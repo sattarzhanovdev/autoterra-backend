@@ -1,0 +1,61 @@
+{% extends "admin/base_site.html" %}
+{% load i18n admin_urls static %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">Главная</a>
+  &rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+  &rsaquo; <a href="{% url 'admin:api_product_changelist' %}">Ассортимент</a>
+  &rsaquo; Загрузка Excel
+</div>
+{% endblock %}
+
+{% block content %}
+<div class="autoterra-help-card">
+  <h2>Загрузка ассортимента из Excel</h2>
+  <p>
+    Сначала можно скачать готовый шаблон, заполнить его и загрузить обратно.
+    Первая строка файла должна быть строкой заголовков.
+  </p>
+  <p>
+    <a class="button" href="{% url 'admin:api_product_template_excel' %}">Скачать шаблон Excel</a>
+  </p>
+  <p>
+    Рекомендуемые русские колонки: <code>{{ sample_headers_ru }}</code>.
+    Обязательные: <code>Артикул</code> и <code>Название</code>.
+  </p>
+  <p>
+    Английский вариант тоже работает: <code>{{ sample_headers_en }}</code>.
+  </p>
+  <p>
+    Статусы: <code>{{ statuses }}</code>. Также можно писать по-русски:
+    <code>в наличии</code>, <code>мало</code>, <code>под заказ</code>, <code>нет в наличии</code>.
+  </p>
+  <p>
+    Технические колонки не нужны. Все загруженные товары автоматически активны
+    и будут видны в приложении.
+  </p>
+</div>
+
+<form method="post" enctype="multipart/form-data" novalidate>
+  {% csrf_token %}
+  <fieldset class="module aligned">
+    {% for field in form %}
+      <div class="form-row{% if field.errors %} errors{% endif %}">
+        {{ field.errors }}
+        <div>
+          {{ field.label_tag }}
+          {{ field }}
+          {% if field.help_text %}
+            <div class="help">{{ field.help_text }}</div>
+          {% endif %}
+        </div>
+      </div>
+    {% endfor %}
+  </fieldset>
+  <div class="submit-row">
+    <input type="submit" value="Загрузить ассортимент" class="default">
+    <a class="button cancel-link" href="{% url 'admin:api_product_changelist' %}">Отмена</a>
+  </div>
+</form>
+{% endblock %}

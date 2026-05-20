@@ -1,0 +1,162 @@
+{% extends "admin/base.html" %}
+
+{% block title %}{{ title }} | AutoTerra Admin{% endblock %}
+
+{% block branding %}
+<div class="autoterra-brand">
+  <div class="autoterra-mark">AT</div>
+  <div>
+    <h1 id="site-name"><a href="{% url 'admin:index' %}">AutoTerra</a></h1>
+    <div class="autoterra-subtitle">Управление дистрибьюторами, клиентами и ассортиментом</div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extrastyle %}
+{{ block.super }}
+<style>
+  :root {
+    --primary: #171717;
+    --secondary: #f01d2c;
+    --accent: #f01d2c;
+    --primary-fg: #ffffff;
+    --body-bg: #f3f4f6;
+    --body-fg: #171717;
+    --body-quiet-color: #5a5a5a;
+    --hairline-color: #d7d7d7;
+    --link-fg: #171717;
+    --link-selected-fg: #f01d2c;
+    --button-bg: #f01d2c;
+    --button-hover-bg: #cf1724;
+    --default-button-bg: #171717;
+    --default-button-hover-bg: #000000;
+  }
+
+  body {
+    background: var(--body-bg);
+  }
+
+  #header {
+    min-height: 66px;
+    background: #171717;
+    border-bottom: 4px solid #f01d2c;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, .12);
+  }
+
+  .autoterra-brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .autoterra-mark {
+    width: 42px;
+    height: 42px;
+    display: grid;
+    place-items: center;
+    background: #f01d2c;
+    color: #fff;
+    font-weight: 900;
+    letter-spacing: .4px;
+  }
+
+  #branding h1 {
+    margin: 0;
+    font-weight: 800;
+    letter-spacing: .2px;
+  }
+
+  #branding h1 a:link,
+  #branding h1 a:visited {
+    color: #fff;
+  }
+
+  .autoterra-subtitle {
+    margin-top: 2px;
+    color: rgba(255, 255, 255, .62);
+    font-size: 12px;
+  }
+
+  div.breadcrumbs {
+    background: #252525;
+    color: rgba(255, 255, 255, .72);
+  }
+
+  div.breadcrumbs a {
+    color: #fff;
+  }
+
+  .module,
+  .inline-group,
+  #content-related,
+  .paginator,
+  .messagelist li {
+    border-radius: 8px;
+    border: 1px solid #dedede;
+    box-shadow: 0 8px 22px rgba(17, 24, 39, .06);
+    overflow: hidden;
+  }
+
+  .module h2,
+  .module caption,
+  .inline-group h2 {
+    background: #171717;
+    color: #fff;
+    font-weight: 800;
+    letter-spacing: .2px;
+  }
+
+  #changelist-filter h2 {
+    background: #171717;
+  }
+
+  .button,
+  input[type=submit],
+  input[type=button],
+  .submit-row input,
+  a.button {
+    border-radius: 6px;
+    font-weight: 800;
+  }
+
+  .object-tools a:link,
+  .object-tools a:visited {
+    background: #f01d2c;
+    border-radius: 6px;
+    font-weight: 800;
+  }
+
+  .object-tools a:hover {
+    background: #cf1724;
+  }
+
+  table thead th {
+    background: #fafafa;
+  }
+
+  #content {
+    padding: 24px;
+  }
+
+  .autoterra-help-card {
+    background: #fff;
+    border: 1px solid #dedede;
+    border-left: 4px solid #f01d2c;
+    border-radius: 8px;
+    padding: 16px;
+    margin: 0 0 18px;
+    box-shadow: 0 8px 22px rgba(17, 24, 39, .06);
+  }
+
+  .autoterra-help-card h2 {
+    margin: 0 0 8px;
+    font-size: 16px;
+  }
+
+  .autoterra-help-card code {
+    background: #f3f4f6;
+    padding: 2px 5px;
+    border-radius: 4px;
+  }
+</style>
+{% endblock %}

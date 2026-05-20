@@ -1,0 +1,30 @@
+{% extends "admin/change_list.html" %}
+{% load i18n admin_urls %}
+
+{% block object-tools-items %}
+  <li>
+    <a href="{% url 'admin:api_product_template_excel' %}" class="viewsitelink">Скачать шаблон Excel</a>
+  </li>
+  <li>
+    <a href="{% url 'admin:api_product_import_excel' %}" class="addlink">Загрузить Excel</a>
+  </li>
+  {{ block.super }}
+{% endblock %}
+
+{% block content %}
+  <div class="autoterra-help-card">
+    <h2>Ассортимент</h2>
+    <p>
+      Товары можно добавлять вручную через кнопку <strong>Добавить товар</strong>,
+      либо массово загрузить из Excel по готовому шаблону. При импорте существующие
+      артикулы обновляются, новые товары создаются.
+    </p>
+    <p>
+      Нормальный формат файла: <code>Артикул</code>, <code>Название</code>,
+      <code>Категория</code>, <code>Бренд</code>, <code>Объём</code>,
+      <code>Цена</code>, <code>Остаток</code>, <code>Статус</code>.
+      Лишние технические колонки не нужны: загруженные товары включаются автоматически.
+    </p>
+  </div>
+  {{ block.super }}
+{% endblock %}
