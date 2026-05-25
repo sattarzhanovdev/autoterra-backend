@@ -5,7 +5,6 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
-import certifi
 from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
 from django.conf import settings
@@ -30,6 +29,11 @@ from .models import (
     Referral,
     Store,
 )
+
+try:
+    import certifi
+except ImportError:
+    certifi = None
 
 
 def _json(request):
@@ -316,7 +320,11 @@ def _hf_chat_answer(client, question):
         },
         method="POST",
     )
-    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    ssl_context = (
+        ssl.create_default_context(cafile=certifi.where())
+        if certifi
+        else ssl.create_default_context()
+    )
     with urllib.request.urlopen(request, timeout=45, context=ssl_context) as response:
         payload = json.loads(response.read().decode("utf-8"))
     return payload["choices"][0]["message"]["content"].strip()
