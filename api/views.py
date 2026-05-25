@@ -1,9 +1,14 @@
 import json
 import secrets
+import ssl
+import urllib.error
+import urllib.request
 from datetime import datetime
 
+import certifi
 from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
+from django.conf import settings
 from django.db import transaction
 from django.http import JsonResponse
 from django.utils import timezone
@@ -274,6 +279,49 @@ def _format_knowledge_card(item):
     }
 
 
+def _hf_chat_answer(client, question):
+    if not settings.HF_API_TOKEN:
+        raise RuntimeError("HF_API_TOKEN is not configured")
+
+    system_prompt = (
+        "Ты AI-помощник AutoTerra для B2B-платформы автосервисов и ЛКМ. "
+        "Отвечай по-русски, коротко и практично. Помогай с подбором материалов, "
+        "технологией нанесения, дефектами покраски, SKU и вопросами к дистрибьютору. "
+        "Если не уверен, предложи передать вопрос технологу через Вопрос-Ответ. "
+        "Не выдумывай наличие товара, цены или остатки."
+    )
+    user_context = (
+        f"Клиент: {client.company_name}. "
+        f"Категория: {client.category.upper()}. "
+        f"Регион: {client.region}, город: {client.city}. "
+        f"Дистрибьютор: {client.distributor.name}."
+    )
+    body = json.dumps(
+        {
+            "model": settings.HF_CHAT_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"{user_context}\n\nВопрос: {question}"},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 700,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        settings.HF_CHAT_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {settings.HF_API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    with urllib.request.urlopen(request, timeout=45, context=ssl_context) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return payload["choices"][0]["message"]["content"].strip()
+
+
 @require_GET
 def health(_request):
     return JsonResponse({"status": "ok", "service": "autoterra-api"})
@@ -441,6 +489,15 @@ def create_order(request):
             quantity = int(raw.get("quantity") or 0)
             if product is None or quantity <= 0:
                 continue
+            if product.status == "outOfStock" or product.quantity <= 0:
+                transaction.set_rollback(True)
+                return JsonResponse({"detail": f"{product.name}: нет в наличии"}, status=400)
+            if quantity > product.quantity:
+                transaction.set_rollback(True)
+                return JsonResponse(
+                    {"detail": f"{product.name}: доступно только {product.quantity} шт."},
+                    status=400,
+                )
             OrderItem.objects.create(
                 order=order,
                 product=product,
@@ -626,3 +683,29 @@ def knowledge_cards(request):
         return err
     qs = KnowledgeCard.objects.filter(is_approved=True)
     return JsonResponse({"results": [_format_knowledge_card(item) for item in qs]})
+
+
+@csrf_exempt
+@require_POST
+def ai_chat(request):
+    client, err = _require_client(request)
+    if err:
+        return err
+    question = (_json(request).get("message") or "").strip()
+    if not question:
+        return JsonResponse({"detail": "Введите вопрос"}, status=400)
+    try:
+        answer = _hf_chat_answer(client, question)
+    except RuntimeError as exc:
+        return JsonResponse({"detail": str(exc)}, status=503)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore") or exc.reason
+        return JsonResponse({"detail": f"Hugging Face error: {detail}"}, status=502)
+    except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError) as exc:
+        return JsonResponse({"detail": f"AI service unavailable: {exc}"}, status=502)
+    return JsonResponse(
+        {
+            "answer": answer,
+            "model": settings.HF_CHAT_MODEL,
+        }
+    )

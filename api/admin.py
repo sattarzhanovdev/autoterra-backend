@@ -331,7 +331,7 @@ class ProductAdmin(admin.ModelAdmin):
                 continue
             if not sku or not name:
                 skipped += 1
-                errors.append(f"Строка {number}: SKU и название обязательны.")
+                errors.append(f"Строка {number}: артикул и название обязательны.")
                 continue
 
             defaults = {

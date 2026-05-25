@@ -27,4 +27,5 @@ urlpatterns = [
     path("notifications/", views.notifications),
     path("notifications/read/", views.mark_notifications_read),
     path("knowledge-cards/", views.knowledge_cards),
+    path("ai/chat/", views.ai_chat),
 ]

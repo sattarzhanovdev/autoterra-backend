@@ -1,6 +1,21 @@
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _load_env_file(path):
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+_load_env_file(BASE_DIR / ".env")
 
 SECRET_KEY = "dev-autoterra-change-me"
 DEBUG = True
@@ -15,6 +30,9 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "api",
 ]
+
+# Keep startup stable if a local admin theme or environment patch adds an app twice.
+INSTALLED_APPS = list(dict.fromkeys(INSTALLED_APPS))
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
@@ -61,3 +79,10 @@ STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "")
+HF_CHAT_MODEL = os.environ.get("HF_CHAT_MODEL", "openai/gpt-oss-120b")
+HF_CHAT_URL = os.environ.get(
+    "HF_CHAT_URL",
+    "https://router.huggingface.co/v1/chat/completions",
+)
