@@ -185,11 +185,41 @@ class DistributorAdmin(admin.ModelAdmin):
 
 @admin.register(ClientProfile)
 class ClientProfileAdmin(admin.ModelAdmin):
-    list_display = ("id", "company_name", "inn", "category", "region", "city", "distributor", "status", "partner_status")
+    list_display = (
+        "id",
+        "company_name",
+        "inn",
+        "category",
+        "region",
+        "city",
+        "distributor",
+        "status",
+        "partner_status",
+        "referral_count",
+        "referral_registered_count",
+        "referral_purchase_amount",
+    )
     list_filter = ("category", "status", "partner_status", "region", "distributor")
     search_fields = ("company_name", "inn", "contact_name", "phone", "user__username", "user__email")
     readonly_fields = ("created_at",)
     inlines = (StoreInline,)
+
+    @admin.display(description="Рекомендовал")
+    def referral_count(self, obj):
+        return obj.referrals.count()
+
+    @admin.display(description="Зарегистр.")
+    def referral_registered_count(self, obj):
+        referrals = [item.sync_from_invitee() for item in obj.referrals.all()]
+        return sum(1 for item in referrals if item.is_registered)
+
+    @admin.display(description="Продажи реф.")
+    def referral_purchase_amount(self, obj):
+        amount = sum(
+            (item.sync_from_invitee().purchase_amount for item in obj.referrals.all()),
+            start=Decimal("0"),
+        )
+        return f"{amount:,.0f}".replace(",", " ")
 
 
 @admin.register(Store)
@@ -393,7 +423,17 @@ class CourierTaskAdmin(admin.ModelAdmin):
 
 @admin.register(Referral)
 class ReferralAdmin(admin.ModelAdmin):
-    list_display = ("id", "inviter", "invitee_name", "invitee_inn", "region", "is_registered", "has_purchase", "condition_met")
+    list_display = (
+        "id",
+        "inviter",
+        "invitee_name",
+        "invitee_inn",
+        "region",
+        "is_registered",
+        "has_purchase",
+        "purchase_amount",
+        "condition_met",
+    )
     list_filter = ("region", "is_registered", "has_purchase", "condition_met")
     search_fields = ("inviter__company_name", "invitee_name", "invitee_inn")
     readonly_fields = ("created_at",)

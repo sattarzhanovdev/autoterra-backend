@@ -9,6 +9,7 @@ from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Q
 from django.http import JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
@@ -26,6 +27,7 @@ from .models import (
     OrderItem,
     Product,
     Purchase,
+    PurchaseItem,
     Referral,
     Store,
 )
@@ -230,6 +232,7 @@ def _format_courier_task(item):
 
 
 def _format_referral(item):
+    item.sync_from_invitee()
     return {
         "id": str(item.id),
         "inviterId": str(item.inviter_id),
@@ -242,6 +245,21 @@ def _format_referral(item):
         "conditionMet": item.condition_met,
         "gift": item.gift or None,
         "createdAt": item.created_at.isoformat(),
+    }
+
+
+def _sync_referral(item):
+    return item.sync_from_invitee()
+
+
+def _referral_stats(referrals):
+    synced = [_sync_referral(item) for item in referrals]
+    return {
+        "invitedCount": len(synced),
+        "registeredCount": sum(1 for item in synced if item.is_registered),
+        "buyersCount": sum(1 for item in synced if item.has_purchase),
+        "giftCount": sum(1 for item in synced if item.condition_met),
+        "purchaseAmount": float(sum((item.purchase_amount for item in synced), start=0)),
     }
 
 
@@ -283,9 +301,41 @@ def _format_knowledge_card(item):
     }
 
 
+def _offline_ai_answer(client, question):
+    words = [
+        word.strip(".,!?;:()[]{}«»\"'").lower()
+        for word in question.split()
+        if len(word.strip(".,!?;:()[]{}«»\"'")) >= 4
+    ]
+    cards = list(KnowledgeCard.objects.filter(is_approved=True).order_by("problem")[:20])
+    matched = []
+    for card in cards:
+        haystack = f"{card.problem} {card.causes} {card.solution} {' '.join(card.skus)}".lower()
+        if any(word in haystack for word in words):
+            matched.append(card)
+
+    if matched:
+        card = matched[0]
+        sku_text = f"\nSKU: {', '.join(card.skus)}" if card.skus else ""
+        restrictions = f"\nОграничения: {card.restrictions}" if card.restrictions else ""
+        return (
+            f"Пока AI-сервис недоступен, но я нашёл похожую карточку базы знаний: {card.problem}.\n\n"
+            f"Возможные причины: {card.causes}\n\n"
+            f"Что сделать: {card.solution}"
+            f"{sku_text}{restrictions}\n\n"
+            f"Если ситуация отличается, лучше отправить вопрос технологу через раздел Вопрос-Ответ."
+        )
+
+    return (
+        "AI-сервис временно недоступен. Я передал бы этот вопрос технологу: "
+        f"{client.distributor.name} видит ваш регион и сможет уточнить наличие, совместимость и рекомендации по материалам. "
+        "Попробуйте позже или создайте вопрос в разделе Вопрос-Ответ."
+    )
+
+
 def _hf_chat_answer(client, question):
     if not settings.HF_API_TOKEN:
-        raise RuntimeError("HF_API_TOKEN is not configured")
+        return _offline_ai_answer(client, question)
 
     system_prompt = (
         "Ты AI-помощник AutoTerra для B2B-платформы автосервисов и ЛКМ. "
@@ -436,8 +486,31 @@ def products(request):
     client, err = _require_client(request)
     if err:
         return err
-    qs = Product.objects.filter(distributor=client.distributor, is_active=True).order_by("category", "name")
-    return JsonResponse({"results": [_format_product(item) for item in qs]})
+    qs = Product.objects.filter(distributor=client.distributor, is_active=True)
+    category = (request.GET.get("category") or "").strip()
+    search = (request.GET.get("search") or "").strip()
+    if category:
+        qs = qs.filter(category=category)
+    if search:
+        qs = qs.filter(
+            Q(name__icontains=search)
+            | Q(sku__icontains=search)
+            | Q(brand__icontains=search)
+        )
+    qs = qs.order_by("category", "name")
+    return JsonResponse(
+        {
+            "distributor": _format_distributor(client.distributor),
+            "categories": list(
+                Product.objects.filter(distributor=client.distributor, is_active=True)
+                .exclude(category="")
+                .order_by("category")
+                .values_list("category", flat=True)
+                .distinct()
+            ),
+            "results": [_format_product(item) for item in qs],
+        }
+    )
 
 
 @require_GET
@@ -450,9 +523,16 @@ def order_config(request):
             "client": _format_client(client),
             "distributor": _format_distributor(client.distributor),
             "stores": [_format_store(item) for item in client.stores.filter(is_active=True)],
+            "categories": list(
+                Product.objects.filter(distributor=client.distributor, is_active=True)
+                .exclude(category="")
+                .order_by("category")
+                .values_list("category", flat=True)
+                .distinct()
+            ),
             "products": [
                 _format_product(item)
-                for item in Product.objects.filter(distributor=client.distributor, is_active=True)
+                for item in Product.objects.filter(distributor=client.distributor, is_active=True).order_by("category", "name")
             ],
         }
     )
@@ -624,7 +704,8 @@ def referrals(request):
     client, err = _require_client(request)
     if err:
         return err
-    return JsonResponse({"results": [_format_referral(item) for item in client.referrals.all()]})
+    qs = list(client.referrals.all())
+    return JsonResponse({"stats": _referral_stats(qs), "results": [_format_referral(item) for item in qs]})
 
 
 @csrf_exempt
@@ -704,8 +785,6 @@ def ai_chat(request):
         return JsonResponse({"detail": "Введите вопрос"}, status=400)
     try:
         answer = _hf_chat_answer(client, question)
-    except RuntimeError as exc:
-        return JsonResponse({"detail": str(exc)}, status=503)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore") or exc.reason
         return JsonResponse({"detail": f"Hugging Face error: {detail}"}, status=502)

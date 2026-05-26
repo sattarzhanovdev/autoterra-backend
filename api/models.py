@@ -290,6 +290,41 @@ class Referral(models.Model):
         verbose_name_plural = "Рефералы"
         ordering = ("-created_at",)
 
+    def sync_from_invitee(self):
+        invitee = ClientProfile.objects.filter(inn=self.invitee_inn).first()
+        if invitee is None:
+            return self
+
+        purchase_amount = (
+            invitee.purchases.filter(status="verified").aggregate(total=models.Sum("total_amount"))["total"]
+            or 0
+        )
+        order_amount = sum(
+            (order.total_amount for order in invitee.orders.filter(status="done").prefetch_related("items")),
+            start=0,
+        )
+        amount = max(purchase_amount, order_amount)
+
+        updates = []
+        if not self.is_registered:
+            self.is_registered = True
+            updates.append("is_registered")
+        if amount and not self.has_purchase:
+            self.has_purchase = True
+            updates.append("has_purchase")
+        if self.purchase_amount != amount:
+            self.purchase_amount = amount
+            updates.append("purchase_amount")
+        if amount >= 30000 and not self.condition_met:
+            self.condition_met = True
+            updates.append("condition_met")
+        if self.condition_met and not self.gift:
+            self.gift = "Подарок за рекомендацию"
+            updates.append("gift")
+        if updates:
+            self.save(update_fields=updates)
+        return self
+
 
 class ExpertTicket(models.Model):
     STATUS_CHOICES = [

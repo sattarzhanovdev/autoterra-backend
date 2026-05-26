@@ -171,7 +171,7 @@ SCHEMAS = {
     },
     "Product": {
         "type": "object",
-        "description": "Позиция ассортимента дистрибьютора. Показывается клиенту в заказе.",
+        "description": "Позиция ассортимента закреплённого дистрибьютора клиента. Чужие прайсы клиенту не отдаются.",
         "properties": {
             "id": {"type": "string", "example": "11"},
             "distributorId": {"type": "string", "example": "2"},
@@ -184,6 +184,17 @@ SCHEMAS = {
             "quantity": {"type": "integer", "example": 24},
             "status": {"type": "string", "enum": ["inStock", "low", "onOrder", "outOfStock"]},
             "updatedAt": {"type": "string", "format": "date-time"},
+        },
+    },
+    "ReferralStats": {
+        "type": "object",
+        "description": "Сводка по рекомендациям клиента. Backend сверяет приглашённых по ИНН с зарегистрированными ClientProfile.",
+        "properties": {
+            "invitedCount": {"type": "integer", "example": 5},
+            "registeredCount": {"type": "integer", "example": 3},
+            "buyersCount": {"type": "integer", "example": 2},
+            "giftCount": {"type": "integer", "example": 1},
+            "purchaseAmount": {"type": "number", "format": "double", "example": 84500},
         },
     },
     "PurchaseItem": {
@@ -545,8 +556,39 @@ PATHS = {
             {
                 "tags": ["Order"],
                 "summary": "Ассортимент закреплённого дистрибьютора",
-                "description": "Возвращает только активные товары дистрибьютора клиента.",
-                "responses": {"200": _ok({"type": "object", "properties": {"results": _array(_ref("Product"))}})},
+                "description": (
+                    "Возвращает только активные товары дистрибьютора клиента. "
+                    "Поддерживает query-параметры category и search для фильтрации по товарной группе, "
+                    "названию, артикулу или бренду."
+                ),
+                "parameters": [
+                    {
+                        "name": "category",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string"},
+                        "description": "Товарная группа, например Лаки или Грунты.",
+                    },
+                    {
+                        "name": "search",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string"},
+                        "description": "Поиск по названию, артикулу или бренду.",
+                    },
+                ],
+                "responses": {
+                    "200": _ok(
+                        {
+                            "type": "object",
+                            "properties": {
+                                "distributor": _ref("Distributor"),
+                                "categories": _array({"type": "string", "example": "Лаки"}),
+                                "results": _array(_ref("Product")),
+                            },
+                        }
+                    )
+                },
             }
         )
     },
@@ -564,6 +606,7 @@ PATHS = {
                                 "client": _ref("Client"),
                                 "distributor": _ref("Distributor"),
                                 "stores": _array(_ref("Store")),
+                                "categories": _array({"type": "string", "example": "Грунты"}),
                                 "products": _array(_ref("Product")),
                             },
                         }
@@ -660,8 +703,22 @@ PATHS = {
         "get": _secured(
             {
                 "tags": ["Referral"],
-                "summary": "Приглашённые автосервисы",
-                "responses": {"200": _ok({"type": "object", "properties": {"results": _array(_ref("Referral"))}})},
+                "summary": "Приглашённые автосервисы и статистика",
+                "description": (
+                    "Возвращает список приглашений и сводку: сколько приглашено, сколько зарегистрировалось, "
+                    "сколько сделали покупки и на какую сумму."
+                ),
+                "responses": {
+                    "200": _ok(
+                        {
+                            "type": "object",
+                            "properties": {
+                                "stats": _ref("ReferralStats"),
+                                "results": _array(_ref("Referral")),
+                            },
+                        }
+                    )
+                },
             }
         )
     },
