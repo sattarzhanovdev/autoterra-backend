@@ -3,19 +3,26 @@ import secrets
 import ssl
 import urllib.error
 import urllib.request
+import csv
+import io
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 
-from django.contrib.auth import authenticate
+from django.contrib.auth import authenticate, login as django_login
+from django.contrib.contenttypes.models import ContentType
 from django.contrib.auth.models import User
 from django.conf import settings
-from django.db import transaction
+from django.db import models, transaction
+from django.db.utils import IntegrityError
 from django.db.models import Q
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
 from .models import (
+    Attachment,
     AuthToken,
     ClientProfile,
     ColorRequest,
@@ -28,7 +35,9 @@ from .models import (
     Product,
     Purchase,
     PurchaseItem,
+    Region,
     Referral,
+    RecipeMaterial,
     Store,
 )
 
@@ -38,11 +47,51 @@ except ImportError:
     certifi = None
 
 
+MAX_UPLOAD_SIZE = 10 * 1024 * 1024
+ALLOWED_UPLOAD_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".pdf", ".mp4", ".mov"}
+ALLOWED_UPLOAD_CONTENT_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "application/pdf",
+    "video/mp4",
+    "video/quicktime",
+}
+
+
 def _json(request):
     try:
         return json.loads(request.body.decode("utf-8") or "{}")
     except json.JSONDecodeError:
         return {}
+
+
+def _normalize_phone(phone):
+    normalized = "".join(ch for ch in (phone or "").strip() if ch.isdigit() or ch == "+")
+    if normalized.startswith("8"):
+        normalized = f"+7{normalized[1:]}"
+    return normalized
+
+
+def _normalize_inn(inn):
+    return "".join(ch for ch in (inn or "").strip() if ch.isdigit())
+
+
+def _normalize_category(category):
+    value = (category or "b").strip().lower()
+    return value if value in {"a", "b", "c"} else "b"
+
+
+def _find_region(value):
+    region_value = (value or "").strip()
+    if not region_value:
+        return None
+    return (
+        Region.objects.select_related("distributor", "manager")
+        .filter(is_active=True)
+        .filter(Q(code__iexact=region_value) | Q(name__iexact=region_value))
+        .first()
+    )
 
 
 def _dt(value):
@@ -79,6 +128,183 @@ def _require_client(request):
         return None, JsonResponse({"detail": "Профиль клиента не создан в admin"}, status=403)
 
 
+def _require_distributor_scope(request):
+    user = _current_user(request)
+    if user is None:
+        return None, False, JsonResponse({"detail": "Unauthorized"}, status=401)
+    if user.is_staff or user.is_superuser:
+        return None, True, None
+    distributor = getattr(user, "distributor_profile", None)
+    if distributor is None:
+        return None, False, JsonResponse({"detail": "Профиль дистрибьютора не создан в admin"}, status=403)
+    return distributor, False, None
+
+
+def _is_courier_user(user):
+    return bool(user and (user.groups.filter(name__iexact="courier").exists() or user.is_staff or user.is_superuser))
+
+
+def _require_courier_scope(request):
+    user = _current_user(request)
+    if user is None:
+        return None, False, JsonResponse({"detail": "Unauthorized"}, status=401)
+    if not _is_courier_user(user):
+        return None, False, JsonResponse({"detail": "Нет доступа курьера"}, status=403)
+    return user, bool(user.is_staff or user.is_superuser), None
+
+
+def _is_expert_user(user):
+    return bool(user and (user.groups.filter(name__iexact="expert").exists() or user.is_staff or user.is_superuser))
+
+
+def _require_expert_scope(request):
+    user = _current_user(request)
+    if user is None:
+        return None, False, JsonResponse({"detail": "Unauthorized"}, status=401)
+    if not _is_expert_user(user):
+        return None, False, JsonResponse({"detail": "Нет доступа эксперта"}, status=403)
+    return user, bool(user.is_staff or user.is_superuser), None
+
+
+def _scope_courier_tasks(user, is_admin):
+    qs = CourierTask.objects.select_related("client", "assigned_courier", "order", "color_request")
+    if is_admin:
+        return qs
+    return qs.filter(Q(assigned_courier=user) | Q(courier_id=str(user.id)) | Q(courier_id=user.username))
+
+
+def _append_task_history(task, status, user=None, comment=""):
+    item = {
+        "status": status,
+        "at": timezone.now().isoformat(),
+        "by": str(user.id) if user else None,
+        "comment": comment,
+    }
+    task.status_history = [*(task.status_history or []), item]
+
+
+def _scope_clients(distributor, is_admin):
+    qs = ClientProfile.objects.select_related("distributor", "manager", "user")
+    return qs if is_admin else qs.filter(distributor=distributor)
+
+
+def _scope_purchases(distributor, is_admin):
+    qs = Purchase.objects.select_related("client", "distributor").prefetch_related("items")
+    return qs if is_admin else qs.filter(distributor=distributor)
+
+
+def _scope_orders(distributor, is_admin):
+    qs = Order.objects.select_related("client", "store", "distributor").prefetch_related("items")
+    return qs if is_admin else qs.filter(distributor=distributor)
+
+
+def _scope_products(distributor, is_admin):
+    qs = Product.objects.select_related("distributor")
+    return qs if is_admin else qs.filter(distributor=distributor)
+
+
+def _money_value(value):
+    try:
+        return Decimal(str(value or "0").replace(" ", "").replace(",", "."))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _parse_items(value):
+    if not value:
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        decoded = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return decoded if isinstance(decoded, list) else []
+
+
+def _uploaded_file_hash(file_obj):
+    if not file_obj:
+        return ""
+    digest = sha256()
+    for chunk in file_obj.chunks():
+        digest.update(chunk)
+    file_obj.seek(0)
+    return digest.hexdigest()
+
+
+def _file_extension(name):
+    lowered = (name or "").lower()
+    if "." not in lowered:
+        return ""
+    return lowered[lowered.rfind(".") :]
+
+
+def _file_type(file_obj):
+    content_type = (getattr(file_obj, "content_type", "") or "").lower()
+    extension = _file_extension(getattr(file_obj, "name", ""))
+    if content_type.startswith("image/") or extension in {".jpg", ".jpeg", ".png", ".webp"}:
+        return "image"
+    if content_type == "application/pdf" or extension == ".pdf":
+        return "pdf"
+    if content_type.startswith("video/") or extension in {".mp4", ".mov"}:
+        return "video"
+    return "document"
+
+
+def _upload_error(file_obj):
+    extension = _file_extension(getattr(file_obj, "name", ""))
+    content_type = (getattr(file_obj, "content_type", "") or "").lower()
+    if extension not in ALLOWED_UPLOAD_EXTENSIONS:
+        return JsonResponse({"detail": "Недопустимый тип файла", "code": "invalid_file_type"}, status=400)
+    if content_type and content_type not in ALLOWED_UPLOAD_CONTENT_TYPES:
+        return JsonResponse({"detail": "Недопустимый тип файла", "code": "invalid_file_type"}, status=400)
+    if getattr(file_obj, "size", 0) > MAX_UPLOAD_SIZE:
+        return JsonResponse({"detail": "Файл больше 10 МБ", "code": "file_too_large"}, status=400)
+    return None
+
+
+def _attachment_files(request):
+    files = []
+    seen = set()
+    for field in ("attachments", "document", "file", "photo", "proof", "files"):
+        for file_obj in request.FILES.getlist(field):
+            marker = id(file_obj)
+            if marker not in seen:
+                files.append(file_obj)
+                seen.add(marker)
+    return files
+
+
+def _create_attachments(request, related_object, files, description=""):
+    content_type = ContentType.objects.get_for_model(related_object)
+    uploaded_by = _current_user(request)
+    attachments = []
+    for file_obj in files:
+        error = _upload_error(file_obj)
+        if error:
+            return attachments, error
+        if hasattr(file_obj, "seek"):
+            file_obj.seek(0)
+        attachments.append(
+            Attachment.objects.create(
+                file=file_obj,
+                file_type=_file_type(file_obj),
+                uploaded_by=uploaded_by,
+                content_type=content_type,
+                object_id=related_object.pk,
+                description=description,
+            )
+        )
+    return attachments, None
+
+
+def _attachments_for(related_object):
+    content_type = ContentType.objects.get_for_model(related_object)
+    return Attachment.objects.filter(content_type=content_type, object_id=related_object.pk)
+
+
+# Formatting Helpers
+
 def _format_client(client):
     return {
         "id": str(client.id),
@@ -90,7 +316,8 @@ def _format_client(client):
         "contact": client.contact_name,
         "phone": client.phone,
         "distributorId": str(client.distributor_id),
-        "managerId": None,
+        "managerId": str(client.manager_id) if client.manager_id else None,
+        "registrationSource": client.registration_source,
         "status": client.status,
         "partnerStatus": client.partner_status,
         "totalPurchases": float(client.total_purchases),
@@ -137,15 +364,15 @@ def _format_product(product):
     }
 
 
-def _format_purchase_item(item):
+def _format_attachment(item):
     return {
-        "sku": item.sku,
-        "name": item.name,
-        "category": item.category,
-        "quantity": item.quantity,
-        "volume": float(item.volume),
-        "price": float(item.price),
-        "brand": item.brand,
+        "id": str(item.id),
+        "url": item.file.url if item.file else None,
+        "name": item.file.name.split("/")[-1] if item.file else "",
+        "fileType": item.file_type,
+        "uploadedBy": str(item.uploaded_by_id) if item.uploaded_by_id else None,
+        "uploadedAt": item.uploaded_at.isoformat(),
+        "description": item.description or None,
     }
 
 
@@ -166,6 +393,8 @@ def _format_order(order):
     return {
         "id": str(order.id),
         "clientId": str(order.client_id),
+        "clientName": order.client.company_name,
+        "clientInn": order.client.inn,
         "distributorId": str(order.distributor_id),
         "storeId": str(order.store_id),
         "storeName": order.store.name,
@@ -175,9 +404,21 @@ def _format_order(order):
         "status": "pending" if order.status in ("pending", "accepted") else "verified",
         "orderStatus": order.status,
         "comment": order.comment,
-        "documentUrl": None,
+        "rejectionReason": order.rejection_reason or None,
         "createdAt": order.created_at.isoformat(),
         "items": items,
+    }
+
+
+def _format_purchase_item(item):
+    return {
+        "sku": item.sku,
+        "name": item.name,
+        "category": item.category,
+        "quantity": item.quantity,
+        "volume": float(item.volume),
+        "price": float(item.price),
+        "brand": item.brand,
     }
 
 
@@ -185,31 +426,66 @@ def _format_purchase(purchase):
     return {
         "id": str(purchase.id),
         "clientId": str(purchase.client_id),
+        "clientName": purchase.client.company_name,
+        "clientInn": purchase.client.inn,
         "distributorId": str(purchase.distributor_id),
         "documentNumber": purchase.document_number,
         "date": purchase.date.isoformat(),
         "totalAmount": float(purchase.total_amount),
         "status": purchase.status,
-        "documentUrl": purchase.document_url or None,
+        "documentUrl": purchase.document_file.url if purchase.document_file else (purchase.document_url or None),
+        "documentHash": purchase.document_hash or None,
+        "rejectionReason": purchase.rejection_reason or None,
         "createdAt": purchase.created_at.isoformat(),
         "items": [_format_purchase_item(item) for item in purchase.items.all()],
+        "attachments": [_format_attachment(item) for item in _attachments_for(purchase)],
+    }
+
+
+def _format_recipe_material(item):
+    return {
+        "id": str(item.id),
+        "sku": item.sku,
+        "quantity": float(item.quantity),
+        "unit": item.unit,
+        "comment": item.comment or None,
+        "version": item.version,
     }
 
 
 def _format_color_request(item):
+    materials = [_format_recipe_material(m) for m in item.materials.all()]
+    courier_tasks = [_format_courier_task(t) for t in item.courier_tasks.all()]
+    now = timezone.now()
+    is_overdue = item.sla_deadline and now > item.sla_deadline and item.status != "delivered"
     return {
         "id": str(item.id),
         "clientId": str(item.client_id),
         "carBrand": item.car_brand,
         "carModel": item.car_model,
+        "carYear": item.car_year or None,
         "vin": item.vin,
         "colorCode": item.color_code,
         "colorName": item.color_name,
         "urgent": item.urgent,
+        "comment": item.comment or None,
         "courierPickup": item.courier_pickup,
+        "pickupAddress": item.pickup_address or None,
+        "pickupDate": item.pickup_date.isoformat() if item.pickup_date else None,
+        "contactPerson": item.contact_person or None,
+        "contactPhone": item.contact_phone or None,
+        "deliveryMethod": item.delivery_method,
+        "slaDeadline": item.sla_deadline.isoformat() if item.sla_deadline else None,
+        "isOverdue": is_overdue,
+        "assignedDistributorId": str(item.assigned_distributor_id) if item.assigned_distributor_id else None,
+        "assignedStation": item.assigned_station or None,
         "status": item.status,
+        "statusHistory": item.status_history or [],
         "recipe": item.recipe or None,
+        "materials": materials,
+        "courierTasks": courier_tasks,
         "createdAt": item.created_at.isoformat(),
+        "attachments": [_format_attachment(attachment) for attachment in _attachments_for(item)],
     }
 
 
@@ -217,6 +493,10 @@ def _format_courier_task(item):
     return {
         "id": str(item.id),
         "clientId": str(item.client_id),
+        "clientName": item.client.company_name,
+        "clientInn": item.client.inn,
+        "orderId": str(item.order_id) if item.order_id else None,
+        "colorRequestId": str(item.color_request_id) if item.color_request_id else None,
         "type": item.type,
         "address": item.address,
         "scheduledTime": item.scheduled_time.isoformat(),
@@ -224,15 +504,69 @@ def _format_courier_task(item):
         "contactPhone": item.contact_phone,
         "carDescription": item.car_description,
         "status": item.status,
+        "assignedCourierId": str(item.assigned_courier_id) if item.assigned_courier_id else None,
         "courierId": item.courier_id or None,
         "photoProof": item.photo_proof or None,
         "comment": item.comment or None,
+        "courierComment": item.courier_comment or None,
+        "statusHistory": item.status_history or [],
+        "createdAt": item.created_at.isoformat(),
+        "attachments": [_format_attachment(attachment) for attachment in _attachments_for(item)],
+    }
+
+
+def _format_ticket(item):
+    return {
+        "id": str(item.id),
+        "clientId": str(item.client_id),
+        "clientName": item.client.company_name,
+        "question": item.question,
+        "category": item.category,
+        "risk": item.risk,
+        "status": item.status,
+        "aiDraftAnswer": item.ai_draft_answer or None,
+        "aiAnswer": item.ai_answer or None,
+        "expertAnswer": item.expert_answer or None,
+        "linkedKnowledgeCardId": str(item.linked_knowledge_card_id) if item.linked_knowledge_card_id else None,
+        "similarCases": item.similar_cases or [],
+        "createdAt": item.created_at.isoformat(),
+        "updatedAt": item.updated_at.isoformat(),
+        "attachments": [_format_attachment(a) for attachment in _attachments_for(item)],
+    }
+
+
+def _format_knowledge_card(item):
+    return {
+        "id": str(item.id),
+        "title": item.title or item.problem,
+        "category": item.category,
+        "problem": item.problem,
+        "causes": item.causes or None,
+        "solution": item.solution,
+        "skus": item.skus or [],
+        "restrictions": item.restrictions or None,
+        "status": item.status,
+        "isApproved": item.status == "approved",
+        "createdBy": str(item.created_by_id) if item.created_by_id else None,
+        "approvedBy": str(item.approved_by_id) if item.approved_by_id else None,
+        "revisionHistory": item.revision_history or [],
+        "createdAt": item.created_at.isoformat(),
+        "updatedAt": item.updated_at.isoformat(),
+    }
+
+
+def _format_notification(item):
+    return {
+        "id": str(item.id),
+        "title": item.title,
+        "body": item.body,
+        "type": item.type,
+        "isRead": item.is_read,
         "createdAt": item.created_at.isoformat(),
     }
 
 
 def _format_referral(item):
-    item.sync_from_invitee()
     return {
         "id": str(item.id),
         "inviterId": str(item.inviter_id),
@@ -248,137 +582,7 @@ def _format_referral(item):
     }
 
 
-def _sync_referral(item):
-    return item.sync_from_invitee()
-
-
-def _referral_stats(referrals):
-    synced = [_sync_referral(item) for item in referrals]
-    return {
-        "invitedCount": len(synced),
-        "registeredCount": sum(1 for item in synced if item.is_registered),
-        "buyersCount": sum(1 for item in synced if item.has_purchase),
-        "giftCount": sum(1 for item in synced if item.condition_met),
-        "purchaseAmount": float(sum((item.purchase_amount for item in synced), start=0)),
-    }
-
-
-def _format_ticket(item):
-    return {
-        "id": str(item.id),
-        "clientId": str(item.client_id),
-        "question": item.question,
-        "category": item.category,
-        "aiAnswer": item.ai_answer or None,
-        "expertAnswer": item.expert_answer or None,
-        "status": item.status,
-        "createdAt": item.created_at.isoformat(),
-    }
-
-
-def _format_notification(item):
-    return {
-        "id": str(item.id),
-        "title": item.title,
-        "body": item.body,
-        "type": item.type,
-        "isRead": item.is_read,
-        "createdAt": item.created_at.isoformat(),
-    }
-
-
-def _format_knowledge_card(item):
-    return {
-        "id": str(item.id),
-        "problem": item.problem,
-        "causes": item.causes,
-        "solution": item.solution,
-        "skus": item.skus,
-        "restrictions": item.restrictions or None,
-        "approvingExpert": item.approving_expert,
-        "isApproved": item.is_approved,
-        "createdAt": item.created_at.isoformat(),
-    }
-
-
-def _offline_ai_answer(client, question):
-    words = [
-        word.strip(".,!?;:()[]{}«»\"'").lower()
-        for word in question.split()
-        if len(word.strip(".,!?;:()[]{}«»\"'")) >= 4
-    ]
-    cards = list(KnowledgeCard.objects.filter(is_approved=True).order_by("problem")[:20])
-    matched = []
-    for card in cards:
-        haystack = f"{card.problem} {card.causes} {card.solution} {' '.join(card.skus)}".lower()
-        if any(word in haystack for word in words):
-            matched.append(card)
-
-    if matched:
-        card = matched[0]
-        sku_text = f"\nSKU: {', '.join(card.skus)}" if card.skus else ""
-        restrictions = f"\nОграничения: {card.restrictions}" if card.restrictions else ""
-        return (
-            f"Пока AI-сервис недоступен, но я нашёл похожую карточку базы знаний: {card.problem}.\n\n"
-            f"Возможные причины: {card.causes}\n\n"
-            f"Что сделать: {card.solution}"
-            f"{sku_text}{restrictions}\n\n"
-            f"Если ситуация отличается, лучше отправить вопрос технологу через раздел Вопрос-Ответ."
-        )
-
-    return (
-        "AI-сервис временно недоступен. Я передал бы этот вопрос технологу: "
-        f"{client.distributor.name} видит ваш регион и сможет уточнить наличие, совместимость и рекомендации по материалам. "
-        "Попробуйте позже или создайте вопрос в разделе Вопрос-Ответ."
-    )
-
-
-def _hf_chat_answer(client, question):
-    if not settings.HF_API_TOKEN:
-        return _offline_ai_answer(client, question)
-
-    system_prompt = (
-        "Ты AI-помощник AutoTerra для B2B-платформы автосервисов и ЛКМ. "
-        "Отвечай по-русски, коротко и практично. Помогай с подбором материалов, "
-        "технологией нанесения, дефектами покраски, SKU и вопросами к дистрибьютору. "
-        "Если не уверен, предложи передать вопрос технологу через Вопрос-Ответ. "
-        "Не выдумывай наличие товара, цены или остатки."
-    )
-    user_context = (
-        f"Клиент: {client.company_name}. "
-        f"Категория: {client.category.upper()}. "
-        f"Регион: {client.region}, город: {client.city}. "
-        f"Дистрибьютор: {client.distributor.name}."
-    )
-    body = json.dumps(
-        {
-            "model": settings.HF_CHAT_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"{user_context}\n\nВопрос: {question}"},
-            ],
-            "temperature": 0.3,
-            "max_tokens": 700,
-        }
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        settings.HF_CHAT_URL,
-        data=body,
-        headers={
-            "Authorization": f"Bearer {settings.HF_API_TOKEN}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    ssl_context = (
-        ssl.create_default_context(cafile=certifi.where())
-        if certifi
-        else ssl.create_default_context()
-    )
-    with urllib.request.urlopen(request, timeout=45, context=ssl_context) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    return payload["choices"][0]["message"]["content"].strip()
-
+# Autoservice Views
 
 @require_GET
 def health(_request):
@@ -387,13 +591,78 @@ def health(_request):
 
 @csrf_exempt
 @require_POST
+def register(request):
+    payload = _json(request)
+    inn = _normalize_inn(payload.get("inn"))
+    company_name = (payload.get("companyName") or payload.get("name") or "").strip()
+    region = _find_region(payload.get("region") or payload.get("regionCode"))
+    phone = _normalize_phone(payload.get("phone"))
+    contact_name = (payload.get("contactName") or payload.get("contact") or "").strip()
+    email = (payload.get("email") or "").strip()
+    password = payload.get("password") or ""
+    category = _normalize_category(payload.get("category"))
+    source = (payload.get("registrationSource") or "client").strip()
+    city = (payload.get("city") or (region.name if region else "")).strip()
+
+    if len(inn) not in (10, 12):
+        return JsonResponse({"detail": "ИНН должен содержать 10 или 12 цифр", "code": "invalid_inn"}, status=400)
+    if not company_name:
+        return JsonResponse({"detail": "Введите название автосервиса", "code": "company_required"}, status=400)
+    if region is None:
+        return JsonResponse({"detail": "Регион не найден", "code": "region_not_found"}, status=404)
+    if not phone:
+        return JsonResponse({"detail": "Введите телефон", "code": "phone_required"}, status=400)
+    if not contact_name:
+        return JsonResponse({"detail": "Введите ФИО контактного лица", "code": "contact_required"}, status=400)
+    if len(password) < 6:
+        return JsonResponse({"detail": "Пароль должен содержать минимум 6 символов", "code": "password_too_short"}, status=400)
+
+    if ClientProfile.objects.filter(inn=inn, region=region.name).exists():
+        return JsonResponse({"detail": "ИНН уже существует в выбранном регионе", "code": "inn_duplicate"}, status=409)
+    if User.objects.filter(username=phone).exists():
+        return JsonResponse({"detail": "Пользователь с таким телефоном уже существует", "code": "phone_duplicate"}, status=409)
+
+    is_branch = ClientProfile.objects.filter(inn=inn).exclude(region=region.name).exists()
+
+    try:
+        with transaction.atomic():
+            user = User.objects.create_user(username=phone, email=email, password=password)
+            client = ClientProfile.objects.create(
+                user=user,
+                inn=inn,
+                company_name=company_name,
+                category=category,
+                region=region.name,
+                city=city or region.name,
+                contact_name=contact_name,
+                phone=phone,
+                distributor=region.distributor,
+                manager=region.manager,
+                registration_source=source,
+                status="under_review",
+            )
+    except IntegrityError:
+        return JsonResponse({"detail": "ИНН уже существует в выбранном регионе", "code": "inn_duplicate"}, status=409)
+
+    return JsonResponse(
+        {
+            "client": _format_client(client),
+            "distributor": _format_distributor(region.distributor),
+            "status": client.status,
+            "requiresAdminApproval": True,
+            "isBranch": is_branch,
+        },
+        status=201,
+    )
+
+
+@csrf_exempt
+@require_POST
 def login(request):
     payload = _json(request)
     phone = (payload.get("phone") or "").strip()
     password = payload.get("password") or ""
-    normalized = "".join(ch for ch in phone if ch.isdigit() or ch == "+")
-    if normalized.startswith("8"):
-        normalized = f"+7{normalized[1:]}"
+    normalized = _normalize_phone(phone)
 
     user = authenticate(username=normalized, password=password)
     if user is None:
@@ -409,33 +678,14 @@ def login(request):
     except ClientProfile.DoesNotExist:
         distributor = getattr(user, "distributor_profile", None)
         if distributor is None:
-            return JsonResponse({"detail": "Профиль клиента или дистрибьютора не создан в admin"}, status=403)
-        return JsonResponse(
-            {
-                "token": token,
-                "user": {
-                    "id": str(user.id),
-                    "phone": user.username,
-                    "email": user.email,
-                    "role": "distributor",
-                    "status": "active" if distributor.is_active else "blocked",
-                    "distributor": _format_distributor(distributor),
-                },
-            }
-        )
+            if _is_courier_user(user):
+                return JsonResponse({"token": token, "user": {"id": str(user.id), "phone": user.username, "role": "courier", "status": "active"}})
+            if _is_expert_user(user):
+                return JsonResponse({"token": token, "user": {"id": str(user.id), "phone": user.username, "role": "expert", "status": "active"}})
+            return JsonResponse({"detail": "Профиль клиента или дистрибьютора не найден"}, status=403)
+        return JsonResponse({"token": token, "user": {"id": str(user.id), "phone": user.username, "role": "distributor", "status": "active", "distributor": _format_distributor(distributor)}})
 
-    return JsonResponse(
-        {
-            "token": token,
-            "user": {
-                "id": str(user.id),
-                "phone": client.phone,
-                "email": user.email,
-                "role": "autoservice",
-                "status": client.status,
-            },
-        }
-    )
+    return JsonResponse({"token": token, "user": {"id": str(user.id), "phone": client.phone, "role": "autoservice", "status": client.status}})
 
 
 @require_GET
@@ -443,16 +693,7 @@ def me(request):
     client, err = _require_client(request)
     if err:
         return err
-    return JsonResponse(
-        {
-            "id": str(client.user_id),
-            "phone": client.phone,
-            "email": client.user.email,
-            "role": "autoservice",
-            "client": _format_client(client),
-            "distributor": _format_distributor(client.distributor),
-        }
-    )
+    return JsonResponse({"id": str(client.user_id), "phone": client.phone, "role": "autoservice", "client": _format_client(client), "distributor": _format_distributor(client.distributor)})
 
 
 @require_GET
@@ -462,15 +703,7 @@ def dashboard(request):
         return err
     purchases = client.purchases.prefetch_related("items").order_by("-date")[:2]
     color_requests = client.color_requests.exclude(status="delivered").order_by("-created_at")[:2]
-    return JsonResponse(
-        {
-            "client": _format_client(client),
-            "distributor": _format_distributor(client.distributor),
-            "unreadCount": client.notifications.filter(is_read=False).count(),
-            "recentPurchases": [_format_purchase(item) for item in purchases],
-            "activeColorRequests": [_format_color_request(item) for item in color_requests],
-        }
-    )
+    return JsonResponse({"client": _format_client(client), "distributor": _format_distributor(client.distributor), "unreadCount": client.notifications.filter(is_read=False).count(), "recentPurchases": [_format_purchase(item) for item in purchases], "activeColorRequests": [_format_color_request(item) for item in color_requests]})
 
 
 @require_GET
@@ -478,7 +711,8 @@ def stores(request):
     client, err = _require_client(request)
     if err:
         return err
-    return JsonResponse({"results": [_format_store(item) for item in client.stores.filter(is_active=True)]})
+    qs = client.stores.filter(is_active=True)
+    return JsonResponse({"results": [_format_store(item) for item in qs]})
 
 
 @require_GET
@@ -492,25 +726,8 @@ def products(request):
     if category:
         qs = qs.filter(category=category)
     if search:
-        qs = qs.filter(
-            Q(name__icontains=search)
-            | Q(sku__icontains=search)
-            | Q(brand__icontains=search)
-        )
-    qs = qs.order_by("category", "name")
-    return JsonResponse(
-        {
-            "distributor": _format_distributor(client.distributor),
-            "categories": list(
-                Product.objects.filter(distributor=client.distributor, is_active=True)
-                .exclude(category="")
-                .order_by("category")
-                .values_list("category", flat=True)
-                .distinct()
-            ),
-            "results": [_format_product(item) for item in qs],
-        }
-    )
+        qs = qs.filter(Q(name__icontains=search) | Q(sku__icontains=search) | Q(brand__icontains=search))
+    return JsonResponse({"categories": list(Product.objects.filter(distributor=client.distributor, is_active=True).values_list("category", flat=True).distinct()), "results": [_format_product(item) for item in qs.order_by("category", "name")]})
 
 
 @require_GET
@@ -518,24 +735,16 @@ def order_config(request):
     client, err = _require_client(request)
     if err:
         return err
-    return JsonResponse(
-        {
-            "client": _format_client(client),
-            "distributor": _format_distributor(client.distributor),
-            "stores": [_format_store(item) for item in client.stores.filter(is_active=True)],
-            "categories": list(
-                Product.objects.filter(distributor=client.distributor, is_active=True)
-                .exclude(category="")
-                .order_by("category")
-                .values_list("category", flat=True)
-                .distinct()
-            ),
-            "products": [
-                _format_product(item)
-                for item in Product.objects.filter(distributor=client.distributor, is_active=True).order_by("category", "name")
-            ],
-        }
-    )
+    stores_qs = client.stores.filter(is_active=True)
+    products_qs = Product.objects.filter(distributor=client.distributor, is_active=True)
+    categories = list(products_qs.values_list("category", flat=True).distinct())
+    return JsonResponse({
+        "client": _format_client(client),
+        "distributor": _format_distributor(client.distributor),
+        "stores": [_format_store(s) for s in stores_qs],
+        "categories": categories,
+        "products": [_format_product(p) for p in products_qs],
+    })
 
 
 @require_GET
@@ -556,51 +765,15 @@ def create_order(request):
     payload = _json(request)
     store_id = payload.get("storeId")
     items = payload.get("items") or []
-    comment = (payload.get("comment") or "").strip()
-    if not store_id or not items:
-        return JsonResponse({"detail": "Выберите магазин и товары"}, status=400)
-
     store = Store.objects.filter(id=store_id, client=client, is_active=True).first()
-    if store is None:
-        return JsonResponse({"detail": "Магазин не найден"}, status=404)
-
-    product_ids = [item.get("productId") for item in items if item.get("productId")]
-    products_by_id = {
-        str(product.id): product
-        for product in Product.objects.filter(id__in=product_ids, distributor=client.distributor, is_active=True)
-    }
-
+    if store is None or not items:
+        return JsonResponse({"detail": "Выберите магазин и товары"}, status=400)
     with transaction.atomic():
-        order = Order.objects.create(client=client, store=store, distributor=client.distributor, comment=comment)
+        order = Order.objects.create(client=client, store=store, distributor=client.distributor, comment=(payload.get("comment") or "").strip())
         for raw in items:
-            product = products_by_id.get(str(raw.get("productId")))
-            quantity = int(raw.get("quantity") or 0)
-            if product is None or quantity <= 0:
-                continue
-            if product.status == "outOfStock" or product.quantity <= 0:
-                transaction.set_rollback(True)
-                return JsonResponse({"detail": f"{product.name}: нет в наличии"}, status=400)
-            if quantity > product.quantity:
-                transaction.set_rollback(True)
-                return JsonResponse(
-                    {"detail": f"{product.name}: доступно только {product.quantity} шт."},
-                    status=400,
-                )
-            OrderItem.objects.create(
-                order=order,
-                product=product,
-                sku=product.sku,
-                name=product.name,
-                category=product.category,
-                brand=product.brand,
-                volume=product.volume,
-                price=product.price,
-                quantity=quantity,
-            )
-        if not order.items.exists():
-            transaction.set_rollback(True)
-            return JsonResponse({"detail": "Не удалось добавить товары"}, status=400)
-
+            product = Product.objects.filter(id=raw.get("productId"), distributor=client.distributor, is_active=True).first()
+            if product:
+                OrderItem.objects.create(order=order, product=product, sku=product.sku, name=product.name, category=product.category, brand=product.brand, volume=product.volume, price=product.price, quantity=int(raw.get("quantity") or 1))
     return JsonResponse({"order": _format_order(order)}, status=201)
 
 
@@ -619,36 +792,43 @@ def create_purchase(request):
     client, err = _require_client(request)
     if err:
         return err
-    payload = _json(request)
-    purchase = Purchase.objects.create(
-        client=client,
-        distributor=client.distributor,
-        document_number=(payload.get("documentNumber") or "").strip(),
-        date=_date(payload.get("date")),
-        total_amount=payload.get("totalAmount") or 0,
-        status="pending",
-        document_url=(payload.get("documentUrl") or "").strip(),
-    )
-    for raw in payload.get("items") or []:
-        PurchaseItem.objects.create(
-            purchase=purchase,
-            sku=raw.get("sku") or "",
-            name=raw.get("name") or "",
-            category=raw.get("category") or "",
-            quantity=raw.get("quantity") or 1,
-            volume=raw.get("volume") or 0,
-            price=raw.get("price") or 0,
-            brand=raw.get("brand") or "AutoTerra",
+    payload = request.POST if (request.content_type or "").startswith("multipart/form-data") else _json(request)
+    files = _attachment_files(request)
+    with transaction.atomic():
+        purchase = Purchase.objects.create(
+            client=client,
+            distributor=client.distributor,
+            document_number=(payload.get("documentNumber") or "").strip(),
+            date=_date(payload.get("date")),
+            total_amount=_money_value(payload.get("totalAmount")),
+            status="pending_verification",
         )
+        _create_attachments(request, purchase, files, description="Документ покупки")
+        items = _parse_items(payload.get("items"))
+        for raw in items:
+            PurchaseItem.objects.create(purchase=purchase, sku=raw.get("sku"), name=raw.get("name"), quantity=int(raw.get("quantity") or 1), price=_money_value(raw.get("price")))
     return JsonResponse({"purchase": _format_purchase(purchase)}, status=201)
 
+
+# Color Lab Views
 
 @require_GET
 def color_requests(request):
     client, err = _require_client(request)
     if err:
         return err
-    return JsonResponse({"results": [_format_color_request(item) for item in client.color_requests.all()]})
+    qs = client.color_requests.prefetch_related("materials", "courier_tasks").all()
+    return JsonResponse({"results": [_format_color_request(item) for item in qs]})
+
+
+def _append_color_history(item, status, user=None, comment=""):
+    history_item = {
+        "status": status,
+        "at": timezone.now().isoformat(),
+        "by": str(user.id) if user else None,
+        "comment": comment,
+    }
+    item.status_history = [*(item.status_history or []), history_item]
 
 
 @csrf_exempt
@@ -657,26 +837,58 @@ def create_color_request(request):
     client, err = _require_client(request)
     if err:
         return err
-    payload = _json(request)
-    item = ColorRequest.objects.create(
-        client=client,
-        car_brand=(payload.get("carBrand") or "").strip(),
-        car_model=(payload.get("carModel") or "").strip(),
-        vin=(payload.get("vin") or "").strip(),
-        color_code=(payload.get("colorCode") or "").strip(),
-        color_name=(payload.get("colorName") or "").strip(),
-        urgent=bool(payload.get("urgent")),
-        courier_pickup=bool(payload.get("courierPickup")),
-    )
+    payload = request.POST if (request.content_type or "").startswith("multipart/form-data") else _json(request)
+    files = _attachment_files(request)
+    with transaction.atomic():
+        item = ColorRequest.objects.create(
+            client=client,
+            car_brand=(payload.get("carBrand") or "").strip(),
+            car_model=(payload.get("carModel") or "").strip(),
+            car_year=(payload.get("carYear") or "").strip()[:4],
+            vin=(payload.get("vin") or "").strip(),
+            color_code=(payload.get("colorCode") or "").strip(),
+            color_name=(payload.get("colorName") or "").strip(),
+            urgent=str(payload.get("urgent")).lower() in {"true", "1", "yes"},
+            comment=(payload.get("comment") or "").strip(),
+            courier_pickup=str(payload.get("courierPickup")).lower() in {"true", "1", "yes"},
+            pickup_address=(payload.get("pickupAddress") or payload.get("address") or client.city).strip(),
+            pickup_date=_dt(payload.get("pickupDate") or payload.get("pickupTime") or payload.get("scheduledTime")) if payload.get("pickupDate") or payload.get("pickupTime") or payload.get("scheduledTime") else None,
+            contact_person=(payload.get("contactPerson") or payload.get("contactName") or client.contact_name).strip(),
+            contact_phone=(payload.get("contactPhone") or client.phone).strip(),
+            delivery_method=(payload.get("deliveryMethod") or "courier").strip(),
+            assigned_distributor=client.distributor,
+        )
+        sla_hours = 4 if item.urgent else 24
+        item.sla_deadline = item.created_at + timezone.timedelta(hours=sla_hours)
+        _append_color_history(item, "created", _current_user(request), "Заявка создана")
+        item.save(update_fields=["sla_deadline", "status_history"])
+        _create_attachments(request, item, files, description="Фото для Color Lab")
+        if item.courier_pickup:
+            task = CourierTask.objects.create(
+                client=client,
+                color_request=item,
+                type="pickup",
+                address=item.pickup_address or client.city,
+                scheduled_time=item.pickup_date or (timezone.now() + timezone.timedelta(hours=2)),
+                contact_name=item.contact_person,
+                contact_phone=item.contact_phone,
+                car_description=f"{item.car_brand} {item.car_model} · {item.color_code}",
+                comment=(item.comment or "Забор лючка для Color Lab").strip(),
+            )
+            _append_task_history(task, "created", _current_user(request), "Создано из Color Lab")
+            task.save(update_fields=["status_history"])
     return JsonResponse({"request": _format_color_request(item)}, status=201)
 
+
+# Courier Views
 
 @require_GET
 def courier_tasks(request):
     client, err = _require_client(request)
     if err:
         return err
-    return JsonResponse({"results": [_format_courier_task(item) for item in client.courier_tasks.all()]})
+    qs = client.courier_tasks.all()
+    return JsonResponse({"results": [_format_courier_task(item) for item in qs]})
 
 
 @csrf_exempt
@@ -686,26 +898,281 @@ def create_courier_task(request):
     if err:
         return err
     payload = _json(request)
-    item = CourierTask.objects.create(
+    task = CourierTask.objects.create(
         client=client,
-        type=payload.get("type") or "delivery",
-        address=(payload.get("address") or "").strip(),
+        type=payload.get("type", "delivery"),
+        address=payload.get("address", client.city),
         scheduled_time=_dt(payload.get("scheduledTime")),
-        contact_name=(payload.get("contactName") or client.contact_name).strip(),
-        contact_phone=(payload.get("contactPhone") or client.phone).strip(),
-        car_description=(payload.get("carDescription") or "").strip(),
-        comment=(payload.get("comment") or "").strip(),
+        contact_name=payload.get("contactName", client.contact_name),
+        contact_phone=payload.get("contactPhone", client.phone),
+        car_description=payload.get("carDescription", ""),
+        comment=payload.get("comment", ""),
     )
-    return JsonResponse({"task": _format_courier_task(item)}, status=201)
+    _append_task_history(task, "created", _current_user(request), "Создано клиентом")
+    task.save(update_fields=["status_history"])
+    return JsonResponse({"task": _format_courier_task(task)}, status=201)
 
+
+@csrf_exempt
+@require_POST
+def courier_task_proof(request, task_id):
+    client, err = _require_client(request)
+    if err:
+        return err
+    task = client.courier_tasks.filter(id=task_id).first()
+    if task:
+        files = _attachment_files(request)
+        _create_attachments(request, task, files, description="Фото подтверждение")
+    return JsonResponse({"task": _format_courier_task(task)})
+
+
+@require_GET
+def courier_my_tasks(request):
+    user, is_admin, err = _require_courier_scope(request)
+    if err:
+        return err
+    qs = _scope_courier_tasks(user, is_admin).order_by("scheduled_time")
+    return JsonResponse({"results": [_format_courier_task(item) for item in qs]})
+
+
+@require_GET
+def courier_task_detail(request, task_id):
+    user, is_admin, err = _require_courier_scope(request)
+    if err:
+        return err
+    task = _scope_courier_tasks(user, is_admin).filter(id=task_id).first()
+    if not task:
+        return JsonResponse({"detail": "Задача не найдена"}, status=404)
+    return JsonResponse({"task": _format_courier_task(task)})
+
+
+@csrf_exempt
+@require_POST
+def courier_task_status(request, task_id):
+    user, is_admin, err = _require_courier_scope(request)
+    if err:
+        return err
+    status = (_json(request).get("status") or "").strip()
+    task = _scope_courier_tasks(user, is_admin).filter(id=task_id).first()
+    if task:
+        task.status = status
+        _append_task_history(task, status, user)
+        task.save(update_fields=["status", "status_history"])
+    return JsonResponse({"task": _format_courier_task(task)})
+
+
+@csrf_exempt
+@require_POST
+def courier_task_comment(request, task_id):
+    user, is_admin, err = _require_courier_scope(request)
+    if err:
+        return err
+    comment = (_json(request).get("comment") or "").strip()
+    task = _scope_courier_tasks(user, is_admin).filter(id=task_id).first()
+    if task:
+        task.courier_comment = comment
+        task.save(update_fields=["courier_comment"])
+    return JsonResponse({"task": _format_courier_task(task)})
+
+
+@csrf_exempt
+@require_POST
+def courier_task_proof_by_courier(request, task_id):
+    user, is_admin, err = _require_courier_scope(request)
+    if err:
+        return err
+    task = _scope_courier_tasks(user, is_admin).filter(id=task_id).first()
+    if task:
+        files = _attachment_files(request)
+        _create_attachments(request, task, files, description="Фото подтверждение от курьера")
+    return JsonResponse({"task": _format_courier_task(task)})
+
+
+@csrf_exempt
+@require_POST
+def assign_courier_task(request, task_id):
+    user, is_admin, err = _require_courier_scope(request)
+    if not is_admin:
+        return JsonResponse({"detail": "Только администратор может назначать курьеров"}, status=403)
+    courier_id = _json(request).get("courierId")
+    task = CourierTask.objects.filter(id=task_id).first()
+    if task:
+        task.assigned_courier_id = courier_id
+        task.status = "assigned"
+        _append_task_history(task, "assigned", user, f"Назначен курьер {courier_id}")
+        task.save(update_fields=["assigned_courier", "status", "status_history"])
+    return JsonResponse({"task": _format_courier_task(task)})
+
+
+# Distributor Views
+
+@require_GET
+def distributor_dashboard(request):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    clients = _scope_clients(distributor, is_admin)
+    purchases = _scope_purchases(distributor, is_admin)
+    orders_qs = _scope_orders(distributor, is_admin)
+    return JsonResponse({"metrics": {"clients": clients.count(), "purchasesToVerify": purchases.filter(status__in=["pending", "pending_verification"]).count(), "ordersToProcess": orders_qs.filter(status="pending").count()}})
+
+
+@require_GET
+def distributor_clients(request):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    qs = _scope_clients(distributor, is_admin)
+    return JsonResponse({"results": [_format_client(item) for item in qs]})
+
+
+@require_GET
+def distributor_purchases(request):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    qs = _scope_purchases(distributor, is_admin).order_by("-created_at")
+    return JsonResponse({"results": [_format_purchase(item) for item in qs]})
+
+
+@csrf_exempt
+@require_POST
+def distributor_confirm_purchase(request, purchase_id):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    purchase = _scope_purchases(distributor, is_admin).filter(id=purchase_id).first()
+    if purchase:
+        purchase.status = "verified"
+        purchase.save(update_fields=["status"])
+    return JsonResponse({"purchase": _format_purchase(purchase)})
+
+
+@csrf_exempt
+@require_POST
+def distributor_reject_purchase(request, purchase_id):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    reason = (_json(request).get("reason") or "").strip()
+    purchase = _scope_purchases(distributor, is_admin).filter(id=purchase_id).first()
+    if purchase:
+        purchase.status = "rejected"
+        purchase.rejection_reason = reason
+        purchase.save(update_fields=["status", "rejection_reason"])
+    return JsonResponse({"purchase": _format_purchase(purchase)})
+
+
+@require_GET
+def distributor_orders(request):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    qs = _scope_orders(distributor, is_admin).order_by("-created_at")
+    return JsonResponse({"results": [_format_order(item) for item in qs]})
+
+
+@csrf_exempt
+@require_POST
+def distributor_accept_order(request, order_id):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    order = _scope_orders(distributor, is_admin).filter(id=order_id).first()
+    if order:
+        order.status = "accepted"
+        order.save(update_fields=["status"])
+    return JsonResponse({"order": _format_order(order)})
+
+
+@csrf_exempt
+@require_POST
+def distributor_reject_order(request, order_id):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    reason = (_json(request).get("reason") or "").strip()
+    order = _scope_orders(distributor, is_admin).filter(id=order_id).first()
+    if order:
+        order.status = "rejected"
+        order.rejection_reason = reason
+        order.save(update_fields=["status", "rejection_reason"])
+    return JsonResponse({"order": _format_order(order)})
+
+
+@csrf_exempt
+@require_POST
+def distributor_update_order_status(request, order_id):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    status = (_json(request).get("status") or "").strip()
+    order = _scope_orders(distributor, is_admin).filter(id=order_id).first()
+    if order:
+        order.status = status
+        order.save(update_fields=["status"])
+    return JsonResponse({"order": _format_order(order)})
+
+
+@require_GET
+def distributor_stock(request):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    qs = _scope_products(distributor, is_admin)
+    return JsonResponse({"results": [_format_product(item) for item in qs]})
+
+
+@csrf_exempt
+@require_POST
+def distributor_stock_upload(request):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    if is_admin:
+        return JsonResponse({"detail": "Admin must specify distributorId"}, status=400)
+    items = _json(request).get("items", [])
+    with transaction.atomic():
+        for raw in items:
+            Product.objects.update_or_create(
+                distributor=distributor,
+                sku=raw.get("sku"),
+                defaults={
+                    "name": raw.get("name"),
+                    "category": raw.get("category"),
+                    "brand": raw.get("brand", "AutoTerra"),
+                    "price": _money_value(raw.get("price")),
+                    "quantity": int(raw.get("quantity", 0)),
+                    "status": raw.get("status", "inStock"),
+                }
+            )
+    return JsonResponse({"status": "ok", "processed": len(items)})
+
+
+@require_GET
+def distributor_reports(request):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    return JsonResponse({"summary": "Stock and order reports will be here"})
+
+
+# Referral Views
 
 @require_GET
 def referrals(request):
     client, err = _require_client(request)
     if err:
         return err
-    qs = list(client.referrals.all())
-    return JsonResponse({"stats": _referral_stats(qs), "results": [_format_referral(item) for item in qs]})
+    qs = client.referrals.all()
+    stats = {
+        "invitedCount": qs.count(),
+        "registeredCount": qs.filter(is_registered=True).count(),
+        "buyersCount": qs.filter(has_purchase=True).count(),
+        "giftCount": qs.filter(condition_met=True).count(),
+        "purchaseAmount": float(sum(r.purchase_amount for r in qs)),
+    }
+    return JsonResponse({"stats": stats, "results": [_format_referral(r) for r in qs]})
 
 
 @csrf_exempt
@@ -717,18 +1184,28 @@ def create_referral(request):
     payload = _json(request)
     item = Referral.objects.create(
         inviter=client,
-        invitee_inn=(payload.get("inviteeInn") or "").strip(),
-        invitee_name=(payload.get("inviteeName") or "").strip(),
-        region=(payload.get("region") or client.region).strip(),
+        invitee_inn=payload.get("inviteeInn"),
+        invitee_name=payload.get("inviteeName"),
+        region=payload.get("region", client.region),
     )
     return JsonResponse({"referral": _format_referral(item)}, status=201)
 
+
+# Support & Expert Views
 
 @require_GET
 def tickets(request):
     client, err = _require_client(request)
     if err:
-        return err
+        # Check if it's an expert
+        user, is_admin, expert_err = _require_expert_scope(request)
+        if expert_err:
+            return err # Original unauthorized error
+        # It's an expert, return all tickets or filtered
+        qs = ExpertTicket.objects.select_related("client").prefetch_related("materials").all()
+        return JsonResponse({"results": [_format_ticket(item) for item in qs]})
+    
+    # It's a client, return only their tickets
     return JsonResponse({"results": [_format_ticket(item) for item in client.expert_tickets.all()]})
 
 
@@ -738,13 +1215,101 @@ def create_ticket(request):
     client, err = _require_client(request)
     if err:
         return err
-    payload = _json(request)
-    item = ExpertTicket.objects.create(
-        client=client,
-        question=(payload.get("question") or "").strip(),
-        category=(payload.get("category") or "Общий вопрос").strip(),
-    )
+    payload = request.POST if (request.content_type or "").startswith("multipart/form-data") else _json(request)
+    files = _attachment_files(request)
+    with transaction.atomic():
+        item = ExpertTicket.objects.create(
+            client=client,
+            question=(payload.get("question") or "").strip(),
+            category=(payload.get("category") or "General").strip(),
+            risk=payload.get("risk", "low"),
+            status="open",
+        )
+        _create_attachments(request, item, files, description="Вложения к тикету")
+        
+        # Simple AI draft generation logic
+        cards = KnowledgeCard.objects.filter(status="approved").filter(
+            Q(problem__icontains=item.question) | Q(title__icontains=item.question)
+        )
+        if cards.exists():
+            card = cards.first()
+            item.ai_draft_answer = f"Предположительный ответ на основе базы знаний:\n{card.solution}"
+            item.similar_cases = [str(card.id)]
+            item.save(update_fields=["ai_draft_answer", "similar_cases"])
+
     return JsonResponse({"ticket": _format_ticket(item)}, status=201)
+
+
+@csrf_exempt
+@require_POST
+def expert_answer_ticket(request, ticket_id):
+    user, is_admin, err = _require_expert_scope(request)
+    if err:
+        return err
+    payload = _json(request)
+    answer = (payload.get("answer") or "").strip()
+    status = payload.get("status", "expertAnswered")
+    
+    ticket = ExpertTicket.objects.filter(id=ticket_id).first()
+    if not ticket:
+        return JsonResponse({"detail": "Тикет не найден"}, status=404)
+        
+    with transaction.atomic():
+        ticket.expert_answer = answer
+        ticket.status = status
+        ticket.save(update_fields=["expert_answer", "status"])
+        
+        # If expert wants to create a knowledge card from this
+        if payload.get("createKnowledgeCard"):
+            card = KnowledgeCard.objects.create(
+                title=f"Кейс: {ticket.category}",
+                category=ticket.category,
+                problem=ticket.question,
+                solution=answer,
+                status="draft",
+                created_by=user,
+            )
+            ticket.linked_knowledge_card = card
+            ticket.save(update_fields=["linked_knowledge_card"])
+            
+    return JsonResponse({"ticket": _format_ticket(ticket)})
+
+
+@require_GET
+def knowledge_cards(request):
+    user = _current_user(request)
+    # Check if user is expert to see drafts
+    if _is_expert_user(user):
+        qs = KnowledgeCard.objects.all()
+    else:
+        qs = KnowledgeCard.objects.filter(status="approved")
+    return JsonResponse({"results": [_format_knowledge_card(item) for item in qs]})
+
+
+@csrf_exempt
+@require_POST
+def update_knowledge_card(request, card_id):
+    user, is_admin, err = _require_expert_scope(request)
+    if err:
+        return err
+    payload = _json(request)
+    card = KnowledgeCard.objects.filter(id=card_id).first()
+    if not card:
+        return JsonResponse({"detail": "Карточка не найдена"}, status=404)
+        
+    fields = ["title", "category", "problem", "causes", "solution", "status", "skus", "restrictions"]
+    updated_fields = []
+    for f in fields:
+        if f in payload:
+            setattr(card, f, payload[f])
+            updated_fields.append(f)
+            
+    if payload.get("status") == "approved":
+        card.approved_by = user
+        updated_fields.append("approved_by")
+        
+    card.save(update_fields=updated_fields)
+    return JsonResponse({"card": _format_knowledge_card(card)})
 
 
 @require_GET
@@ -765,34 +1330,47 @@ def mark_notifications_read(request):
     return JsonResponse({"ok": True})
 
 
-@require_GET
-def knowledge_cards(request):
-    client, err = _require_client(request)
-    if err:
-        return err
-    qs = KnowledgeCard.objects.filter(is_approved=True)
-    return JsonResponse({"results": [_format_knowledge_card(item) for item in qs]})
-
-
 @csrf_exempt
 @require_POST
 def ai_chat(request):
     client, err = _require_client(request)
     if err:
         return err
-    question = (_json(request).get("message") or "").strip()
-    if not question:
-        return JsonResponse({"detail": "Введите вопрос"}, status=400)
-    try:
-        answer = _hf_chat_answer(client, question)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore") or exc.reason
-        return JsonResponse({"detail": f"Hugging Face error: {detail}"}, status=502)
-    except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError) as exc:
-        return JsonResponse({"detail": f"AI service unavailable: {exc}"}, status=502)
-    return JsonResponse(
-        {
-            "answer": answer,
-            "model": settings.HF_CHAT_MODEL,
-        }
+    payload = _json(request)
+    question = (payload.get("message") or "").strip()
+    
+    # AI logic with guardrails
+    cards = KnowledgeCard.objects.filter(status="approved").filter(
+        Q(problem__icontains=question) | Q(title__icontains=question) | Q(category__icontains=question)
     )
+    
+    if cards.exists():
+        card = cards.first()
+        # Prevent giving technical advice if it looks like something dangerous and not explicitly covered
+        dangerous_keywords = ["пропорции", "гарантия", "совместимость", "срок годности"]
+        looks_dangerous = any(kw in question.lower() for kw in dangerous_keywords)
+        
+        if looks_dangerous and not any(kw in card.solution.lower() for kw in dangerous_keywords):
+            answer = ("Я нашел похожую инструкцию, но она не содержит точных данных по вашему вопросу (пропорции/совместимость). "
+                      "Чтобы гарантировать качество ремонта, я не могу дать совет без подтвержденного источника. "
+                      "Рекомендую создать тикет нашему технологу.")
+            source_id = None
+            suggest_escalation = True
+        else:
+            answer = f"На основе нашей базы знаний ({card.category}):\n\n{card.solution}"
+            if card.restrictions:
+                answer += f"\n\nВажно: {card.restrictions}"
+            source_id = str(card.id)
+            suggest_escalation = False
+    else:
+        answer = ("К сожалению, у меня нет подтвержденной технической инструкции по вашему вопросу. "
+                  "Я постоянно обучаюсь, но сейчас лучше уточнить этот момент у эксперта. "
+                  "Создать обращение технологу?")
+        source_id = None
+        suggest_escalation = True
+
+    return JsonResponse({
+        "answer": answer,
+        "sourceId": source_id,
+        "suggestEscalation": suggest_escalation
+    })

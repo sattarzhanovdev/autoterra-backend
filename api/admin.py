@@ -12,6 +12,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 
 from .forms import ProductExcelImportForm
 from .models import (
+    Attachment,
     AuthToken,
     ClientProfile,
     ColorRequest,
@@ -25,6 +26,7 @@ from .models import (
     Product,
     Purchase,
     PurchaseItem,
+    Region,
     Referral,
     Store,
 )
@@ -183,6 +185,13 @@ class DistributorAdmin(admin.ModelAdmin):
     inlines = (ProductInline,)
 
 
+@admin.register(Region)
+class RegionAdmin(admin.ModelAdmin):
+    list_display = ("id", "code", "name", "distributor", "manager", "is_active")
+    list_filter = ("is_active", "distributor")
+    search_fields = ("code", "name", "distributor__name", "manager__username", "manager__email")
+
+
 @admin.register(ClientProfile)
 class ClientProfileAdmin(admin.ModelAdmin):
     list_display = (
@@ -193,13 +202,15 @@ class ClientProfileAdmin(admin.ModelAdmin):
         "region",
         "city",
         "distributor",
+        "manager",
         "status",
+        "registration_source",
         "partner_status",
         "referral_count",
         "referral_registered_count",
         "referral_purchase_amount",
     )
-    list_filter = ("category", "status", "partner_status", "region", "distributor")
+    list_filter = ("category", "status", "registration_source", "partner_status", "region", "distributor")
     search_fields = ("company_name", "inn", "contact_name", "phone", "user__username", "user__email")
     readonly_fields = ("created_at",)
     inlines = (StoreInline,)
@@ -398,7 +409,7 @@ class OrderAdmin(admin.ModelAdmin):
 
 @admin.register(Purchase)
 class PurchaseAdmin(admin.ModelAdmin):
-    list_display = ("id", "document_number", "client", "distributor", "date", "total_amount", "status")
+    list_display = ("id", "document_number", "client", "distributor", "date", "total_amount", "status", "document_file")
     list_filter = ("status", "distributor", "date")
     search_fields = ("document_number", "client__company_name", "client__inn")
     readonly_fields = ("created_at",)
@@ -415,8 +426,8 @@ class ColorRequestAdmin(admin.ModelAdmin):
 
 @admin.register(CourierTask)
 class CourierTaskAdmin(admin.ModelAdmin):
-    list_display = ("id", "client", "type", "address", "scheduled_time", "status", "courier_id")
-    list_filter = ("type", "status", "scheduled_time", "client__distributor")
+    list_display = ("id", "client", "type", "address", "scheduled_time", "status", "assigned_courier", "courier_id")
+    list_filter = ("type", "status", "scheduled_time", "client__distributor", "assigned_courier")
     search_fields = ("client__company_name", "address", "contact_name", "contact_phone", "car_description")
     readonly_fields = ("created_at",)
 
@@ -441,10 +452,10 @@ class ReferralAdmin(admin.ModelAdmin):
 
 @admin.register(ExpertTicket)
 class ExpertTicketAdmin(admin.ModelAdmin):
-    list_display = ("id", "client", "category", "status", "created_at")
-    list_filter = ("status", "category")
-    search_fields = ("client__company_name", "question", "ai_answer", "expert_answer")
-    readonly_fields = ("created_at",)
+    list_display = ("id", "client", "category", "risk", "status", "created_at")
+    list_filter = ("status", "category", "risk")
+    search_fields = ("client__company_name", "question", "expert_answer")
+    readonly_fields = ("created_at", "updated_at")
 
 
 @admin.register(Notification)
@@ -457,10 +468,10 @@ class NotificationAdmin(admin.ModelAdmin):
 
 @admin.register(KnowledgeCard)
 class KnowledgeCardAdmin(admin.ModelAdmin):
-    list_display = ("id", "problem", "approving_expert", "is_approved", "created_at")
-    list_filter = ("is_approved",)
-    search_fields = ("problem", "causes", "solution", "skus")
-    readonly_fields = ("created_at",)
+    list_display = ("id", "title", "problem", "category", "status", "created_at")
+    list_filter = ("status", "category")
+    search_fields = ("title", "problem", "causes", "solution", "skus")
+    readonly_fields = ("created_at", "updated_at")
 
 
 @admin.register(AuthToken)
@@ -468,3 +479,11 @@ class AuthTokenAdmin(admin.ModelAdmin):
     list_display = ("id", "user", "key", "created_at")
     search_fields = ("user__username", "user__email", "key")
     readonly_fields = ("created_at",)
+
+
+@admin.register(Attachment)
+class AttachmentAdmin(admin.ModelAdmin):
+    list_display = ("id", "file", "file_type", "uploaded_by", "uploaded_at", "content_type", "object_id")
+    list_filter = ("file_type", "content_type", "uploaded_at")
+    search_fields = ("file", "description", "uploaded_by__username", "uploaded_by__email")
+    readonly_fields = ("uploaded_at",)

@@ -82,8 +82,7 @@ SCHEMAS = {
             "phone": {
                 "type": "string",
                 "description": (
-                    "Username пользователя. Для автосервиса обычно телефон. "
-                    "Номер с 8 нормализуется в +7."
+                    "Username пользователя. Номер с 8 нормализуется в +7."
                 ),
                 "example": "+996222121217",
             },
@@ -101,25 +100,18 @@ SCHEMAS = {
             },
             "user": {
                 "type": "object",
-                "description": (
-                    "Данные пользователя. Для role=autoservice доступно мобильное приложение. "
-                    "Для role=distributor backend возвращает карточку distributor, но мобильные "
-                    "клиентские endpoint-ы пока требуют ClientProfile."
-                ),
                 "properties": {
                     "id": {"type": "string", "example": "12"},
                     "phone": {"type": "string", "example": "+996222121217"},
                     "email": {"type": "string", "example": "client@example.com"},
-                    "role": {"type": "string", "enum": ["autoservice", "distributor"]},
+                    "role": {"type": "string", "enum": ["autoservice", "distributor", "courier", "expert"]},
                     "status": {"type": "string", "example": "active"},
-                    "distributor": _ref("Distributor"),
                 },
             },
         },
     },
     "Client": {
         "type": "object",
-        "description": "Профиль автосервиса. Создаётся и редактируется через Django admin.",
         "properties": {
             "id": {"type": "string", "example": "1"},
             "inn": {"type": "string", "example": "222122004503"},
@@ -130,661 +122,162 @@ SCHEMAS = {
             "contact": {"type": "string", "example": "Даниел"},
             "phone": {"type": "string", "example": "+996222121217"},
             "distributorId": {"type": "string", "example": "2"},
-            "managerId": {"type": "string", "nullable": True, "example": None},
-            "status": {
-                "type": "string",
-                "enum": ["newClient", "pending", "active", "blocked", "archived"],
-                "example": "active",
-            },
+            "managerId": {"type": "string", "nullable": True},
+            "status": {"type": "string", "example": "active"},
             "partnerStatus": {"type": "string", "example": "Silver"},
-            "totalPurchases": {"type": "number", "format": "double", "example": 128500.0},
+            "totalPurchases": {"type": "number", "example": 128500.0},
             "createdAt": {"type": "string", "format": "date-time"},
         },
     },
     "Distributor": {
         "type": "object",
-        "description": (
-            "Дистрибьютор, закреплённый за регионом и клиентами. "
-            "Поле userId появляется, если в admin привязан аккаунт дистрибьютора."
-        ),
         "properties": {
             "id": {"type": "string", "example": "2"},
-            "userId": {"type": "string", "nullable": True, "example": "7"},
+            "userId": {"type": "string", "nullable": True},
             "name": {"type": "string", "example": "Daniel Sattarzhanov"},
             "inn": {"type": "string", "example": "222122004503"},
-            "regions": _array({"type": "string", "example": "Бишкек"}),
+            "regions": _array({"type": "string"}),
             "phone": {"type": "string", "example": "+996222121217"},
             "email": {"type": "string", "format": "email", "example": "dist@example.com"},
             "isActive": {"type": "boolean", "example": True},
         },
     },
-    "Store": {
-        "type": "object",
-        "description": "Точка самовывоза/магазин клиента у закреплённого дистрибьютора.",
-        "properties": {
-            "id": {"type": "string", "example": "5"},
-            "name": {"type": "string", "example": "Магазин Профсоюзная"},
-            "address": {"type": "string", "example": "Бишкек, ул. Киевская, 120"},
-            "isActive": {"type": "boolean", "example": True},
-            "createdAt": {"type": "string", "format": "date-time"},
-        },
-    },
-    "Product": {
-        "type": "object",
-        "description": "Позиция ассортимента закреплённого дистрибьютора клиента. Чужие прайсы клиенту не отдаются.",
-        "properties": {
-            "id": {"type": "string", "example": "11"},
-            "distributorId": {"type": "string", "example": "2"},
-            "sku": {"type": "string", "example": "LAK-015"},
-            "name": {"type": "string", "example": "Лак HS 2+1"},
-            "category": {"type": "string", "example": "Лаки"},
-            "brand": {"type": "string", "example": "AutoTerra"},
-            "volume": {"type": "number", "format": "double", "example": 1.0},
-            "price": {"type": "number", "format": "double", "example": 2800.0},
-            "quantity": {"type": "integer", "example": 24},
-            "status": {"type": "string", "enum": ["inStock", "low", "onOrder", "outOfStock"]},
-            "updatedAt": {"type": "string", "format": "date-time"},
-        },
-    },
-    "ReferralStats": {
-        "type": "object",
-        "description": "Сводка по рекомендациям клиента. Backend сверяет приглашённых по ИНН с зарегистрированными ClientProfile.",
-        "properties": {
-            "invitedCount": {"type": "integer", "example": 5},
-            "registeredCount": {"type": "integer", "example": 3},
-            "buyersCount": {"type": "integer", "example": 2},
-            "giftCount": {"type": "integer", "example": 1},
-            "purchaseAmount": {"type": "number", "format": "double", "example": 84500},
-        },
-    },
-    "PurchaseItem": {
+    "Attachment": {
         "type": "object",
         "properties": {
-            "sku": {"type": "string", "example": "LAK-015"},
-            "name": {"type": "string", "example": "Лак HS 2+1"},
-            "category": {"type": "string", "example": "Лаки"},
-            "quantity": {"type": "integer", "example": 2},
-            "volume": {"type": "number", "format": "double", "example": 1.0},
-            "price": {"type": "number", "format": "double", "example": 2800.0},
-            "brand": {"type": "string", "example": "AutoTerra"},
-        },
+            "id": {"type": "string"},
+            "url": {"type": "string"},
+            "name": {"type": "string"},
+            "fileType": {"type": "string"},
+            "uploadedAt": {"type": "string", "format": "date-time"},
+            "description": {"type": "string", "nullable": True},
+        }
     },
-    "Purchase": {
-        "type": "object",
-        "description": "Подтверждённая или ожидающая проверки покупка/УПД.",
-        "properties": {
-            "id": {"type": "string", "example": "6"},
-            "clientId": {"type": "string", "example": "1"},
-            "distributorId": {"type": "string", "example": "2"},
-            "documentNumber": {"type": "string", "example": "УПД-2026-001"},
-            "date": {"type": "string", "format": "date", "example": "2026-05-20"},
-            "totalAmount": {"type": "number", "format": "double", "example": 5600.0},
-            "status": {"type": "string", "enum": ["pending", "verified", "rejected"]},
-            "documentUrl": {"type": "string", "nullable": True, "example": None},
-            "createdAt": {"type": "string", "format": "date-time"},
-            "items": _array(_ref("PurchaseItem")),
-        },
-    },
-    "OrderItem": {
-        "allOf": [_ref("PurchaseItem")],
-        "description": "Снимок товара на момент заказа.",
-    },
-    "Order": {
-        "type": "object",
-        "description": "Заявка клиента на заказ ассортимента у закреплённого дистрибьютора.",
-        "properties": {
-            "id": {"type": "string", "example": "9"},
-            "clientId": {"type": "string", "example": "1"},
-            "distributorId": {"type": "string", "example": "2"},
-            "storeId": {"type": "string", "example": "5"},
-            "storeName": {"type": "string", "example": "Магазин Профсоюзная"},
-            "documentNumber": {"type": "string", "example": "ORD-00009"},
-            "date": {"type": "string", "format": "date-time"},
-            "totalAmount": {"type": "number", "format": "double", "example": 8400.0},
-            "status": {"type": "string", "enum": ["pending", "verified"]},
-            "orderStatus": {"type": "string", "enum": ["pending", "accepted", "rejected", "done"]},
-            "comment": {"type": "string", "example": "Нужен счёт и аналог растворителя"},
-            "documentUrl": {"type": "string", "nullable": True, "example": None},
-            "createdAt": {"type": "string", "format": "date-time"},
-            "items": _array(_ref("OrderItem")),
-        },
-    },
-    "CreateOrderRequest": {
-        "type": "object",
-        "required": ["storeId", "items"],
-        "properties": {
-            "storeId": {"type": "string", "description": "ID активной точки клиента.", "example": "5"},
-            "comment": {"type": "string", "example": "Подготовьте счёт"},
-            "items": _array(
-                {
-                    "type": "object",
-                    "required": ["productId", "quantity"],
-                    "properties": {
-                        "productId": {
-                            "type": "string",
-                            "description": "ID активного Product у дистрибьютора клиента.",
-                            "example": "11",
-                        },
-                        "quantity": {"type": "integer", "minimum": 1, "example": 3},
-                    },
-                }
-            ),
-        },
-    },
-    "CreatePurchaseRequest": {
+    "ExpertTicket": {
         "type": "object",
         "properties": {
-            "documentNumber": {"type": "string", "example": "УПД-2026-001"},
-            "date": {"type": "string", "format": "date", "example": "2026-05-20"},
-            "totalAmount": {"type": "number", "format": "double", "example": 5600},
-            "documentUrl": {"type": "string", "example": "upd_2026_001.pdf"},
-            "items": _array(_ref("PurchaseItem")),
-        },
-    },
-    "ColorRequest": {
-        "type": "object",
-        "description": "Заявка на подбор цвета. Забор лючка является опцией courierPickup.",
-        "properties": {
-            "id": {"type": "string", "example": "3"},
-            "clientId": {"type": "string", "example": "1"},
-            "carBrand": {"type": "string", "example": "Toyota"},
-            "carModel": {"type": "string", "example": "Camry"},
-            "vin": {"type": "string", "example": "JTDBT923391234567"},
-            "colorCode": {"type": "string", "example": "1F7"},
-            "colorName": {"type": "string", "example": "Silver Metallic"},
-            "urgent": {"type": "boolean", "example": False},
-            "courierPickup": {"type": "boolean", "example": True},
-            "status": {"type": "string", "enum": ["created", "inProgress", "ready", "delivered"]},
-            "recipe": {"type": "string", "nullable": True, "example": "Base: 65% Silver..."},
-            "createdAt": {"type": "string", "format": "date-time"},
-        },
-    },
-    "CreateColorRequestRequest": {
-        "type": "object",
-        "required": ["carBrand", "carModel", "vin", "colorCode"],
-        "properties": {
-            "carBrand": {"type": "string", "example": "Toyota"},
-            "carModel": {"type": "string", "example": "Camry"},
-            "vin": {"type": "string", "example": "JTDBT923391234567"},
-            "colorCode": {"type": "string", "example": "1F7"},
-            "colorName": {"type": "string", "example": "Silver Metallic"},
-            "urgent": {"type": "boolean", "example": False},
-            "courierPickup": {"type": "boolean", "example": True},
-        },
-    },
-    "CourierTask": {
-        "type": "object",
-        "properties": {
-            "id": {"type": "string", "example": "8"},
-            "clientId": {"type": "string", "example": "1"},
-            "type": {"type": "string", "enum": ["delivery", "pickup", "return"]},
-            "address": {"type": "string", "example": "Бишкек, ул. Киевская, 120"},
-            "scheduledTime": {"type": "string", "format": "date-time"},
-            "contactName": {"type": "string", "example": "Даниел"},
-            "contactPhone": {"type": "string", "example": "+996222121217"},
-            "carDescription": {"type": "string", "example": "Toyota Camry 1F7"},
-            "status": {"type": "string", "enum": ["created", "assigned", "inProgress", "delivered", "returned"]},
-            "courierId": {"type": "string", "nullable": True, "example": "courier-1"},
-            "photoProof": {"type": "string", "nullable": True, "example": None},
-            "comment": {"type": "string", "nullable": True, "example": "Позвонить за 30 минут"},
-            "createdAt": {"type": "string", "format": "date-time"},
-        },
-    },
-    "CreateCourierTaskRequest": {
-        "type": "object",
-        "required": ["address"],
-        "properties": {
-            "type": {"type": "string", "enum": ["delivery", "pickup", "return"], "example": "delivery"},
-            "address": {"type": "string", "example": "Бишкек, ул. Киевская, 120"},
-            "scheduledTime": {"type": "string", "format": "date-time"},
-            "contactName": {"type": "string", "example": "Даниел"},
-            "contactPhone": {"type": "string", "example": "+996222121217"},
-            "carDescription": {"type": "string", "example": "Toyota Camry 1F7"},
-            "comment": {"type": "string", "example": "Позвонить за 30 минут"},
-        },
-    },
-    "Referral": {
-        "type": "object",
-        "properties": {
-            "id": {"type": "string", "example": "4"},
-            "inviterId": {"type": "string", "example": "1"},
-            "inviteeInn": {"type": "string", "example": "123456789012"},
-            "inviteeName": {"type": "string", "example": "СТО Партнёр"},
-            "region": {"type": "string", "example": "Бишкек"},
-            "isRegistered": {"type": "boolean", "example": False},
-            "hasPurchase": {"type": "boolean", "example": False},
-            "purchaseAmount": {"type": "number", "format": "double", "example": 0},
-            "conditionMet": {"type": "boolean", "example": False},
-            "gift": {"type": "string", "nullable": True, "example": None},
-            "createdAt": {"type": "string", "format": "date-time"},
-        },
-    },
-    "CreateReferralRequest": {
-        "type": "object",
-        "required": ["inviteeInn", "inviteeName"],
-        "properties": {
-            "inviteeInn": {"type": "string", "example": "123456789012"},
-            "inviteeName": {"type": "string", "example": "СТО Партнёр"},
-            "region": {"type": "string", "example": "Бишкек"},
-        },
-    },
-    "Ticket": {
-        "type": "object",
-        "properties": {
-            "id": {"type": "string", "example": "10"},
-            "clientId": {"type": "string", "example": "1"},
-            "question": {"type": "string", "example": "Почему подрывает лак?"},
-            "category": {"type": "string", "example": "Лаки"},
-            "aiAnswer": {"type": "string", "nullable": True, "example": None},
-            "expertAnswer": {"type": "string", "nullable": True, "example": None},
+            "id": {"type": "string"},
+            "clientId": {"type": "string"},
+            "clientName": {"type": "string"},
+            "question": {"type": "string"},
+            "category": {"type": "string"},
+            "risk": {"type": "string", "enum": ["low", "medium", "high"]},
             "status": {"type": "string", "enum": ["open", "aiAnswered", "escalated", "expertAnswered", "closed"]},
+            "aiDraftAnswer": {"type": "string", "nullable": True},
+            "aiAnswer": {"type": "string", "nullable": True},
+            "expertAnswer": {"type": "string", "nullable": True},
+            "linkedKnowledgeCardId": {"type": "string", "nullable": True},
+            "similarCases": _array({"type": "string"}),
             "createdAt": {"type": "string", "format": "date-time"},
+            "updatedAt": {"type": "string", "format": "date-time"},
+            "attachments": _array(_ref("Attachment")),
         },
     },
-    "CreateTicketRequest": {
+    "CreateExpertTicketRequest": {
         "type": "object",
-        "required": ["question"],
+        "required": ["question", "category"],
         "properties": {
             "question": {"type": "string", "example": "Почему подрывает лак?"},
-            "category": {"type": "string", "example": "Лаки"},
-        },
-    },
-    "Notification": {
-        "type": "object",
-        "properties": {
-            "id": {"type": "string", "example": "12"},
-            "title": {"type": "string", "example": "Заказ принят"},
-            "body": {"type": "string", "example": "Дистрибьютор принял заказ ORD-00009."},
-            "type": {"type": "string", "enum": ["order", "color", "delivery", "referral", "ai", "system"]},
-            "isRead": {"type": "boolean", "example": False},
-            "createdAt": {"type": "string", "format": "date-time"},
+            "category": {"type": "string", "example": "Дефекты"},
+            "risk": {"type": "string", "enum": ["low", "medium", "high"], "default": "low"},
         },
     },
     "KnowledgeCard": {
         "type": "object",
         "properties": {
-            "id": {"type": "string", "example": "7"},
-            "problem": {"type": "string", "example": "Подрыв лака"},
-            "causes": {"type": "string", "example": "Нарушена выдержка базы."},
-            "solution": {"type": "string", "example": "Увеличить межслойную выдержку."},
-            "skus": _array({"type": "string", "example": "LAK-015"}),
-            "restrictions": {"type": "string", "nullable": True, "example": None},
-            "approvingExpert": {"type": "string", "example": "Технолог AutoTerra"},
-            "isApproved": {"type": "boolean", "example": True},
+            "id": {"type": "string"},
+            "title": {"type": "string"},
+            "category": {"type": "string"},
+            "problem": {"type": "string"},
+            "causes": {"type": "string", "nullable": True},
+            "solution": {"type": "string"},
+            "skus": _array({"type": "string"}),
+            "restrictions": {"type": "string", "nullable": True},
+            "status": {"type": "string", "enum": ["draft", "approved", "rejected", "archived"]},
+            "isApproved": {"type": "boolean"},
+            "createdBy": {"type": "string", "nullable": True},
+            "approvedBy": {"type": "string", "nullable": True},
+            "revisionHistory": _array({"type": "object"}),
             "createdAt": {"type": "string", "format": "date-time"},
+            "updatedAt": {"type": "string", "format": "date-time"},
         },
     },
+    "AiChatResponse": {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string"},
+            "sourceId": {"type": "string", "nullable": True},
+            "suggestEscalation": {"type": "boolean"},
+        }
+    },
 }
-
-
-def _schema(request):
-    server_url = request.build_absolute_uri("/api").rstrip("/")
-    return {
-        "openapi": "3.0.3",
-        "info": {
-            "title": "AutoTerra Backend API",
-            "version": "1.0.0",
-            "description": (
-                "API для мобильного приложения AutoTerra. Все бизнес-данные управляются "
-                "через Django admin: дистрибьюторы, клиенты, магазины, ассортимент, "
-                "покупки, заказы, колеровка, доставка, уведомления и рефералы.\n\n"
-                "Типовой сценарий:\n"
-                "1. В admin создать User.\n"
-                "2. Создать Distributor и при необходимости привязать аккаунт дистрибьютора.\n"
-                "3. Создать ClientProfile и привязать его к User клиента.\n"
-                "4. Добавить Store и Product.\n"
-                "5. Клиент логинится через /api/login/ и отправляет Bearer token в защищённые endpoint-ы."
-            ),
-            "contact": {"name": "AutoTerra backend"},
-        },
-        "servers": [
-            {"url": server_url, "description": "Текущий Django server"},
-            {"url": "http://192.168.51.83:8000/api", "description": "Локальная сеть для iPhone"},
-            {"url": "http://127.0.0.1:8000/api", "description": "Локально на Mac"},
-        ],
-        "tags": [
-            {"name": "System", "description": "Health check и служебные endpoint-ы."},
-            {"name": "Auth", "description": "Вход и текущий пользователь."},
-            {"name": "Dashboard", "description": "Сводные данные главного экрана."},
-            {"name": "Order", "description": "Ассортимент, магазины и создание заказа."},
-            {"name": "Purchases", "description": "История и добавление покупок/УПД."},
-            {"name": "Color", "description": "Заявки на подбор цвета и опция забора лючка."},
-            {"name": "Delivery", "description": "Доставка заказов и логистика лючка."},
-            {"name": "Referral", "description": "Реферальная программа."},
-            {"name": "Support", "description": "Вопросы эксперту и база знаний."},
-            {"name": "Notifications", "description": "Уведомления клиента."},
-        ],
-        "paths": PATHS,
-        "components": {
-            "securitySchemes": {
-                "BearerAuth": {
-                    "type": "http",
-                    "scheme": "bearer",
-                    "bearerFormat": "token",
-                    "description": "Передавайте токен из /api/login/: Authorization: Bearer <token>",
-                }
-            },
-            "schemas": SCHEMAS,
-        },
-    }
-
 
 PATHS = {
     "/health/": {
         "get": {
             "tags": ["System"],
-            "summary": "Проверка доступности backend",
-            "description": "Публичный endpoint без авторизации. Удобен для проверки, что Django server поднят.",
             "responses": {"200": _ok(_ref("Health"))},
         }
     },
     "/login/": {
         "post": {
             "tags": ["Auth"],
-            "summary": "Вход пользователя",
-            "description": (
-                "Проверяет username/password. Для клиента требуется ClientProfile, иначе будет 403. "
-                "Для дистрибьютора требуется привязка User к Distributor."
-            ),
-            "requestBody": _body(_ref("LoginRequest"), "Телефон/username и пароль."),
-            "responses": {
-                "200": _ok(_ref("LoginResponse")),
-                "401": _error("Неверный телефон или пароль."),
-                "403": _error("User существует, но не привязан к ClientProfile или Distributor."),
-            },
+            "requestBody": _body(_ref("LoginRequest"), "Логин"),
+            "responses": {"200": _ok(_ref("LoginResponse"))},
         }
     },
-    "/auth/me/": {
-        "get": _secured(
-            {
-                "tags": ["Auth"],
-                "summary": "Текущий клиент",
-                "description": "Возвращает профиль автосервиса и закреплённого дистрибьютора.",
-                "responses": {
-                    "200": _ok(
-                        {
-                            "type": "object",
-                            "properties": {
-                                "id": {"type": "string"},
-                                "phone": {"type": "string"},
-                                "email": {"type": "string"},
-                                "role": {"type": "string", "example": "autoservice"},
-                                "client": _ref("Client"),
-                                "distributor": _ref("Distributor"),
-                            },
-                        }
-                    )
-                },
-            }
-        )
-    },
-    "/dashboard/": {
-        "get": _secured(
-            {
-                "tags": ["Dashboard"],
-                "summary": "Главный экран приложения",
-                "description": "Клиент, дистрибьютор, счётчик непрочитанных уведомлений, последние покупки и активные заявки на цвет.",
-                "responses": {
-                    "200": _ok(
-                        {
-                            "type": "object",
-                            "properties": {
-                                "client": _ref("Client"),
-                                "distributor": _ref("Distributor"),
-                                "unreadCount": {"type": "integer", "example": 2},
-                                "recentPurchases": _array(_ref("Purchase")),
-                                "activeColorRequests": _array(_ref("ColorRequest")),
-                            },
-                        }
-                    )
-                },
-            }
-        )
-    },
-    "/stores/": {
-        "get": _secured(
-            {
-                "tags": ["Order"],
-                "summary": "Активные магазины/точки клиента",
-                "description": "Используется при выборе, где клиент заберёт заказ.",
-                "responses": {"200": _ok({"type": "object", "properties": {"results": _array(_ref("Store"))}})},
-            }
-        )
-    },
-    "/products/": {
-        "get": _secured(
-            {
-                "tags": ["Order"],
-                "summary": "Ассортимент закреплённого дистрибьютора",
-                "description": (
-                    "Возвращает только активные товары дистрибьютора клиента. "
-                    "Поддерживает query-параметры category и search для фильтрации по товарной группе, "
-                    "названию, артикулу или бренду."
-                ),
-                "parameters": [
-                    {
-                        "name": "category",
-                        "in": "query",
-                        "required": False,
-                        "schema": {"type": "string"},
-                        "description": "Товарная группа, например Лаки или Грунты.",
-                    },
-                    {
-                        "name": "search",
-                        "in": "query",
-                        "required": False,
-                        "schema": {"type": "string"},
-                        "description": "Поиск по названию, артикулу или бренду.",
-                    },
-                ],
-                "responses": {
-                    "200": _ok(
-                        {
-                            "type": "object",
-                            "properties": {
-                                "distributor": _ref("Distributor"),
-                                "categories": _array({"type": "string", "example": "Лаки"}),
-                                "results": _array(_ref("Product")),
-                            },
-                        }
-                    )
-                },
-            }
-        )
-    },
-    "/order-config/": {
-        "get": _secured(
-            {
-                "tags": ["Order"],
-                "summary": "Всё для экрана заказа одним запросом",
-                "description": "Клиент, дистрибьютор, магазины и ассортимент. Используется экраном 'Направить заказ'.",
-                "responses": {
-                    "200": _ok(
-                        {
-                            "type": "object",
-                            "properties": {
-                                "client": _ref("Client"),
-                                "distributor": _ref("Distributor"),
-                                "stores": _array(_ref("Store")),
-                                "categories": _array({"type": "string", "example": "Грунты"}),
-                                "products": _array(_ref("Product")),
-                            },
-                        }
-                    )
-                },
-            }
-        )
-    },
-    "/orders/": {
-        "get": _secured(
-            {
-                "tags": ["Order"],
-                "summary": "Список заказов клиента",
-                "responses": {"200": _ok({"type": "object", "properties": {"results": _array(_ref("Order"))}})},
-            }
-        )
-    },
-    "/orders/create/": {
-        "post": _secured(
-            {
-                "tags": ["Order"],
-                "summary": "Создать заказ",
-                "description": "Создаёт заказ у закреплённого дистрибьютора. Позиции заказа копируют SKU/цену/название товара на момент оформления.",
-                "requestBody": _body(_ref("CreateOrderRequest"), "Магазин самовывоза, комментарий и товары."),
-                "responses": {
-                    "201": _created({"type": "object", "properties": {"order": _ref("Order")}}),
-                    "400": _error("Не выбран магазин, товары пустые или не удалось добавить позиции."),
-                    "404": _error("Магазин не найден у текущего клиента."),
-                },
-            }
-        )
-    },
-    "/purchases/": {
-        "get": _secured(
-            {
-                "tags": ["Purchases"],
-                "summary": "История покупок клиента",
-                "responses": {"200": _ok({"type": "object", "properties": {"results": _array(_ref("Purchase"))}})},
-            }
-        )
-    },
-    "/purchases/create/": {
-        "post": _secured(
-            {
-                "tags": ["Purchases"],
-                "summary": "Создать покупку/УПД на проверку",
-                "description": "Создаёт покупку со статусом pending. Дистрибьютор и клиент берутся из токена.",
-                "requestBody": _body(_ref("CreatePurchaseRequest"), "Данные документа и позиции."),
-                "responses": {"201": _created({"type": "object", "properties": {"purchase": _ref("Purchase")}})},
-            }
-        )
-    },
-    "/color-requests/": {
-        "get": _secured(
-            {
-                "tags": ["Color"],
-                "summary": "Заявки на подбор цвета",
-                "responses": {"200": _ok({"type": "object", "properties": {"results": _array(_ref("ColorRequest"))}})},
-            }
-        )
-    },
-    "/color-requests/create/": {
-        "post": _secured(
-            {
-                "tags": ["Color"],
-                "summary": "Создать заявку на подбор цвета",
-                "description": "Если нужен забор лючка, передайте courierPickup=true. Это доп-опция колеровки, не отдельная услуга.",
-                "requestBody": _body(_ref("CreateColorRequestRequest"), "Автомобиль, VIN, код цвета и опции."),
-                "responses": {"201": _created({"type": "object", "properties": {"request": _ref("ColorRequest")}})},
-            }
-        )
-    },
-    "/courier-tasks/": {
-        "get": _secured(
-            {
-                "tags": ["Delivery"],
-                "summary": "Заявки доставки клиента",
-                "responses": {"200": _ok({"type": "object", "properties": {"results": _array(_ref("CourierTask"))}})},
-            }
-        )
-    },
-    "/courier-tasks/create/": {
-        "post": _secured(
-            {
-                "tags": ["Delivery"],
-                "summary": "Создать доставку",
-                "description": "Создаёт доставку заказа, забор или возврат лючка. Если дата не передана, backend ставит текущее время.",
-                "requestBody": _body(_ref("CreateCourierTaskRequest"), "Адрес, тип доставки, контактные данные и комментарий."),
-                "responses": {"201": _created({"type": "object", "properties": {"task": _ref("CourierTask")}})},
-            }
-        )
-    },
-    "/referrals/": {
-        "get": _secured(
-            {
-                "tags": ["Referral"],
-                "summary": "Приглашённые автосервисы и статистика",
-                "description": (
-                    "Возвращает список приглашений и сводку: сколько приглашено, сколько зарегистрировалось, "
-                    "сколько сделали покупки и на какую сумму."
-                ),
-                "responses": {
-                    "200": _ok(
-                        {
-                            "type": "object",
-                            "properties": {
-                                "stats": _ref("ReferralStats"),
-                                "results": _array(_ref("Referral")),
-                            },
-                        }
-                    )
-                },
-            }
-        )
-    },
-    "/referrals/create/": {
-        "post": _secured(
-            {
-                "tags": ["Referral"],
-                "summary": "Создать приглашение",
-                "requestBody": _body(_ref("CreateReferralRequest"), "ИНН, название и регион приглашённого сервиса."),
-                "responses": {"201": _created({"type": "object", "properties": {"referral": _ref("Referral")}})},
-            }
-        )
-    },
     "/tickets/": {
-        "get": _secured(
-            {
-                "tags": ["Support"],
-                "summary": "Вопросы эксперту",
-                "responses": {"200": _ok({"type": "object", "properties": {"results": _array(_ref("Ticket"))}})},
-            }
-        )
+        "get": _secured({
+            "tags": ["Support"],
+            "responses": {"200": _ok({"type": "object", "properties": {"results": _array(_ref("ExpertTicket"))}})},
+        })
     },
     "/tickets/create/": {
-        "post": _secured(
-            {
-                "tags": ["Support"],
-                "summary": "Задать вопрос эксперту",
-                "requestBody": _body(_ref("CreateTicketRequest"), "Текст вопроса и категория."),
-                "responses": {"201": _created({"type": "object", "properties": {"ticket": _ref("Ticket")}})},
-            }
-        )
+        "post": _secured({
+            "tags": ["Support"],
+            "requestBody": _body(_ref("CreateExpertTicketRequest"), "Новое обращение"),
+            "responses": {"201": _created({"type": "object", "properties": {"ticket": _ref("ExpertTicket")}})},
+        })
     },
-    "/notifications/": {
-        "get": _secured(
-            {
-                "tags": ["Notifications"],
-                "summary": "Уведомления клиента",
-                "responses": {"200": _ok({"type": "object", "properties": {"results": _array(_ref("Notification"))}})},
-            }
-        )
-    },
-    "/notifications/read/": {
-        "post": _secured(
-            {
-                "tags": ["Notifications"],
-                "summary": "Отметить все уведомления прочитанными",
-                "responses": {"200": _ok({"type": "object", "properties": {"ok": {"type": "boolean", "example": True}}})},
-            }
-        )
+    "/tickets/{ticket_id}/expert-answer/": {
+        "post": _secured({
+            "tags": ["Expert"],
+            "parameters": [{"name": "ticket_id", "in": "path", "required": True, "schema": {"type": "integer"}}],
+            "requestBody": _body({"type": "object", "properties": {"answer": {"type": "string"}, "status": {"type": "string"}, "createKnowledgeCard": {"type": "boolean"}}}, "Ответ эксперта"),
+            "responses": {"200": _ok({"type": "object", "properties": {"ticket": _ref("ExpertTicket")}})},
+        })
     },
     "/knowledge-cards/": {
-        "get": _secured(
-            {
-                "tags": ["Support"],
-                "summary": "Одобренные карточки базы знаний",
-                "responses": {"200": _ok({"type": "object", "properties": {"results": _array(_ref("KnowledgeCard"))}})},
-            }
-        )
+        "get": _secured({
+            "tags": ["Support"],
+            "responses": {"200": _ok({"type": "object", "properties": {"results": _array(_ref("KnowledgeCard"))}})},
+        })
+    },
+    "/ai/chat/": {
+        "post": _secured({
+            "tags": ["Support"],
+            "requestBody": _body({"type": "object", "properties": {"message": {"type": "string"}}}, "Вопрос к AI"),
+            "responses": {"200": _ok(_ref("AiChatResponse"))},
+        })
     },
 }
 
+def _schema(request):
+    server_url = request.build_absolute_uri("/api").rstrip("/")
+    return {
+        "openapi": "303",
+        "info": {"title": "AutoTerra Q&A Refined API", "version": "1.1.0"},
+        "servers": [{"url": server_url}],
+        "paths": PATHS,
+        "components": {
+            "securitySchemes": {"BearerAuth": {"type": "http", "scheme": "bearer"}},
+            "schemas": SCHEMAS,
+        },
+    }
 
 @require_GET
 def openapi_schema(request):
     return JsonResponse(_schema(request), json_dumps_params={"ensure_ascii": False, "indent": 2})
-
 
 @require_GET
 def swagger_ui(_request):
@@ -796,10 +289,6 @@ def swagger_ui(_request):
     <meta charset="utf-8" />
     <title>AutoTerra API Docs</title>
     <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
-    <style>
-      body { margin: 0; background: #f6f6f6; }
-      .swagger-ui .topbar { display: none; }
-    </style>
   </head>
   <body>
     <div id="swagger-ui"></div>
@@ -808,12 +297,7 @@ def swagger_ui(_request):
       window.ui = SwaggerUIBundle({
         url: "/api/schema/",
         dom_id: "#swagger-ui",
-        deepLinking: true,
         persistAuthorization: true,
-        displayRequestDuration: true,
-        defaultModelsExpandDepth: 2,
-        defaultModelExpandDepth: 2,
-        docExpansion: "none"
       });
     </script>
   </body>
