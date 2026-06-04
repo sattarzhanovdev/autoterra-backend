@@ -1,11 +1,11 @@
 from decimal import Decimal, InvalidOperation
-
 from django.contrib import admin, messages
+from django.template.response import TemplateResponse
 from django.http import HttpResponse
 from django.shortcuts import redirect, render
 from django.urls import path, reverse
 from django.utils.html import format_html
-
+from django.utils import timezone
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -34,6 +34,7 @@ from .models import (
 admin.site.site_header = "AutoTerra Admin"
 admin.site.site_title = "AutoTerra"
 admin.site.index_title = "Панель управления платформой"
+admin.site.index_template = "admin/api/index.html"
 
 
 PRODUCT_STATUS_ALIASES = {
@@ -179,9 +180,9 @@ class PurchaseItemInline(admin.TabularInline):
 
 @admin.register(Distributor)
 class DistributorAdmin(admin.ModelAdmin):
-    list_display = ("id", "name", "inn", "user", "phone", "email", "is_active")
+    list_display = ("id", "name", "inn", "external_id", "user", "phone", "email", "is_active")
     list_filter = ("is_active",)
-    search_fields = ("name", "inn", "phone", "email", "user__username", "user__email")
+    search_fields = ("name", "inn", "external_id", "phone", "email", "user__username", "user__email")
     inlines = (ProductInline,)
 
 
@@ -198,6 +199,7 @@ class ClientProfileAdmin(admin.ModelAdmin):
         "id",
         "company_name",
         "inn",
+        "external_id",
         "category",
         "region",
         "city",
@@ -211,7 +213,7 @@ class ClientProfileAdmin(admin.ModelAdmin):
         "referral_purchase_amount",
     )
     list_filter = ("category", "status", "registration_source", "partner_status", "region", "distributor")
-    search_fields = ("company_name", "inn", "contact_name", "phone", "user__username", "user__email")
+    search_fields = ("company_name", "inn", "external_id", "contact_name", "phone", "user__username", "user__email")
     readonly_fields = ("created_at",)
     inlines = (StoreInline,)
 
@@ -244,9 +246,9 @@ class StoreAdmin(admin.ModelAdmin):
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
     change_list_template = "admin/api/product/change_list.html"
-    list_display = ("id", "sku", "name", "category", "brand", "distributor", "quantity", "status", "price")
+    list_display = ("id", "sku", "external_id", "name", "category", "brand", "distributor", "quantity", "status", "price")
     list_filter = ("status", "category", "brand", "distributor")
-    search_fields = ("sku", "name", "category", "brand", "distributor__name")
+    search_fields = ("sku", "external_id", "name", "category", "brand", "distributor__name")
     readonly_fields = ("updated_at",)
 
     def get_urls(self):
@@ -400,9 +402,9 @@ class ProductAdmin(admin.ModelAdmin):
 
 @admin.register(Order)
 class OrderAdmin(admin.ModelAdmin):
-    list_display = ("id", "client", "store", "distributor", "status", "created_at")
+    list_display = ("id", "client", "store", "distributor", "external_id", "status", "created_at")
     list_filter = ("status", "distributor", "store")
-    search_fields = ("client__company_name", "client__inn", "store__name", "comment", "items__name", "items__sku")
+    search_fields = ("id", "external_id", "client__company_name", "client__inn", "store__name", "comment", "items__name", "items__sku")
     readonly_fields = ("created_at",)
     inlines = (OrderItemInline,)
 
@@ -479,6 +481,99 @@ class AuthTokenAdmin(admin.ModelAdmin):
     list_display = ("id", "user", "key", "created_at")
     search_fields = ("user__username", "user__email", "key")
     readonly_fields = ("created_at",)
+
+    def get_urls(self):
+        urls = super().get_urls()
+        custom_urls = [
+            path("dashboard/", self.admin_site.admin_view(self.dashboard_view), name="api_dashboard"),
+        ]
+        return custom_urls + urls
+
+    def dashboard_view(self, request):
+        from django.db.models import Count
+        from django.db.models.functions import TruncMonth
+        from .models import ClientProfile, Purchase, Order, ExpertTicket, ColorRequest, Referral, Region, Distributor
+
+        # Filters
+        days = int(request.GET.get("days", 30))
+        region_id = request.GET.get("region")
+        distributor_id = request.GET.get("distributor")
+
+        start_date = timezone.now() - timezone.timedelta(days=days)
+
+        # Base Querysets
+        clients_qs = ClientProfile.objects.all()
+        purchases_qs = Purchase.objects.all()
+        orders_qs = Order.objects.all()
+        tickets_qs = ExpertTicket.objects.all()
+        color_qs = ColorRequest.objects.all()
+        referrals_qs = Referral.objects.all()
+
+        if region_id:
+            try:
+                reg_name = Region.objects.get(id=region_id).name
+                clients_qs = clients_qs.filter(region=reg_name)
+                purchases_qs = purchases_qs.filter(client__region=reg_name)
+                orders_qs = orders_qs.filter(client__region=reg_name)
+                tickets_qs = tickets_qs.filter(client__region=reg_name)
+                color_qs = color_qs.filter(client__region=reg_name)
+                referrals_qs = referrals_qs.filter(inviter__region=reg_name)
+            except (Region.DoesNotExist, ValueError):
+                pass
+
+        if distributor_id:
+            clients_qs = clients_qs.filter(distributor_id=distributor_id)
+            purchases_qs = purchases_qs.filter(distributor_id=distributor_id)
+            orders_qs = orders_qs.filter(distributor_id=distributor_id)
+            tickets_qs = tickets_qs.filter(client__distributor_id=distributor_id)
+            color_qs = color_qs.filter(client__distributor_id=distributor_id)
+            referrals_qs = referrals_qs.filter(inviter__distributor_id=distributor_id)
+
+        # KPI Metrics
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "Аналитика AutoTerra",
+            "kpi": {
+                "clients_total": clients_qs.count(),
+                "new_registrations": clients_qs.filter(created_at__gte=start_date).count(),
+                "purchases_count": purchases_qs.filter(created_at__gte=start_date).count(),
+                "orders_count": orders_qs.filter(created_at__gte=start_date).count(),
+                "tickets_count": tickets_qs.filter(created_at__gte=start_date).count(),
+                "color_requests_count": color_qs.filter(created_at__gte=start_date).count(),
+                "referrals_count": referrals_qs.filter(created_at__gte=start_date).count(),
+            },
+            "regions": Region.objects.filter(is_active=True),
+            "distributors": Distributor.objects.filter(is_active=True),
+            "current_filters": {
+                "days": days,
+                "region": region_id,
+                "distributor": distributor_id,
+            }
+        }
+
+        # Charts Data
+        reg_trend = (clients_qs.filter(created_at__gte=timezone.now() - timezone.timedelta(days=180))
+                    .annotate(month=TruncMonth("created_at"))
+                    .values("month")
+                    .annotate(count=Count("id"))
+                    .order_by("month"))
+        
+        pur_trend = (purchases_qs.filter(created_at__gte=timezone.now() - timezone.timedelta(days=180))
+                    .annotate(month=TruncMonth("created_at"))
+                    .values("month")
+                    .annotate(count=Count("id"))
+                    .order_by("month"))
+
+        context["chart_labels"] = [i["month"].strftime("%b %Y") for i in reg_trend]
+        context["reg_data"] = [i["count"] for i in reg_trend]
+        context["pur_data"] = [i["count"] for i in pur_trend]
+
+        # Regional Activity
+        reg_activity = clients_qs.values("region").annotate(count=Count("id")).order_by("-count")[:10]
+        context["reg_activity_labels"] = [i["region"] for i in reg_activity]
+        context["reg_activity_data"] = [i["count"] for i in reg_activity]
+
+        return render(request, "admin/api/dashboard.html", context)
 
 
 @admin.register(Attachment)

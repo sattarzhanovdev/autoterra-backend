@@ -24,6 +24,7 @@ class Distributor(models.Model):
     )
     name = models.CharField("Название", max_length=255)
     inn = models.CharField("ИНН", max_length=12, unique=True)
+    external_id = models.CharField("Внешний ID (1C)", max_length=128, blank=True, null=True, db_index=True)
     regions = models.JSONField("Регионы", default=list, blank=True)
     phone = models.CharField("Телефон", max_length=32)
     email = models.EmailField("Email")
@@ -87,6 +88,7 @@ class ClientProfile(models.Model):
 
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="client_profile")
     inn = models.CharField("ИНН", max_length=12)
+    external_id = models.CharField("Внешний ID (1C)", max_length=128, blank=True, null=True, db_index=True)
     company_name = models.CharField("Компания", max_length=255)
     category = models.CharField("Категория", max_length=1, choices=CATEGORY_CHOICES, default="b")
     region = models.CharField("Регион", max_length=128)
@@ -161,6 +163,7 @@ class Product(models.Model):
         verbose_name="Дистрибьютор",
     )
     sku = models.CharField("Артикул", max_length=64)
+    external_id = models.CharField("Внешний ID (1C)", max_length=128, blank=True, null=True, db_index=True)
     name = models.CharField("Название", max_length=255)
     category = models.CharField("Категория", max_length=128)
     brand = models.CharField("Бренд", max_length=128, default="AutoTerra")
@@ -192,6 +195,7 @@ class Order(models.Model):
     client = models.ForeignKey(ClientProfile, on_delete=models.CASCADE, related_name="orders", verbose_name="Клиент")
     store = models.ForeignKey(Store, on_delete=models.PROTECT, related_name="orders", verbose_name="Где забрать")
     distributor = models.ForeignKey(Distributor, on_delete=models.PROTECT, related_name="orders", verbose_name="Дистрибьютор")
+    external_id = models.CharField("Внешний ID (1C)", max_length=128, blank=True, null=True, db_index=True)
     comment = models.TextField("Комментарий", blank=True)
     status = models.CharField("Статус", max_length=32, choices=STATUS_CHOICES, default="pending")
     rejection_reason = models.TextField("Причина отклонения", blank=True)

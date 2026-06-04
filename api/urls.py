@@ -47,6 +47,7 @@ urlpatterns = [
     path("tickets/<int:ticket_id>/expert-answer/", views.expert_answer_ticket),
     path("knowledge-cards/", views.knowledge_cards),
     path("knowledge-cards/<int:card_id>/update/", views.update_knowledge_card),
+    path("regions/", views.regions),
     path("notifications/", views.notifications),
     path("notifications/read/", views.mark_notifications_read),
     path("ai/chat/", views.ai_chat),

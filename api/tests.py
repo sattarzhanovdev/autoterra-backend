@@ -138,6 +138,24 @@ class ClientRegistrationTests(TestCase):
         self.assertEqual(branch.status, "under_review")
         self.assertEqual(ClientProfile.objects.filter(inn="7701234567").count(), 2)
 
+    def test_get_regions_returns_active_only(self):
+        Region.objects.create(code="inactive", name="Неактивный", distributor=self.north_distributor, is_active=False)
+        
+        response = self.client.get("/api/regions/")
+        body = response.json()
+        
+        self.assertEqual(response.status_code, 200)
+        names = [r["name"] for r in body["results"]]
+        self.assertIn("Москва", names)
+        self.assertNotIn("Неактивный", names)
+
+    def test_registration_fails_with_invalid_region(self):
+        payload = self._payload(region="Несуществующий Регион")
+        response = self._post_register(payload)
+        
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["code"], "region_not_found")
+
 
 class PurchaseCreateTests(TestCase):
     def setUp(self):

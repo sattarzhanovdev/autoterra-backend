@@ -614,8 +614,12 @@ def register(request):
         return JsonResponse({"detail": "Введите телефон", "code": "phone_required"}, status=400)
     if not contact_name:
         return JsonResponse({"detail": "Введите ФИО контактного лица", "code": "contact_required"}, status=400)
-    if len(password) < 6:
-        return JsonResponse({"detail": "Пароль должен содержать минимум 6 символов", "code": "password_too_short"}, status=400)
+    import re
+    if len(password) < 8 or not re.search(r"[A-Za-zА-Яа-я]", password) or not re.search(r"\d", password):
+        return JsonResponse({
+            "detail": "Пароль должен содержать минимум 8 символов, включая буквы и цифры", 
+            "code": "password_too_weak"
+        }, status=400)
 
     if ClientProfile.objects.filter(inn=inn, region=region.name).exists():
         return JsonResponse({"detail": "ИНН уже существует в выбранном регионе", "code": "inn_duplicate"}, status=409)
@@ -1313,6 +1317,22 @@ def update_knowledge_card(request, card_id):
 
 
 @require_GET
+def regions(request):
+    qs = Region.objects.filter(is_active=True).order_by("name")
+    return JsonResponse({
+        "results": [
+            {
+                "id": str(item.id),
+                "code": item.code,
+                "name": item.name,
+                "active": item.is_active,
+            }
+            for item in qs
+        ]
+    })
+
+
+@require_GET
 def notifications(request):
     client, err = _require_client(request)
     if err:
@@ -1330,6 +1350,48 @@ def mark_notifications_read(request):
     return JsonResponse({"ok": True})
 
 
+def _normalize_words(text):
+    import re
+    if not text:
+        return set()
+    text = text.lower()
+    return set(re.findall(r"[a-zа-я0-9]+", text))
+
+
+def _score_card(query_words, card):
+    if not query_words:
+        return 0.0
+    
+    weights = {
+        "problem": 1.2,
+        "title": 1.0,
+        "category": 0.5,
+        "solution": 0.3,
+    }
+    
+    score = 0.0
+    for field, weight in weights.items():
+        field_val = getattr(card, field, "")
+        if isinstance(field_val, list):
+            field_val = " ".join(field_val)
+        
+        field_words = _normalize_words(field_val)
+        if not field_words:
+            continue
+            
+        common = query_words.intersection(field_words)
+        if common:
+            # Bonus for matching more query words
+            coverage = len(common) / len(query_words)
+            score += coverage * weight
+            
+            # Exact match bonus for short fields
+            if len(query_words) == len(field_words) and coverage == 1.0:
+                score += 0.5 * weight
+
+    return score
+
+
 @csrf_exempt
 @require_POST
 def ai_chat(request):
@@ -1339,38 +1401,74 @@ def ai_chat(request):
     payload = _json(request)
     question = (payload.get("message") or "").strip()
     
-    # AI logic with guardrails
-    cards = KnowledgeCard.objects.filter(status="approved").filter(
-        Q(problem__icontains=question) | Q(title__icontains=question) | Q(category__icontains=question)
-    )
+    query_words = _normalize_words(question)
+    if not query_words:
+        return JsonResponse({"answer": "Пожалуйста, введите ваш вопрос.", "suggestEscalation": False})
+
+    # 1. Fetch approved cards
+    cards = KnowledgeCard.objects.filter(status="approved")
     
-    if cards.exists():
-        card = cards.first()
-        # Prevent giving technical advice if it looks like something dangerous and not explicitly covered
+    # 2. Ranking
+    ranked = []
+    for card in cards:
+        score = _score_card(query_words, card)
+        if score > 0.1: # Minimum threshold to even consider
+            ranked.append((score, card))
+    
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    
+    # 3. Decision making
+    CONFIDENCE_THRESHOLD = 0.5
+    best_score = ranked[0][0] if ranked else 0
+    card = ranked[0][1] if ranked else None
+
+    if card and best_score >= CONFIDENCE_THRESHOLD:
+        # Guardrails (Dangerous keywords check)
         dangerous_keywords = ["пропорции", "гарантия", "совместимость", "срок годности"]
         looks_dangerous = any(kw in question.lower() for kw in dangerous_keywords)
         
-        if looks_dangerous and not any(kw in card.solution.lower() for kw in dangerous_keywords):
-            answer = ("Я нашел похожую инструкцию, но она не содержит точных данных по вашему вопросу (пропорции/совместимость). "
-                      "Чтобы гарантировать качество ремонта, я не могу дать совет без подтвержденного источника. "
-                      "Рекомендую создать тикет нашему технологу.")
-            source_id = None
-            suggest_escalation = True
-        else:
-            answer = f"На основе нашей базы знаний ({card.category}):\n\n{card.solution}"
-            if card.restrictions:
-                answer += f"\n\nВажно: {card.restrictions}"
+        solution_lower = card.solution.lower()
+        if looks_dangerous and not any(kw in solution_lower for kw in dangerous_keywords):
+            answer = (f"Я нашёл статью '{card.title}', но в ней нет точной информации по вашим критериям "
+                      "(пропорции/совместимость). Чтобы не рисковать качеством ремонта, я создал "
+                      "заявку для нашего технолога.")
             source_id = str(card.id)
-            suggest_escalation = False
-    else:
-        answer = ("К сожалению, у меня нет подтвержденной технической инструкции по вашему вопросу. "
-                  "Я постоянно обучаюсь, но сейчас лучше уточнить этот момент у эксперта. "
-                  "Создать обращение технологу?")
-        source_id = None
-        suggest_escalation = True
+            _auto_create_ticket(client, question, "AI - High Risk Match")
+            return JsonResponse({"answer": answer, "sourceId": source_id, "suggestEscalation": True})
+        
+        answer = f"На основе базы знаний ({card.category}):\n\n{card.solution}"
+        if card.restrictions:
+            answer += f"\n\nВажно: {card.restrictions}"
+        
+        return JsonResponse({
+            "answer": answer,
+            "sourceId": str(card.id),
+            "suggestEscalation": False
+        })
 
+    # 4. Low confidence: Automatic Escalation
+    _auto_create_ticket(client, question, "AI - Low Confidence")
     return JsonResponse({
-        "answer": answer,
-        "sourceId": source_id,
-        "suggestEscalation": suggest_escalation
+        "answer": ("К сожалению, в базе знаний нет точного ответа на ваш вопрос. "
+                  "Я автоматически создал обращение к нашему технологу. Он ответит вам в ближайшее время."),
+        "sourceId": None,
+        "suggestEscalation": True
     })
+
+
+def _auto_create_ticket(client, question, category):
+    # Check for existing open ticket with same question to avoid spam
+    exists = ExpertTicket.objects.filter(
+        client=client, 
+        question=question, 
+        status__in=["open", "escalated"]
+    ).exists()
+    
+    if not exists:
+        ExpertTicket.objects.create(
+            client=client,
+            question=question,
+            category=category,
+            status="open",
+            risk="medium"
+        )
