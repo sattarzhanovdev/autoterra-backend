@@ -19,7 +19,7 @@ from django.db.models import Q
 from django.http import JsonResponse, HttpResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
 from .models import (
     Attachment,
@@ -40,6 +40,7 @@ from .models import (
     RecipeMaterial,
     Store,
 )
+from .serializers import RegistrationSerializer, PurchaseSerializer
 
 try:
     import certifi
@@ -311,7 +312,7 @@ def _format_client(client):
         "inn": client.inn,
         "name": client.company_name,
         "category": client.category,
-        "region": client.region,
+        "region": client.region.name if client.region else "",
         "city": client.city,
         "contact": client.contact_name,
         "phone": client.phone,
@@ -490,6 +491,8 @@ def _format_color_request(item):
 
 
 def _format_courier_task(item):
+    if not item:
+        return None
     return {
         "id": str(item.id),
         "clientId": str(item.client_id),
@@ -497,18 +500,16 @@ def _format_courier_task(item):
         "clientInn": item.client.inn,
         "orderId": str(item.order_id) if item.order_id else None,
         "colorRequestId": str(item.color_request_id) if item.color_request_id else None,
-        "type": item.type,
+        "taskType": item.task_type,
+        "typeDisplay": item.get_task_type_display(),
         "address": item.address,
-        "scheduledTime": item.scheduled_time.isoformat(),
-        "contactName": item.contact_name,
-        "contactPhone": item.contact_phone,
-        "carDescription": item.car_description,
+        "timeSlot": item.time_slot,
         "status": item.status,
-        "assignedCourierId": str(item.assigned_courier_id) if item.assigned_courier_id else None,
-        "courierId": item.courier_id or None,
-        "photoProof": item.photo_proof or None,
-        "comment": item.comment or None,
-        "courierComment": item.courier_comment or None,
+        "statusDisplay": item.get_status_display(),
+        "assignedCourierId": str(item.courier_id) if item.courier_id else None,
+        "photoProof": item.proof_photo.url if item.proof_photo else None,
+        "comment": item.comment,
+        "courierComment": item.courier_comment,
         "statusHistory": item.status_history or [],
         "createdAt": item.created_at.isoformat(),
         "attachments": [_format_attachment(attachment) for attachment in _attachments_for(item)],
@@ -593,71 +594,89 @@ def health(_request):
 @require_POST
 def register(request):
     payload = _json(request)
-    inn = _normalize_inn(payload.get("inn"))
-    company_name = (payload.get("companyName") or payload.get("name") or "").strip()
-    region = _find_region(payload.get("region") or payload.get("regionCode"))
-    phone = _normalize_phone(payload.get("phone"))
-    contact_name = (payload.get("contactName") or payload.get("contact") or "").strip()
-    email = (payload.get("email") or "").strip()
-    password = payload.get("password") or ""
-    category = _normalize_category(payload.get("category"))
-    source = (payload.get("registrationSource") or "client").strip()
-    city = (payload.get("city") or (region.name if region else "")).strip()
-
-    if len(inn) not in (10, 12):
-        return JsonResponse({"detail": "ИНН должен содержать 10 или 12 цифр", "code": "invalid_inn"}, status=400)
-    if not company_name:
-        return JsonResponse({"detail": "Введите название автосервиса", "code": "company_required"}, status=400)
-    if region is None:
-        return JsonResponse({"detail": "Регион не найден", "code": "region_not_found"}, status=404)
-    if not phone:
-        return JsonResponse({"detail": "Введите телефон", "code": "phone_required"}, status=400)
-    if not contact_name:
-        return JsonResponse({"detail": "Введите ФИО контактного лица", "code": "contact_required"}, status=400)
-    import re
-    if len(password) < 8 or not re.search(r"[A-Za-zА-Яа-я]", password) or not re.search(r"\d", password):
+    print(f"DEBUG: Register payload: {payload}")
+    serializer = RegistrationSerializer(payload)
+    if not serializer.is_valid():
+        print(f"DEBUG: Serializer errors: {serializer.errors}")
+        # Возвращаем detail для фронтенда, чтобы он мог показать ошибку
+        first_err_msg = "Ошибка валидации"
+        if serializer.errors:
+            # Извлекаем первое сообщение об ошибке
+            field = next(iter(serializer.errors))
+            first_err_msg = f"{field}: {serializer.errors[field]}"
+            if isinstance(serializer.errors[field], list):
+                first_err_msg = serializer.errors[field][0]
+            else:
+                first_err_msg = str(serializer.errors[field])
+        
+        return JsonResponse({"detail": first_err_msg, "errors": serializer.errors}, status=400)
+    
+    validated_data = serializer.validated_data
+    username = validated_data['username']
+    password = validated_data['password']
+    inn = validated_data['inn']
+    region = validated_data['region']
+    company_name = validated_data['company_name']
+    contact_name = validated_data['contact_name']
+    
+    # 1. Проверка уникальности номера телефона
+    if User.objects.filter(username=username).exists():
         return JsonResponse({
-            "detail": "Пароль должен содержать минимум 8 символов, включая буквы и цифры", 
-            "code": "password_too_weak"
-        }, status=400)
+            "detail": f"Номер телефона {username} уже используется. Пожалуйста, войдите в аккаунт или используйте другой номер.", 
+            "code": "phone_duplicate"
+        }, status=409)
 
-    if ClientProfile.objects.filter(inn=inn, region=region.name).exists():
-        return JsonResponse({"detail": "ИНН уже существует в выбранном регионе", "code": "inn_duplicate"}, status=409)
-    if User.objects.filter(username=phone).exists():
-        return JsonResponse({"detail": "Пользователь с таким телефоном уже существует", "code": "phone_duplicate"}, status=409)
+    # 2. Проверка уникальности ИНН (локально в текущем регионе)
+    if ClientProfile.objects.filter(inn=inn, region=region).exists():
+        return JsonResponse({
+            "detail": f"Организация с ИНН {inn} уже зарегистрирована в регионе {region.name}. Повторная регистрация в одном и том же регионе запрещена.", 
+            "code": "inn_duplicate"
+        }, status=409)
 
-    is_branch = ClientProfile.objects.filter(inn=inn).exclude(region=region.name).exists()
+    # Если ИНН есть в других регионах, помечаем как филиал (статус "на проверке")
+    is_branch = ClientProfile.objects.filter(inn=inn).exclude(region=region).exists()
+    status = "under_review" if is_branch else "new"
 
     try:
         with transaction.atomic():
-            user = User.objects.create_user(username=phone, email=email, password=password)
+            # Создаем пользователя
+            user = User.objects.create_user(username=username, password=password)
+            
+            # Создаем профиль
             client = ClientProfile.objects.create(
                 user=user,
                 inn=inn,
                 company_name=company_name,
-                category=category,
-                region=region.name,
-                city=city or region.name,
+                region=region,
+                status=status,
+                phone=username,
+                city=region.name,
                 contact_name=contact_name,
-                phone=phone,
+                registration_source="app",
                 distributor=region.distributor,
-                manager=region.manager,
-                registration_source=source,
-                status="under_review",
+                manager=region.manager
             )
-    except IntegrityError:
-        return JsonResponse({"detail": "ИНН уже существует в выбранном регионе", "code": "inn_duplicate"}, status=409)
+            
+            token = secrets.token_hex(24)
+            AuthToken.objects.create(key=token, user=user)
+    except IntegrityError as e:
+        # Резервный обработчик на случай гонки условий
+        return JsonResponse({
+            "detail": "Ошибка уникальности данных: возможно, ИНН или телефон были зарегистрированы только что другим пользователем.",
+            "code": "integrity_error"
+        }, status=409)
+    except Exception as e:
+        return JsonResponse({
+            "detail": f"Внутренняя ошибка сервера при регистрации: {str(e)}",
+            "code": "server_error"
+        }, status=500)
 
-    return JsonResponse(
-        {
-            "client": _format_client(client),
-            "distributor": _format_distributor(region.distributor),
-            "status": client.status,
-            "requiresAdminApproval": True,
-            "isBranch": is_branch,
-        },
-        status=201,
-    )
+    return JsonResponse({
+        "status": "success",
+        "token": token,
+        "client": _format_client(client),
+        "requires_approval": status == "under_review"
+    }, status=201)
 
 
 @csrf_exempt
@@ -796,21 +815,45 @@ def create_purchase(request):
     client, err = _require_client(request)
     if err:
         return err
-    payload = request.POST if (request.content_type or "").startswith("multipart/form-data") else _json(request)
-    files = _attachment_files(request)
+    payload = _json(request)
+    serializer = PurchaseSerializer(payload)
+    if not serializer.is_valid():
+        return JsonResponse({"errors": serializer.errors}, status=400)
+    
+    validated_data = serializer.validated_data
+    
+    existing = Purchase.objects.filter(
+        client=client,
+        document_number=validated_data['document_number'],
+        date=validated_data['date'],
+        total_amount=validated_data['amount']
+    ).first()
+    
+    if existing:
+        return JsonResponse({
+            "error": "duplicate_detected",
+            "message": f"Покупка с такими данными уже загружена и имеет статус [{existing.get_status_display()}]"
+        }, status=400)
+    
     with transaction.atomic():
         purchase = Purchase.objects.create(
             client=client,
             distributor=client.distributor,
-            document_number=(payload.get("documentNumber") or "").strip(),
-            date=_date(payload.get("date")),
-            total_amount=_money_value(payload.get("totalAmount")),
-            status="pending_verification",
+            document_number=validated_data['document_number'],
+            date=validated_data['date'],
+            total_amount=validated_data['amount'],
+            status="new",
         )
-        _create_attachments(request, purchase, files, description="Документ покупки")
         items = _parse_items(payload.get("items"))
         for raw in items:
-            PurchaseItem.objects.create(purchase=purchase, sku=raw.get("sku"), name=raw.get("name"), quantity=int(raw.get("quantity") or 1), price=_money_value(raw.get("price")))
+            PurchaseItem.objects.create(
+                purchase=purchase, 
+                sku=raw.get("sku"), 
+                name=raw.get("name"), 
+                quantity=int(raw.get("quantity") or 1), 
+                price=_money_value(raw.get("price"))
+            )
+            
     return JsonResponse({"purchase": _format_purchase(purchase)}, status=201)
 
 
@@ -935,60 +978,50 @@ def courier_my_tasks(request):
     user, is_admin, err = _require_courier_scope(request)
     if err:
         return err
-    qs = _scope_courier_tasks(user, is_admin).order_by("scheduled_time")
+    
+    # Задачи, назначенные на текущего курьера
+    qs = CourierTask.objects.filter(courier=user).order_by("-created_at")
+    if is_admin:
+        qs = CourierTask.objects.all().order_by("-created_at")
+        
     return JsonResponse({"results": [_format_courier_task(item) for item in qs]})
 
-
-@require_GET
-def courier_task_detail(request, task_id):
+@csrf_exempt
+@require_http_methods(["PATCH", "POST"])
+def courier_update_task_status(request, task_id):
     user, is_admin, err = _require_courier_scope(request)
     if err:
         return err
-    task = _scope_courier_tasks(user, is_admin).filter(id=task_id).first()
+    
+    task = CourierTask.objects.filter(id=task_id).first()
     if not task:
         return JsonResponse({"detail": "Задача не найдена"}, status=404)
-    return JsonResponse({"task": _format_courier_task(task)})
+    
+    if not is_admin and task.courier != user:
+        return JsonResponse({"detail": "Нет прав для редактирования этой задачи"}, status=403)
 
+    # Приоритетно берем из POST (для multipart), затем из JSON
+    status = request.POST.get("status")
+    comment = request.POST.get("courier_comment")
 
-@csrf_exempt
-@require_POST
-def courier_task_status(request, task_id):
-    user, is_admin, err = _require_courier_scope(request)
-    if err:
-        return err
-    status = (_json(request).get("status") or "").strip()
-    task = _scope_courier_tasks(user, is_admin).filter(id=task_id).first()
-    if task:
+    if not status:
+        payload = _json(request)
+        status = payload.get("status")
+        if not comment:
+            comment = payload.get("courier_comment")
+
+    if status:
         task.status = status
         _append_task_history(task, status, user)
-        task.save(update_fields=["status", "status_history"])
-    return JsonResponse({"task": _format_courier_task(task)})
-
-
-@csrf_exempt
-@require_POST
-def courier_task_comment(request, task_id):
-    user, is_admin, err = _require_courier_scope(request)
-    if err:
-        return err
-    comment = (_json(request).get("comment") or "").strip()
-    task = _scope_courier_tasks(user, is_admin).filter(id=task_id).first()
-    if task:
+    
+    if comment is not None:
         task.courier_comment = comment
-        task.save(update_fields=["courier_comment"])
-    return JsonResponse({"task": _format_courier_task(task)})
 
+    # Обработка фото-подтверждения
+    if "proof_photo" in request.FILES:
+        task.proof_photo = request.FILES["proof_photo"]
 
-@csrf_exempt
-@require_POST
-def courier_task_proof_by_courier(request, task_id):
-    user, is_admin, err = _require_courier_scope(request)
-    if err:
-        return err
-    task = _scope_courier_tasks(user, is_admin).filter(id=task_id).first()
-    if task:
-        files = _attachment_files(request)
-        _create_attachments(request, task, files, description="Фото подтверждение от курьера")
+    task.save()
     return JsonResponse({"task": _format_courier_task(task)})
 
 
@@ -1035,35 +1068,43 @@ def distributor_purchases(request):
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
         return err
-    qs = _scope_purchases(distributor, is_admin).order_by("-created_at")
+    
+    # Список покупок, ожидающих проверки (или всех покупок для этого дистрибьютора)
+    qs = _scope_purchases(distributor, is_admin).order_by("-date")
+    
+    # Фильтрация по статусу (например, только новые и на проверке)
+    status_filter = request.GET.get("status")
+    if status_filter:
+        qs = qs.filter(status=status_filter)
+    else:
+        qs = qs.filter(status__in=["new", "pending", "pending_verification", "under_review"])
+
     return JsonResponse({"results": [_format_purchase(item) for item in qs]})
 
 
 @csrf_exempt
-@require_POST
-def distributor_confirm_purchase(request, purchase_id):
+@require_http_methods(["PATCH", "POST"])
+def distributor_verify_purchase(request, purchase_id):
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
         return err
+    
     purchase = _scope_purchases(distributor, is_admin).filter(id=purchase_id).first()
-    if purchase:
-        purchase.status = "verified"
-        purchase.save(update_fields=["status"])
-    return JsonResponse({"purchase": _format_purchase(purchase)})
+    if not purchase:
+        return JsonResponse({"detail": "Покупка не найдена"}, status=404)
 
+    payload = _json(request)
+    status = payload.get("status")
+    reason = payload.get("rejection_reason")
 
-@csrf_exempt
-@require_POST
-def distributor_reject_purchase(request, purchase_id):
-    distributor, is_admin, err = _require_distributor_scope(request)
-    if err:
-        return err
-    reason = (_json(request).get("reason") or "").strip()
-    purchase = _scope_purchases(distributor, is_admin).filter(id=purchase_id).first()
-    if purchase:
-        purchase.status = "rejected"
+    if status not in ["verified", "rejected"]:
+        return JsonResponse({"detail": "Некорректный статус. Используйте verified или rejected"}, status=400)
+
+    purchase.status = status
+    if status == "rejected" and reason:
         purchase.rejection_reason = reason
-        purchase.save(update_fields=["status", "rejection_reason"])
+    
+    purchase.save()
     return JsonResponse({"purchase": _format_purchase(purchase)})
 
 
@@ -1072,49 +1113,39 @@ def distributor_orders(request):
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
         return err
+    
     qs = _scope_orders(distributor, is_admin).order_by("-created_at")
+    
+    status_filter = request.GET.get("status")
+    if status_filter:
+        qs = qs.filter(status=status_filter)
+
     return JsonResponse({"results": [_format_order(item) for item in qs]})
 
 
 @csrf_exempt
-@require_POST
-def distributor_accept_order(request, order_id):
-    distributor, is_admin, err = _require_distributor_scope(request)
-    if err:
-        return err
-    order = _scope_orders(distributor, is_admin).filter(id=order_id).first()
-    if order:
-        order.status = "accepted"
-        order.save(update_fields=["status"])
-    return JsonResponse({"order": _format_order(order)})
-
-
-@csrf_exempt
-@require_POST
-def distributor_reject_order(request, order_id):
-    distributor, is_admin, err = _require_distributor_scope(request)
-    if err:
-        return err
-    reason = (_json(request).get("reason") or "").strip()
-    order = _scope_orders(distributor, is_admin).filter(id=order_id).first()
-    if order:
-        order.status = "rejected"
-        order.rejection_reason = reason
-        order.save(update_fields=["status", "rejection_reason"])
-    return JsonResponse({"order": _format_order(order)})
-
-
-@csrf_exempt
-@require_POST
+@require_http_methods(["PATCH", "POST"])
 def distributor_update_order_status(request, order_id):
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
         return err
-    status = (_json(request).get("status") or "").strip()
+    
     order = _scope_orders(distributor, is_admin).filter(id=order_id).first()
-    if order:
-        order.status = status
-        order.save(update_fields=["status"])
+    if not order:
+        return JsonResponse({"detail": "Заказ не найден"}, status=404)
+
+    payload = _json(request)
+    status = payload.get("status")
+    reason = payload.get("rejection_reason")
+
+    if status not in ["accepted", "rejected", "done"]:
+        return JsonResponse({"detail": "Некорректный статус"}, status=400)
+
+    order.status = status
+    if status == "rejected" and reason:
+        order.rejection_reason = reason
+    
+    order.save()
     return JsonResponse({"order": _format_order(order)})
 
 

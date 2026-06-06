@@ -428,9 +428,9 @@ class ColorRequestAdmin(admin.ModelAdmin):
 
 @admin.register(CourierTask)
 class CourierTaskAdmin(admin.ModelAdmin):
-    list_display = ("id", "client", "type", "address", "scheduled_time", "status", "assigned_courier", "courier_id")
-    list_filter = ("type", "status", "scheduled_time", "client__distributor", "assigned_courier")
-    search_fields = ("client__company_name", "address", "contact_name", "contact_phone", "car_description")
+    list_display = ("id", "client", "task_type", "address", "time_slot", "status", "courier", "created_at")
+    list_filter = ("task_type", "status", "courier", "created_at", "client__distributor")
+    search_fields = ("client__company_name", "address", "courier__username", "comment", "courier_comment")
     readonly_fields = ("created_at",)
 
 

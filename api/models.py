@@ -2,6 +2,28 @@ from django.contrib.auth.models import User
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
+from django.core.exceptions import ValidationError
+from django.core.validators import RegexValidator
+
+
+class Profile(models.Model):
+    class Role(models.TextChoices):
+        CLIENT = "client", "Клиент (автосервис)"
+        DISTRIBUTOR = "distributor", "Дистрибьютор"
+        MANAGER = "manager", "Менеджер импортера"
+        ADMIN = "admin", "Центральный админ"
+        COURIER = "courier", "Курьер"
+        AI_EXPERT = "ai_expert", "Эксперт базы знаний"
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="profile")
+    role = models.CharField("Роль", max_length=20, choices=Role.choices, default=Role.CLIENT)
+
+    class Meta:
+        verbose_name = "Профиль пользователя"
+        verbose_name_plural = "Профили пользователей"
+
+    def __str__(self):
+        return f"{self.user.username} ({self.get_role_display()})"
 
 
 class AuthToken(models.Model):
@@ -44,9 +66,11 @@ class Region(models.Model):
     name = models.CharField("Название", max_length=128, unique=True)
     distributor = models.ForeignKey(
         Distributor,
-        on_delete=models.PROTECT,
+        on_delete=models.SET_NULL,
         related_name="managed_regions",
         verbose_name="Дистрибьютор",
+        null=True,
+        blank=True,
     )
     manager = models.ForeignKey(
         User,
@@ -68,30 +92,35 @@ class Region(models.Model):
 
 
 class ClientProfile(models.Model):
+    inn_validator = RegexValidator(
+        regex=r"^\d{10}(\d{2})?$",
+        message="ИНН должен состоять из 10 или 12 цифр.",
+    )
+
     CATEGORY_CHOICES = [("a", "A"), ("b", "B"), ("c", "C")]
     STATUS_CHOICES = [
         ("new", "Новый"),
         ("under_review", "На проверке"),
-        ("approved", "Одобрен"),
-        ("rejected", "Отклонён"),
-        ("newClient", "Новый"),
-        ("pending", "На проверке"),
         ("active", "Активный"),
         ("blocked", "Заблокирован"),
-        ("archived", "Архив"),
     ]
     SOURCE_CHOICES = [
-        ("client", "Клиент"),
-        ("importer_manager", "Менеджер импортёра"),
-        ("distributor", "Дистрибьютор"),
+        ("app", "Мобильное приложение"),
+        ("web", "Веб-сайт"),
+        ("manager", "Менеджер"),
     ]
 
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="client_profile")
-    inn = models.CharField("ИНН", max_length=12)
+    inn = models.CharField("ИНН", max_length=12, validators=[inn_validator])
     external_id = models.CharField("Внешний ID (1C)", max_length=128, blank=True, null=True, db_index=True)
     company_name = models.CharField("Компания", max_length=255)
     category = models.CharField("Категория", max_length=1, choices=CATEGORY_CHOICES, default="b")
-    region = models.CharField("Регион", max_length=128)
+    region = models.ForeignKey(
+        Region,
+        on_delete=models.PROTECT,
+        related_name="clients",
+        verbose_name="Регион",
+    )
     city = models.CharField("Город", max_length=128)
     contact_name = models.CharField("Контакт", max_length=255)
     phone = models.CharField("Телефон", max_length=32)
@@ -100,6 +129,8 @@ class ClientProfile(models.Model):
         on_delete=models.PROTECT,
         related_name="clients",
         verbose_name="Дистрибьютор",
+        null=True,
+        blank=True,
     )
     manager = models.ForeignKey(
         User,
@@ -113,11 +144,12 @@ class ClientProfile(models.Model):
         "Источник регистрации",
         max_length=32,
         choices=SOURCE_CHOICES,
-        default="client",
+        default="app",
     )
-    status = models.CharField("Статус", max_length=32, choices=STATUS_CHOICES, default="approved")
+    status = models.CharField("Статус", max_length=32, choices=STATUS_CHOICES, default="new")
     partner_status = models.CharField("Партнёрский статус", max_length=32, default="Silver")
     total_purchases = models.DecimalField("Сумма закупок", max_digits=12, decimal_places=2, default=0)
+    comments = models.TextField("Комментарии", blank=True)
     created_at = models.DateTimeField("Создан", auto_now_add=True)
 
     class Meta:
@@ -130,6 +162,30 @@ class ClientProfile(models.Model):
 
     def __str__(self):
         return self.company_name
+
+    def clean(self):
+        # INN validation logic
+        if self.inn and self.region:
+            # Check for existing INN in the SAME region
+            existing_same = ClientProfile.objects.filter(inn=self.inn, region=self.region).exclude(pk=self.pk)
+            if existing_same.exists():
+                raise ValidationError(f"Клиент с ИНН {self.inn} уже существует в регионе {self.region.name}.")
+
+    def save(self, *args, **kwargs):
+        # Trigger clean for validation
+        self.full_clean()
+
+        # 1. Auto-assign distributor from region
+        if not self.distributor and self.region and self.region.distributor:
+            self.distributor = self.region.distributor
+        
+        # 2. Status logic: if INN exists in ANOTHER region, set to under_review
+        if self.inn and self.region:
+            existing_other = ClientProfile.objects.filter(inn=self.inn).exclude(region=self.region).exclude(pk=self.pk)
+            if existing_other.exists():
+                self.status = "under_review"
+
+        super().save(*args, **kwargs)
 
 
 class Store(models.Model):
@@ -239,6 +295,7 @@ class OrderItem(models.Model):
 
 class Purchase(models.Model):
     STATUS_CHOICES = [
+        ("new", "Новая"),
         ("pending", "На проверке"),
         ("pending_verification", "Ожидает подтверждения"),
         ("under_review", "Ручная проверка"),
@@ -392,43 +449,72 @@ class RecipeMaterial(models.Model):
 
 
 class CourierTask(models.Model):
-    TYPE_CHOICES = [("delivery", "Доставка"), ("pickup", "Забор лючка"), ("return", "Возврат лючка")]
+    TYPE_CHOICES = [
+        ("delivery", "Доставка"),
+        ("pickup", "Забор лючка"),
+        ("return", "Возврат лючка"),
+    ]
     STATUS_CHOICES = [
-        ("created", "Создана"),
-        ("assigned", "Назначен курьер"),
-        ("picked_up", "Забрано"),
+        ("assigned", "Назначен"),
         ("in_progress", "В пути"),
-        ("inProgress", "В пути"),
         ("delivered", "Доставлено"),
         ("returned", "Возвращено"),
         ("cancelled", "Отменено"),
     ]
 
-    client = models.ForeignKey(ClientProfile, on_delete=models.CASCADE, related_name="courier_tasks", verbose_name="Клиент")
-    order = models.ForeignKey(Order, on_delete=models.SET_NULL, related_name="courier_tasks", verbose_name="Связанный заказ", blank=True, null=True)
-    color_request = models.ForeignKey(ColorRequest, on_delete=models.SET_NULL, related_name="courier_tasks", verbose_name="Заявка Color Lab", blank=True, null=True)
-    type = models.CharField("Тип", max_length=32, choices=TYPE_CHOICES, default="delivery")
+    courier = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="assigned_tasks",
+        verbose_name="Курьер",
+        null=True,
+        blank=True,
+    )
+    client = models.ForeignKey(
+        ClientProfile,
+        on_delete=models.CASCADE,
+        related_name="courier_tasks",
+        verbose_name="Клиент",
+    )
+    order = models.ForeignKey(
+        Order,
+        on_delete=models.SET_NULL,
+        related_name="courier_tasks",
+        verbose_name="Связанный заказ",
+        blank=True,
+        null=True,
+    )
+    color_request = models.ForeignKey(
+        ColorRequest,
+        on_delete=models.SET_NULL,
+        related_name="courier_tasks",
+        verbose_name="Заявка Color Lab",
+        blank=True,
+        null=True,
+    )
+    task_type = models.CharField(
+        "Тип задачи", max_length=32, choices=TYPE_CHOICES, default="delivery"
+    )
     address = models.CharField("Адрес", max_length=255)
-    scheduled_time = models.DateTimeField("Время")
-    contact_name = models.CharField("Контакт", max_length=255)
-    contact_phone = models.CharField("Телефон", max_length=32)
-    car_description = models.CharField("Авто/описание", max_length=255, blank=True)
-    status = models.CharField("Статус", max_length=32, choices=STATUS_CHOICES, default="created")
-    assigned_courier = models.ForeignKey(User, on_delete=models.SET_NULL, related_name="courier_tasks", verbose_name="Назначенный курьер", blank=True, null=True)
-    courier_id = models.CharField("Курьер", max_length=128, blank=True)
-    photo_proof = models.CharField("Фото", max_length=255, blank=True)
+    time_slot = models.CharField("Временной интервал", max_length=64)
+    status = models.CharField(
+        "Статус", max_length=32, choices=STATUS_CHOICES, default="assigned"
+    )
+    proof_photo = models.ImageField(
+        "Фото-подтверждение", upload_to="courier_proofs/%Y/%m/", null=True, blank=True
+    )
     comment = models.TextField("Комментарий", blank=True)
     courier_comment = models.TextField("Комментарий курьера", blank=True)
     status_history = models.JSONField("История статусов", default=list, blank=True)
     created_at = models.DateTimeField("Создана", auto_now_add=True)
 
     class Meta:
-        verbose_name = "Доставка"
-        verbose_name_plural = "Доставка"
-        ordering = ("-scheduled_time",)
+        verbose_name = "Задача курьера"
+        verbose_name_plural = "Задачи курьеров"
+        ordering = ("-created_at",)
 
     def __str__(self):
-        return f"{self.get_type_display()} · {self.address}"
+        return f"{self.get_task_type_display()} · {self.address}"
 
 
 class Referral(models.Model):
@@ -551,6 +637,21 @@ class Notification(models.Model):
         verbose_name = "Уведомление"
         verbose_name_plural = "Уведомления"
         ordering = ("-created_at",)
+
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+
+@receiver(post_save, sender=User)
+def create_user_profile(sender, instance, created, **kwargs):
+    if created:
+        Profile.objects.get_or_create(user=instance)
+
+
+@receiver(post_save, sender=User)
+def save_user_profile(sender, instance, **kwargs):
+    if hasattr(instance, "profile"):
+        instance.profile.save()
 
 
 class KnowledgeCard(models.Model):
