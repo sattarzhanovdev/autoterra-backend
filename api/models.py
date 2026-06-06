@@ -91,6 +91,55 @@ class Region(models.Model):
         return self.name
 
 
+class IntegrationToken(models.Model):
+    distributor = models.ForeignKey(
+        Distributor,
+        on_delete=models.CASCADE,
+        related_name="integration_tokens",
+        verbose_name="Дистрибьютор",
+    )
+    token = models.CharField("Токен", max_length=128, unique=True)
+    is_active = models.BooleanField("Активен", default=True)
+    created_at = models.DateTimeField("Создан", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Токен интеграции"
+        verbose_name_plural = "Токены интеграции"
+
+    def __str__(self):
+        return f"{self.distributor.name} · {self.created_at:%d.%m.%Y}"
+
+
+class SyncLog(models.Model):
+    TYPE_CHOICES = [
+        ("stock_update", "Обновление остатков"),
+        ("orders_export", "Экспорт заказов"),
+    ]
+    STATUS_CHOICES = [
+        ("success", "Успех"),
+        ("error", "Ошибка"),
+    ]
+
+    distributor = models.ForeignKey(
+        Distributor,
+        on_delete=models.CASCADE,
+        related_name="sync_logs",
+        verbose_name="Дистрибьютор",
+    )
+    sync_type = models.CharField("Тип синхронизации", max_length=32, choices=TYPE_CHOICES)
+    status = models.CharField("Статус", max_length=16, choices=STATUS_CHOICES)
+    details = models.JSONField("Детали", default=dict, blank=True)
+    created_at = models.DateTimeField("Дата/время", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Лог синхронизации"
+        verbose_name_plural = "Логи синхронизации"
+        ordering = ("-created_at",)
+
+    def __str__(self):
+        return f"{self.created_at:%d.%m.%Y %H:%M} · {self.get_sync_type_display()} · {self.get_status_display()}"
+
+
 class ClientProfile(models.Model):
     inn_validator = RegexValidator(
         regex=r"^\d{10}(\d{2})?$",
@@ -623,6 +672,16 @@ class Referral(models.Model):
             self.gift = "Сертификат на 5000 ₽"
             updates.append("condition_met")
             updates.append("gift")
+            
+            # Notify inviter
+            Notification.objects.create(
+                user=self.inviter.user,
+                client=self.inviter,
+                title="Бонус начислен!",
+                body=f"Ваша рекомендация {self.invitee_name} совершила покупки на сумму более 30 000 ₽. Вам начислен подарок!",
+                type="referral",
+                related_link="/referral"
+            )
 
         if updates:
             self.save(update_fields=updates)
@@ -680,6 +739,9 @@ class ExpertTicket(models.Model):
 
 class Notification(models.Model):
     TYPE_CHOICES = [
+        ("info", "Информация"),
+        ("action_required", "Требуется действие"),
+        ("recommendation", "Рекомендация"),
         ("order", "Заказ"),
         ("color", "Колеровка"),
         ("delivery", "Доставка"),
@@ -688,10 +750,12 @@ class Notification(models.Model):
         ("system", "Система"),
     ]
 
-    client = models.ForeignKey(ClientProfile, on_delete=models.CASCADE, related_name="notifications", verbose_name="Клиент")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="notifications", verbose_name="Пользователь", null=True)
+    client = models.ForeignKey(ClientProfile, on_delete=models.CASCADE, related_name="notifications_legacy", verbose_name="Клиент", null=True, blank=True)
     title = models.CharField("Заголовок", max_length=255)
     body = models.TextField("Текст")
-    type = models.CharField("Тип", max_length=32, choices=TYPE_CHOICES, default="system")
+    type = models.CharField("Тип", max_length=32, choices=TYPE_CHOICES, default="info")
+    related_link = models.CharField("Ссылка", max_length=255, blank=True)
     is_read = models.BooleanField("Прочитано", default=False)
     created_at = models.DateTimeField("Создано", auto_now_add=True)
 

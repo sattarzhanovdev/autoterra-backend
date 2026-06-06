@@ -39,6 +39,8 @@ from .models import (
     Referral,
     RecipeMaterial,
     Store,
+    IntegrationToken,
+    SyncLog,
 )
 from .serializers import RegistrationSerializer, PurchaseSerializer
 
@@ -65,6 +67,17 @@ def _json(request):
         return json.loads(request.body.decode("utf-8") or "{}")
     except json.JSONDecodeError:
         return {}
+
+
+def _paginate(request, qs, default_limit=50):
+    try:
+        limit = int(request.GET.get("limit", default_limit))
+        offset = int(request.GET.get("offset", 0))
+    except ValueError:
+        limit = default_limit
+        offset = 0
+    limit = min(limit, 100)
+    return qs[offset:offset+limit]
 
 
 def _normalize_phone(phone):
@@ -560,6 +573,7 @@ def _format_notification(item):
         "title": item.title,
         "body": item.body,
         "type": item.type,
+        "relatedLink": item.related_link,
         "isRead": item.is_read,
         "createdAt": item.created_at.isoformat(),
     }
@@ -724,7 +738,13 @@ def dashboard(request):
         return err
     purchases = client.purchases.prefetch_related("items").order_by("-date")[:2]
     color_requests = client.color_requests.exclude(status="delivered").order_by("-created_at")[:2]
-    return JsonResponse({"client": _format_client(client), "distributor": _format_distributor(client.distributor), "unreadCount": client.notifications.filter(is_read=False).count(), "recentPurchases": [_format_purchase(item) for item in purchases], "activeColorRequests": [_format_color_request(item) for item in color_requests]})
+    return JsonResponse({
+        "client": _format_client(client),
+        "distributor": _format_distributor(client.distributor),
+        "unreadCount": client.user.notifications.filter(is_read=False).count(),
+        "recentPurchases": [_format_purchase(item) for item in purchases],
+        "activeColorRequests": [_format_color_request(item) for item in color_requests]
+    })
 
 
 @require_GET
@@ -1085,7 +1105,7 @@ def manager_dashboard(request):
         "totalClients": client_qs.count(),
         "activeOrders": order_qs.filter(status__in=["new", "accepted"]).count(),
         "fulfilledOrders": order_qs.filter(status="fulfilled").count(),
-        "totalTurnover": float(order_qs.filter(status="fulfilled").aggregate(Sum("total_amount"))["total_amount"] or 0),
+        "totalTurnover": sum((o.total_amount for o in order_qs.filter(status="fulfilled").prefetch_related("items")), start=0),
         "regionalStats": [
             {
                 "region": r.name,
@@ -1096,6 +1116,185 @@ def manager_dashboard(request):
     }
     
     return JsonResponse(stats)
+
+
+@csrf_exempt
+@require_POST
+def erp_stock_update(request):
+    token_str = request.headers.get("X-Integration-Token")
+    if not token_str:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token_str = auth_header.split(" ")[1]
+            
+    if not token_str:
+        return JsonResponse({"detail": "Token is missing"}, status=401)
+        
+    token = IntegrationToken.objects.filter(token=token_str, is_active=True).select_related("distributor").first()
+    if not token:
+        return JsonResponse({"detail": "Invalid or inactive token"}, status=401)
+        
+    distributor = token.distributor
+    payload = _json(request)
+    
+    if not isinstance(payload, list):
+        return JsonResponse({"detail": "Expected a JSON array"}, status=400)
+        
+    updated_count = 0
+    errors = []
+    
+    try:
+        with transaction.atomic():
+            for item in payload:
+                sku = item.get("sku")
+                quantity = item.get("quantity")
+                price = item.get("price")
+                
+                if not sku or quantity is None:
+                    errors.append(f"Missing sku or quantity in item: {item}")
+                    continue
+                    
+                try:
+                    product = Product.objects.get(distributor=distributor, sku=sku)
+                    product.quantity = int(quantity)
+                    if price is not None:
+                        product.price = Decimal(str(price))
+                    
+                    if product.quantity > 5:
+                        product.status = "inStock"
+                    elif product.quantity > 0:
+                        product.status = "low"
+                    else:
+                        product.status = "outOfStock"
+                        
+                    product.save()
+                    updated_count += 1
+                except Product.DoesNotExist:
+                    errors.append(f"Product with sku '{sku}' not found")
+                except Exception as e:
+                    errors.append(f"Error updating '{sku}': {str(e)}")
+                    
+        status = "success" if not errors else "error"
+        details = {
+            "updated_count": updated_count,
+            "errors": errors
+        }
+        SyncLog.objects.create(
+            distributor=distributor,
+            sync_type="stock_update",
+            status=status,
+            details=details
+        )
+        
+        return JsonResponse({
+            "status": status,
+            "updated": updated_count,
+            "errors": errors
+        })
+    except Exception as e:
+        SyncLog.objects.create(
+            distributor=distributor,
+            sync_type="stock_update",
+            status="error",
+            details={"error": str(e)}
+        )
+        return JsonResponse({"detail": "Internal server error"}, status=500)
+
+
+@require_GET
+def admin_integration_tokens(request):
+    user, is_admin, err = _require_manager_scope(request)
+    if err:
+        return err
+        
+    distributors = Distributor.objects.prefetch_related('integration_tokens').all()
+    results = []
+    for d in distributors:
+        active_token = d.integration_tokens.filter(is_active=True).first()
+        results.append({
+            "id": str(d.id),
+            "name": d.name,
+            "token": active_token.token if active_token else None,
+            "createdAt": active_token.created_at.isoformat() if active_token else None,
+        })
+        
+    return JsonResponse({"results": results})
+
+
+@csrf_exempt
+@require_POST
+def admin_integration_generate(request, distributor_id):
+    user, is_admin, err = _require_manager_scope(request)
+    if err:
+        return err
+        
+    from django.shortcuts import get_object_or_404
+    distributor = get_object_or_404(Distributor, id=distributor_id)
+        
+    distributor.integration_tokens.filter(is_active=True).update(is_active=False)
+    
+    new_token = secrets.token_hex(32)
+    IntegrationToken.objects.create(distributor=distributor, token=new_token)
+    
+    return JsonResponse({"token": new_token})
+
+
+@require_GET
+def admin_integration_logs(request):
+    user, is_admin, err = _require_manager_scope(request)
+    if err:
+        return err
+        
+    qs = SyncLog.objects.select_related("distributor").order_by("-created_at")
+    recent_logs = _paginate(request, qs)
+    
+    return JsonResponse({
+        "results": [
+            {
+                "id": str(log.id),
+                "distributorName": log.distributor.name,
+                "type": log.sync_type,
+                "status": log.status,
+                "details": log.details,
+                "createdAt": log.created_at.isoformat()
+            } for log in recent_logs
+        ]
+    })
+
+
+@require_GET
+def admin_analytics(request):
+    user, is_admin, err = _require_manager_scope(request)
+    if err:
+        return err
+        
+    from django.db.models import Sum
+    from datetime import date
+    
+    today = date.today()
+    start_of_month = today.replace(day=1)
+    
+    total_clients = ClientProfile.objects.count()
+    total_purchases_month = Purchase.objects.filter(
+        status="verified", 
+        date__gte=start_of_month
+    ).aggregate(total=Sum('total_amount'))['total'] or 0
+    
+    open_tickets = ExpertTicket.objects.filter(status="open").count()
+    
+    total_syncs = SyncLog.objects.count()
+    successful_syncs = SyncLog.objects.filter(status="success").count()
+    sync_success_rate = (successful_syncs / total_syncs * 100) if total_syncs > 0 else 100.0
+
+    # Also maybe some historical data for charts
+    # For simplicity, returning a small mock or actual simple history
+    
+    return JsonResponse({
+        "totalClients": total_clients,
+        "monthlyTurnover": float(total_purchases_month),
+        "openTickets": open_tickets,
+        "syncSuccessRate": round(sync_success_rate, 1)
+    })
 
 
 @require_GET
@@ -1115,6 +1314,7 @@ def distributor_clients(request):
     if err:
         return err
     qs = _scope_clients(distributor, is_admin)
+    qs = _paginate(request, qs)
     return JsonResponse({"results": [_format_client(item) for item in qs]})
 
 
@@ -1317,6 +1517,7 @@ def referrals(request):
     client, err = _require_client(request)
     if err:
         return err
+        
     qs = client.referrals.all()
     stats = {
         "invitedCount": qs.count(),
@@ -1325,8 +1526,11 @@ def referrals(request):
         "giftCount": qs.filter(condition_met=True).count(),
         "purchaseAmount": float(sum(r.purchase_amount for r in qs)),
     }
-    return JsonResponse({"stats": stats, "results": [_format_referral(r) for r in qs]})
-
+    qs = _paginate(request, qs.order_by("-created_at"))
+    return JsonResponse({
+        "stats": stats,
+        "results": [_format_referral(item) for item in qs]
+    })
 
 @csrf_exempt
 @require_POST
@@ -1355,11 +1559,14 @@ def tickets(request):
         if expert_err:
             return err # Original unauthorized error
         # It's an expert, return all tickets or filtered
-        qs = ExpertTicket.objects.select_related("client").prefetch_related("materials").all()
+        qs = ExpertTicket.objects.select_related("client").order_by("-created_at")
+        qs = _paginate(request, qs)
         return JsonResponse({"results": [_format_ticket(item) for item in qs]})
     
     # It's a client, return only their tickets
-    return JsonResponse({"results": [_format_ticket(item) for item in client.expert_tickets.all()]})
+    qs = client.expert_tickets.order_by("-created_at")
+    qs = _paginate(request, qs)
+    return JsonResponse({"results": [_format_ticket(item) for item in qs]})
 
 
 @csrf_exempt
@@ -1483,20 +1690,69 @@ def regions(request):
 
 @require_GET
 def notifications(request):
-    client, err = _require_client(request)
-    if err:
-        return err
-    return JsonResponse({"results": [_format_notification(item) for item in client.notifications.all()]})
+    user = _current_user(request)
+    if user is None:
+        return JsonResponse({"detail": "Unauthorized"}, status=401)
+        
+    qs = user.notifications.order_by("-created_at")
+    qs = _paginate(request, qs)
+    return JsonResponse({"results": [_format_notification(item) for item in qs]})
 
 
 @csrf_exempt
 @require_POST
 def mark_notifications_read(request):
-    client, err = _require_client(request)
+    user = _current_user(request)
+    if user is None:
+        return JsonResponse({"detail": "Unauthorized"}, status=401)
+    user.notifications.filter(is_read=False).update(is_read=True)
+    return JsonResponse({"ok": True})
+
+
+@require_GET
+def manager_clients(request):
+    user, is_admin, err = _require_manager_scope(request)
     if err:
         return err
-    client.notifications.filter(is_read=False).update(is_read=True)
-    return JsonResponse({"ok": True})
+    qs = ClientProfile.objects.all().select_related("region", "distributor")
+    qs = _paginate(request, qs)
+    return JsonResponse({"results": [_format_client(c) for c in qs]})
+
+
+@require_GET
+def manager_client_unified(request, client_id):
+    user, is_admin, err = _require_manager_scope(request)
+    if err:
+        return err
+    
+    client = get_object_or_404(ClientProfile, id=client_id)
+    
+    # 1. Profile
+    profile_data = _format_client(client)
+    
+    # 2. Purchases
+    purchases = [_format_purchase(p) for p in _paginate(request, client.purchases.all().order_by("-date"))]
+    
+    # 3. Orders
+    orders = [_format_order(o) for o in _paginate(request, client.orders.all().order_by("-created_at"))]
+    
+    # 4. Color Requests
+    color_requests = [_format_color_request(c) for c in _paginate(request, client.color_requests.all().order_by("-created_at"))]
+    
+    # 5. Expert Tickets
+    tickets = [_format_ticket(t) for t in _paginate(request, client.expert_tickets.all().order_by("-created_at"))]
+    
+    # 6. Referrals
+    referrals = [_format_referral(r) for r in _paginate(request, client.referrals.all().order_by("-created_at"))]
+    
+    return JsonResponse({
+        "client": profile_data,
+        "purchases": purchases,
+        "orders": orders,
+        "colorRequests": color_requests,
+        "tickets": tickets,
+        "referrals": referrals,
+    })
 
 
 def _normalize_words(text):

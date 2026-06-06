@@ -37,6 +37,7 @@ INSTALLED_APPS = list(dict.fromkeys(INSTALLED_APPS))
 
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
+    "api.middleware.ApiStatelessMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -46,7 +47,17 @@ MIDDLEWARE = [
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
-CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:8080",
+    "http://127.0.0.1:8000",
+    "http://localhost:49581",
+    "http://127.0.0.1:49581",
+    "http://89.111.132.221",
+    "http://89.111.132.221:8000",
+    "https://autoterra.ru",
+    "http://localhost:50215",
+]
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_METHODS = [
     "DELETE",
