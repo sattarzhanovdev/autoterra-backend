@@ -242,10 +242,10 @@ class Product(models.Model):
 
 class Order(models.Model):
     STATUS_CHOICES = [
-        ("pending", "Новый"),
+        ("new", "Новый"),
         ("accepted", "Принят"),
         ("rejected", "Отклонён"),
-        ("done", "Выполнен"),
+        ("fulfilled", "Выполнен"),
     ]
 
     client = models.ForeignKey(ClientProfile, on_delete=models.CASCADE, related_name="orders", verbose_name="Клиент")
@@ -253,7 +253,7 @@ class Order(models.Model):
     distributor = models.ForeignKey(Distributor, on_delete=models.PROTECT, related_name="orders", verbose_name="Дистрибьютор")
     external_id = models.CharField("Внешний ID (1C)", max_length=128, blank=True, null=True, db_index=True)
     comment = models.TextField("Комментарий", blank=True)
-    status = models.CharField("Статус", max_length=32, choices=STATUS_CHOICES, default="pending")
+    status = models.CharField("Статус", max_length=32, choices=STATUS_CHOICES, default="new")
     rejection_reason = models.TextField("Причина отклонения", blank=True)
     created_at = models.DateTimeField("Создан", auto_now_add=True)
 
@@ -383,6 +383,10 @@ class ColorRequest(models.Model):
         ("ready", "Готова"),
         ("delivered", "Выдана"),
     ]
+    TRANSFER_CHOICES = [
+        ("courier", "Курьер"),
+        ("self_delivery", "Сам привезу"),
+    ]
 
     client = models.ForeignKey(ClientProfile, on_delete=models.CASCADE, related_name="color_requests", verbose_name="Клиент")
     car_brand = models.CharField("Марка", max_length=128)
@@ -394,12 +398,11 @@ class ColorRequest(models.Model):
     urgent = models.BooleanField("Срочно", default=False)
     comment = models.TextField("Комментарий", blank=True)
     
-    courier_pickup = models.BooleanField("Нужен курьер для лючка", default=False)
+    transfer_method = models.CharField("Способ передачи", max_length=32, choices=TRANSFER_CHOICES, default="courier")
     pickup_address = models.CharField("Адрес забора лючка", max_length=255, blank=True)
-    pickup_date = models.DateTimeField("Дата/время забора", blank=True, null=True)
+    pickup_time = models.DateTimeField("Дата/время забора", blank=True, null=True)
     contact_person = models.CharField("Контактное лицо", max_length=255, blank=True)
     contact_phone = models.CharField("Телефон", max_length=32, blank=True)
-    delivery_method = models.CharField("Способ передачи", max_length=64, default="courier")
     
     sla_deadline = models.DateTimeField("SLA deadline", blank=True, null=True)
     assigned_distributor = models.ForeignKey(
@@ -424,6 +427,14 @@ class ColorRequest(models.Model):
 
     def __str__(self):
         return f"{self.car_brand} {self.car_model} · {self.color_code}"
+
+    def save(self, *args, **kwargs):
+        is_new = self.pk is None
+        if is_new and not self.sla_deadline:
+            from django.utils import timezone
+            sla_hours = 4 if self.urgent else 24
+            self.sla_deadline = timezone.now() + timezone.timedelta(hours=sla_hours)
+        super().save(*args, **kwargs)
 
 
 class RecipeMaterial(models.Model):
@@ -453,6 +464,7 @@ class CourierTask(models.Model):
         ("delivery", "Доставка"),
         ("pickup", "Забор лючка"),
         ("return", "Возврат лючка"),
+        ("color_lab_pickup", "Забор для Color Lab"),
     ]
     STATUS_CHOICES = [
         ("assigned", "Назначен"),
@@ -500,21 +512,61 @@ class CourierTask(models.Model):
     status = models.CharField(
         "Статус", max_length=32, choices=STATUS_CHOICES, default="assigned"
     )
-    proof_photo = models.ImageField(
-        "Фото-подтверждение", upload_to="courier_proofs/%Y/%m/", null=True, blank=True
-    )
+    status_history = models.JSONField("История статусов", default=list, blank=True)
+    car_description = models.CharField("Автомобиль", max_length=255, blank=True)
+    contact_name = models.CharField("Контактное лицо", max_length=255, blank=True)
+    contact_phone = models.CharField("Телефон", max_length=32, blank=True)
+    scheduled_time = models.DateTimeField("Запланировано", blank=True, null=True)
     comment = models.TextField("Комментарий", blank=True)
     courier_comment = models.TextField("Комментарий курьера", blank=True)
-    status_history = models.JSONField("История статусов", default=list, blank=True)
+    proof_photo = models.ImageField("Фото-отчет", upload_to="courier_proofs/%Y/%m/", blank=True, null=True)
     created_at = models.DateTimeField("Создана", auto_now_add=True)
 
     class Meta:
         verbose_name = "Задача курьера"
-        verbose_name_plural = "Задачи курьеров"
+        verbose_name_plural = "Задачи курьера"
         ordering = ("-created_at",)
 
     def __str__(self):
         return f"{self.get_task_type_display()} · {self.address}"
+
+
+# Signals for CourierTask
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+@receiver(post_save, sender=ColorRequest)
+def create_color_lab_courier_task(sender, instance, created, **kwargs):
+    if created and instance.transfer_method == 'courier':
+        CourierTask.objects.create(
+            client=instance.client,
+            color_request=instance,
+            task_type="color_lab_pickup",
+            address=instance.pickup_address or instance.client.city,
+            time_slot=instance.pickup_time.strftime("%H:%M") if instance.pickup_time else "В течение дня",
+            scheduled_time=instance.pickup_time,
+            car_description=f"{instance.car_brand} {instance.car_model}",
+            contact_name=instance.contact_person or instance.client.contact_name,
+            contact_phone=instance.contact_phone or instance.client.phone,
+            comment=instance.comment or "Забор лючка для Color Lab"
+        )
+
+
+class AuditLog(models.Model):
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Пользователь")
+    action = models.CharField("Действие", max_length=255)
+    model_name = models.CharField("Модель", max_length=100, blank=True)
+    object_id = models.CharField("ID объекта", max_length=100, blank=True)
+    changes = models.JSONField("Изменения", default=dict, blank=True)
+    created_at = models.DateTimeField("Дата/время", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Лог аудита"
+        verbose_name_plural = "Логи аудита"
+        ordering = ("-created_at",)
+
+    def __str__(self):
+        return f"{self.created_at}: {self.action}"
 
 
 class Referral(models.Model):
@@ -539,32 +591,39 @@ class Referral(models.Model):
         if invitee is None:
             return self
 
-        purchase_amount = (
+        # Anti-fraud: only count verified purchases and fulfilled orders
+        purchase_total = (
             invitee.purchases.filter(status="verified").aggregate(total=models.Sum("total_amount"))["total"]
             or 0
         )
-        order_amount = sum(
-            (order.total_amount for order in invitee.orders.filter(status="done").prefetch_related("items")),
-            start=0,
-        )
-        amount = max(purchase_amount, order_amount)
+        
+        # Order.total_amount is a property, sum it manually from the queryset
+        orders = invitee.orders.filter(status="fulfilled").prefetch_related("items")
+        order_total = sum((o.total_amount for o in orders), start=0)
+        
+        amount = float(purchase_total) + float(order_total)
 
         updates = []
         if not self.is_registered:
             self.is_registered = True
             updates.append("is_registered")
-        if amount and not self.has_purchase:
+            
+        if amount > 0 and not self.has_purchase:
             self.has_purchase = True
             updates.append("has_purchase")
-        if self.purchase_amount != amount:
+            
+        if float(self.purchase_amount) != amount:
             self.purchase_amount = amount
             updates.append("purchase_amount")
-        if amount >= 30000 and not self.condition_met:
+            
+        # Threshold for bonus/gift (e.g. 30,000)
+        BONUS_THRESHOLD = 30000
+        if amount >= BONUS_THRESHOLD and not self.condition_met:
             self.condition_met = True
+            self.gift = "Сертификат на 5000 ₽"
             updates.append("condition_met")
-        if self.condition_met and not self.gift:
-            self.gift = "Подарок за рекомендацию"
             updates.append("gift")
+
         if updates:
             self.save(update_fields=updates)
         return self
@@ -594,10 +653,13 @@ class ExpertTicket(models.Model):
     ai_answer = models.TextField("Ответ AI (опубликованный)", blank=True)
     expert_answer = models.TextField("Ответ эксперта", blank=True)
     
+    photo = models.ImageField("Фото дефекта", upload_to="tickets/photos/%Y/%m/", blank=True, null=True)
+    video_link = models.URLField("Ссылка на видео", blank=True)
+    
     linked_knowledge_card = models.ForeignKey(
         "KnowledgeCard",
         on_delete=models.SET_NULL,
-        related_name="source_tickets",
+        related_name="source_tickets_legacy",
         verbose_name="Связанная база знаний",
         blank=True,
         null=True,
@@ -671,19 +733,20 @@ class KnowledgeCard(models.Model):
     restrictions = models.TextField("Ограничения", blank=True)
     
     status = models.CharField("Статус", max_length=32, choices=STATUS_CHOICES, default="draft")
-    is_approved = models.BooleanField("Одобрено (legacy)", default=False)
     
-    created_by = models.ForeignKey(
+    expert_author = models.ForeignKey(
         User,
         on_delete=models.SET_NULL,
-        related_name="created_knowledge_cards",
+        related_name="authored_knowledge_cards",
+        verbose_name="Автор-эксперт",
         null=True,
         blank=True,
     )
-    approved_by = models.ForeignKey(
-        User,
+    source_ticket = models.ForeignKey(
+        ExpertTicket,
         on_delete=models.SET_NULL,
-        related_name="approved_knowledge_cards",
+        related_name="derived_knowledge_cards",
+        verbose_name="Источник (тикет)",
         null=True,
         blank=True,
     )

@@ -402,8 +402,7 @@ def _format_order(order):
         "documentNumber": f"ORD-{order.id:05d}",
         "date": order.created_at.isoformat(),
         "totalAmount": float(order.total_amount),
-        "status": "pending" if order.status in ("pending", "accepted") else "verified",
-        "orderStatus": order.status,
+        "status": order.status,
         "comment": order.comment,
         "rejectionReason": order.rejection_reason or None,
         "createdAt": order.created_at.isoformat(),
@@ -470,12 +469,11 @@ def _format_color_request(item):
         "colorName": item.color_name,
         "urgent": item.urgent,
         "comment": item.comment or None,
-        "courierPickup": item.courier_pickup,
+        "transferMethod": item.transfer_method,
         "pickupAddress": item.pickup_address or None,
-        "pickupDate": item.pickup_date.isoformat() if item.pickup_date else None,
+        "pickupTime": item.pickup_time.isoformat() if item.pickup_time else None,
         "contactPerson": item.contact_person or None,
         "contactPhone": item.contact_phone or None,
-        "deliveryMethod": item.delivery_method,
         "slaDeadline": item.sla_deadline.isoformat() if item.sla_deadline else None,
         "isOverdue": is_overdue,
         "assignedDistributorId": str(item.assigned_distributor_id) if item.assigned_distributor_id else None,
@@ -811,11 +809,17 @@ def purchases(request):
 
 @csrf_exempt
 @require_POST
+@csrf_exempt
+@require_POST
 def create_purchase(request):
     client, err = _require_client(request)
     if err:
         return err
-    payload = _json(request)
+    
+    is_multipart = (request.content_type or "").startswith("multipart/form-data")
+    payload = request.POST if is_multipart else _json(request)
+    files = _attachment_files(request)
+    
     serializer = PurchaseSerializer(payload)
     if not serializer.is_valid():
         return JsonResponse({"errors": serializer.errors}, status=400)
@@ -844,7 +848,15 @@ def create_purchase(request):
             total_amount=validated_data['amount'],
             status="new",
         )
-        items = _parse_items(payload.get("items"))
+        
+        items_data = payload.get("items")
+        if isinstance(items_data, str):
+            try:
+                items_data = json.loads(items_data)
+            except json.JSONDecodeError:
+                items_data = []
+        
+        items = _parse_items(items_data)
         for raw in items:
             PurchaseItem.objects.create(
                 purchase=purchase, 
@@ -853,6 +865,8 @@ def create_purchase(request):
                 quantity=int(raw.get("quantity") or 1), 
                 price=_money_value(raw.get("price"))
             )
+        
+        _create_attachments(request, purchase, files, description="Документ к покупке")
             
     return JsonResponse({"purchase": _format_purchase(purchase)}, status=201)
 
@@ -887,6 +901,7 @@ def create_color_request(request):
     payload = request.POST if (request.content_type or "").startswith("multipart/form-data") else _json(request)
     files = _attachment_files(request)
     with transaction.atomic():
+        urgent = str(payload.get("urgent")).lower() in {"true", "1", "yes"}
         item = ColorRequest.objects.create(
             client=client,
             car_brand=(payload.get("carBrand") or "").strip(),
@@ -895,35 +910,20 @@ def create_color_request(request):
             vin=(payload.get("vin") or "").strip(),
             color_code=(payload.get("colorCode") or "").strip(),
             color_name=(payload.get("colorName") or "").strip(),
-            urgent=str(payload.get("urgent")).lower() in {"true", "1", "yes"},
+            urgent=urgent,
             comment=(payload.get("comment") or "").strip(),
-            courier_pickup=str(payload.get("courierPickup")).lower() in {"true", "1", "yes"},
+            transfer_method=(payload.get("transferMethod") or "courier").strip(),
             pickup_address=(payload.get("pickupAddress") or payload.get("address") or client.city).strip(),
-            pickup_date=_dt(payload.get("pickupDate") or payload.get("pickupTime") or payload.get("scheduledTime")) if payload.get("pickupDate") or payload.get("pickupTime") or payload.get("scheduledTime") else None,
+            pickup_time=_dt(payload.get("pickupTime") or payload.get("pickupDate") or payload.get("scheduledTime")) if payload.get("pickupTime") or payload.get("pickupDate") or payload.get("scheduledTime") else None,
             contact_person=(payload.get("contactPerson") or payload.get("contactName") or client.contact_name).strip(),
             contact_phone=(payload.get("contactPhone") or client.phone).strip(),
-            delivery_method=(payload.get("deliveryMethod") or "courier").strip(),
             assigned_distributor=client.distributor,
         )
         sla_hours = 4 if item.urgent else 24
-        item.sla_deadline = item.created_at + timezone.timedelta(hours=sla_hours)
+        item.sla_deadline = timezone.now() + timezone.timedelta(hours=sla_hours)
         _append_color_history(item, "created", _current_user(request), "Заявка создана")
         item.save(update_fields=["sla_deadline", "status_history"])
         _create_attachments(request, item, files, description="Фото для Color Lab")
-        if item.courier_pickup:
-            task = CourierTask.objects.create(
-                client=client,
-                color_request=item,
-                type="pickup",
-                address=item.pickup_address or client.city,
-                scheduled_time=item.pickup_date or (timezone.now() + timezone.timedelta(hours=2)),
-                contact_name=item.contact_person,
-                contact_phone=item.contact_phone,
-                car_description=f"{item.car_brand} {item.car_model} · {item.color_code}",
-                comment=(item.comment or "Забор лючка для Color Lab").strip(),
-            )
-            _append_task_history(task, "created", _current_user(request), "Создано из Color Lab")
-            task.save(update_fields=["status_history"])
     return JsonResponse({"request": _format_color_request(item)}, status=201)
 
 
@@ -1044,6 +1044,61 @@ def assign_courier_task(request, task_id):
 # Distributor Views
 
 @require_GET
+def distributors(request):
+    qs = Distributor.objects.all()
+    return JsonResponse({"results": [{"id": str(d.id), "name": d.name} for d in qs]})
+
+
+def _require_manager_scope(request):
+    user = _current_user(request)
+    if user is None:
+        return None, False, JsonResponse({"detail": "Unauthorized"}, status=401)
+    if user.is_staff or user.is_superuser:
+        return user, True, None
+    profile = getattr(user, "profile", None)
+    if profile and profile.role in ["manager", "admin"]:
+        return user, False, None
+    return None, False, JsonResponse({"detail": "Нет доступа менеджера"}, status=403)
+
+
+@require_GET
+def manager_dashboard(request):
+    user, is_admin, err = _require_manager_scope(request)
+    if err:
+        return err
+    
+    # Filters
+    region_id = request.GET.get("region")
+    distributor_id = request.GET.get("distributor")
+    
+    client_qs = ClientProfile.objects.all()
+    order_qs = Order.objects.all()
+    
+    if region_id:
+        client_qs = client_qs.filter(region_id=region_id)
+        order_qs = order_qs.filter(client__region_id=region_id)
+    if distributor_id:
+        client_qs = client_qs.filter(distributor_id=distributor_id)
+        order_qs = order_qs.filter(distributor_id=distributor_id)
+
+    stats = {
+        "totalClients": client_qs.count(),
+        "activeOrders": order_qs.filter(status__in=["new", "accepted"]).count(),
+        "fulfilledOrders": order_qs.filter(status="fulfilled").count(),
+        "totalTurnover": float(order_qs.filter(status="fulfilled").aggregate(Sum("total_amount"))["total_amount"] or 0),
+        "regionalStats": [
+            {
+                "region": r.name,
+                "clients": client_qs.filter(region=r).count(),
+                "orders": order_qs.filter(client__region=r).count()
+            } for r in Region.objects.all()
+        ]
+    }
+    
+    return JsonResponse(stats)
+
+
+@require_GET
 def distributor_dashboard(request):
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
@@ -1077,9 +1132,64 @@ def distributor_purchases(request):
     if status_filter:
         qs = qs.filter(status=status_filter)
     else:
-        qs = qs.filter(status__in=["new", "pending", "pending_verification", "under_review"])
+        qs = qs.filter(status__in=["new", "under_review"])
 
     return JsonResponse({"results": [_format_purchase(item) for item in qs]})
+
+
+import openpyxl
+from openpyxl.styles import Font, Alignment
+from django.http import HttpResponse
+
+def _log_audit(request, action, obj, changes=None):
+    AuditLog.objects.create(
+        user=_current_user(request),
+        action=action,
+        model_name=obj.__class__.__name__,
+        object_id=str(obj.id),
+        changes=changes or {}
+    )
+
+
+@require_GET
+def export_excel(request):
+    user, is_admin, err = _require_manager_scope(request)
+    if err:
+        return err
+    
+    region_id = request.GET.get("region")
+    
+    # Create workbook
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "AutoTerra Report"
+    
+    # Headers
+    headers = ["Регион", "Клиент", "ИНН", "Документ", "Дата", "Сумма", "Статус"]
+    for col, header in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center")
+
+    # Data
+    qs = Purchase.objects.select_related("client", "client__region")
+    if region_id:
+        qs = qs.filter(client__region_id=region_id)
+    
+    for row_idx, p in enumerate(qs.order_by("-date"), 2):
+        ws.cell(row=row_idx, column=1, value=p.client.region.name if p.client.region else "-")
+        ws.cell(row=row_idx, column=2, value=p.client.company_name)
+        ws.cell(row=row_idx, column=3, value=p.client.inn)
+        ws.cell(row=row_idx, column=4, value=p.document_number)
+        ws.cell(row=row_idx, column=5, value=p.date.strftime("%d.%m.%Y") if p.date else "")
+        ws.cell(row=row_idx, column=6, value=float(p.total_amount))
+        ws.cell(row=row_idx, column=7, value=p.get_status_display())
+
+    # Response
+    response = HttpResponse(content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    response["Content-Disposition"] = 'attachment; filename="autoterra_report.xlsx"'
+    wb.save(response)
+    return response
 
 
 @csrf_exempt
@@ -1098,13 +1208,17 @@ def distributor_verify_purchase(request, purchase_id):
     reason = payload.get("rejection_reason")
 
     if status not in ["verified", "rejected"]:
-        return JsonResponse({"detail": "Некорректный статус. Используйте verified или rejected"}, status=400)
+        return JsonResponse({"detail": "Некорректный статус"}, status=400)
 
+    old_status = purchase.status
     purchase.status = status
     if status == "rejected" and reason:
         purchase.rejection_reason = reason
     
     purchase.save()
+    
+    _log_audit(request, f"Purchase status change: {old_status} -> {status}", purchase, {"reason": reason})
+    
     return JsonResponse({"purchase": _format_purchase(purchase)})
 
 
@@ -1138,14 +1252,18 @@ def distributor_update_order_status(request, order_id):
     status = payload.get("status")
     reason = payload.get("rejection_reason")
 
-    if status not in ["accepted", "rejected", "done"]:
+    if status not in ["accepted", "rejected", "fulfilled"]:
         return JsonResponse({"detail": "Некорректный статус"}, status=400)
 
+    old_status = order.status
     order.status = status
     if status == "rejected" and reason:
         order.rejection_reason = reason
     
     order.save()
+    
+    _log_audit(request, f"Order status change: {old_status} -> {status}", order, {"reason": reason})
+    
     return JsonResponse({"order": _format_order(order)})
 
 
@@ -1453,23 +1571,25 @@ def ai_chat(request):
     best_score = ranked[0][0] if ranked else 0
     card = ranked[0][1] if ranked else None
 
+    # Guardrails: Forbidden topics if not in KB
+    dangerous_keywords = ["пропорции", "смешивание", "гарантия", "совместимость", "срок годности", "разбавление"]
+    is_query_dangerous = any(kw in question.lower() for kw in dangerous_keywords)
+
     if card and best_score >= CONFIDENCE_THRESHOLD:
-        # Guardrails (Dangerous keywords check)
-        dangerous_keywords = ["пропорции", "гарантия", "совместимость", "срок годности"]
-        looks_dangerous = any(kw in question.lower() for kw in dangerous_keywords)
-        
         solution_lower = card.solution.lower()
-        if looks_dangerous and not any(kw in solution_lower for kw in dangerous_keywords):
-            answer = (f"Я нашёл статью '{card.title}', но в ней нет точной информации по вашим критериям "
-                      "(пропорции/совместимость). Чтобы не рисковать качеством ремонта, я создал "
-                      "заявку для нашего технолога.")
-            source_id = str(card.id)
-            _auto_create_ticket(client, question, "AI - High Risk Match")
-            return JsonResponse({"answer": answer, "sourceId": source_id, "suggestEscalation": True})
+        # If user asks for specifics but KB doesn't have them explicitly
+        if is_query_dangerous and not any(kw in solution_lower for kw in dangerous_keywords):
+            answer = (f"В базе знаний найдена информация по теме '{card.title or card.problem}', но в ней отсутствуют точные технические параметры (пропорции/гарантии). "
+                      "Во избежание нарушения технологии, я не могу дать совет. Рекомендую создать обращение к эксперту.")
+            return JsonResponse({
+                "answer": answer, 
+                "sourceId": str(card.id), 
+                "suggestEscalation": True
+            })
         
-        answer = f"На основе базы знаний ({card.category}):\n\n{card.solution}"
+        answer = f"На основе утверждённой базы знаний ({card.category}):\n\n{card.solution}"
         if card.restrictions:
-            answer += f"\n\nВажно: {card.restrictions}"
+            answer += f"\n\nВАЖНО: {card.restrictions}"
         
         return JsonResponse({
             "answer": answer,
@@ -1477,12 +1597,9 @@ def ai_chat(request):
             "suggestEscalation": False
         })
 
-    # 4. Low confidence: Automatic Escalation
-    _auto_create_ticket(client, question, "AI - Low Confidence")
+    # 4. Low confidence or No Match
     return JsonResponse({
-        "answer": ("К сожалению, в базе знаний нет точного ответа на ваш вопрос. "
-                  "Я автоматически создал обращение к нашему технологу. Он ответит вам в ближайшее время."),
-        "sourceId": None,
+        "answer": "Недостаточно данных в базе знаний для точного ответа. Перевожу на эксперта. Пожалуйста, создайте тикет с описанием проблемы и фото.",
         "suggestEscalation": True
     })
 
