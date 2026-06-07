@@ -17,6 +17,9 @@ class Profile(models.Model):
 
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="profile")
     role = models.CharField("Роль", max_length=20, choices=Role.choices, default=Role.CLIENT)
+    specialty = models.CharField("Специализация", max_length=255, blank=True)
+    bio = models.TextField("О себе", blank=True)
+    rating = models.DecimalField("Рейтинг", max_digits=3, decimal_places=1, default=5.0)
 
     class Meta:
         verbose_name = "Профиль пользователя"
@@ -711,6 +714,14 @@ class ExpertTicket(models.Model):
     ai_draft_answer = models.TextField("AI черновик ответа", blank=True)
     ai_answer = models.TextField("Ответ AI (опубликованный)", blank=True)
     expert_answer = models.TextField("Ответ эксперта", blank=True)
+    expert_author = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="answered_tickets",
+        verbose_name="Ответивший эксперт",
+        null=True,
+        blank=True,
+    )
     
     photo = models.ImageField("Фото дефекта", upload_to="tickets/photos/%Y/%m/", blank=True, null=True)
     video_link = models.URLField("Ссылка на видео", blank=True)

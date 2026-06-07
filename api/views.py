@@ -24,6 +24,7 @@ from django.views.decorators.http import require_GET, require_POST, require_http
 from .models import (
     Attachment,
     AuthToken,
+    AuditLog,
     ClientProfile,
     ColorRequest,
     CourierTask,
@@ -136,6 +137,11 @@ def _require_client(request):
     user = _current_user(request)
     if user is None:
         return None, JsonResponse({"detail": "Unauthorized"}, status=401)
+    
+    role = getattr(user, "profile", None).role if hasattr(user, "profile") else "client"
+    if role != "client":
+        return None, JsonResponse({"detail": "Нет доступа клиента"}, status=403)
+        
     try:
         return user.client_profile, None
     except ClientProfile.DoesNotExist:
@@ -148,6 +154,11 @@ def _require_distributor_scope(request):
         return None, False, JsonResponse({"detail": "Unauthorized"}, status=401)
     if user.is_staff or user.is_superuser:
         return None, True, None
+        
+    role = getattr(user, "profile", None).role if hasattr(user, "profile") else "unknown"
+    if role != "distributor":
+        return None, False, JsonResponse({"detail": "Нет доступа дистрибьютора"}, status=403)
+
     distributor = getattr(user, "distributor_profile", None)
     if distributor is None:
         return None, False, JsonResponse({"detail": "Профиль дистрибьютора не создан в admin"}, status=403)
@@ -155,7 +166,11 @@ def _require_distributor_scope(request):
 
 
 def _is_courier_user(user):
-    return bool(user and (user.groups.filter(name__iexact="courier").exists() or user.is_staff or user.is_superuser))
+    if not user:
+        return False
+    if user.is_staff or user.is_superuser:
+        return True
+    return getattr(user, "profile", None) and user.profile.role == "courier"
 
 
 def _require_courier_scope(request):
@@ -168,7 +183,11 @@ def _require_courier_scope(request):
 
 
 def _is_expert_user(user):
-    return bool(user and (user.groups.filter(name__iexact="expert").exists() or user.is_staff or user.is_superuser))
+    if not user:
+        return False
+    if user.is_staff or user.is_superuser:
+        return True
+    return getattr(user, "profile", None) and user.profile.role == "ai_expert"
 
 
 def _require_expert_scope(request):
@@ -322,6 +341,7 @@ def _attachments_for(related_object):
 def _format_client(client):
     return {
         "id": str(client.id),
+        "userId": str(client.user_id),
         "inn": client.inn,
         "name": client.company_name,
         "category": client.category,
@@ -553,14 +573,13 @@ def _format_knowledge_card(item):
         "title": item.title or item.problem,
         "category": item.category,
         "problem": item.problem,
-        "causes": item.causes or None,
+        "causes": item.causes or "",
         "solution": item.solution,
         "skus": item.skus or [],
         "restrictions": item.restrictions or None,
         "status": item.status,
         "isApproved": item.status == "approved",
-        "createdBy": str(item.created_by_id) if item.created_by_id else None,
-        "approvedBy": str(item.approved_by_id) if item.approved_by_id else None,
+        "approvingExpert": item.expert_author.username if item.expert_author else "System",
         "revisionHistory": item.revision_history or [],
         "createdAt": item.created_at.isoformat(),
         "updatedAt": item.updated_at.isoformat(),
@@ -695,32 +714,58 @@ def register(request):
 @require_POST
 def login(request):
     payload = _json(request)
-    phone = (payload.get("phone") or "").strip()
+    login_input = (payload.get("phone") or "").strip()
     password = payload.get("password") or ""
-    normalized = _normalize_phone(phone)
-
-    user = authenticate(username=normalized, password=password)
+    
+    # 1. Try to authenticate with raw input (useful for text logins like 'admin')
+    user = authenticate(username=login_input, password=password)
+    
+    # 2. If fails, try normalizing as phone and authenticate again
     if user is None:
-        user = User.objects.filter(username=normalized).first()
+        normalized = _normalize_phone(login_input)
+        if normalized and normalized != login_input:
+            user = authenticate(username=normalized, password=password)
+            
+    # 3. Final check (fallback check for users without proper password setup but exist in DB)
+    if user is None:
+        # Check if login_input or normalized matches username
+        matches = [login_input]
+        normalized = _normalize_phone(login_input)
+        if normalized and normalized != login_input:
+            matches.append(normalized)
+            
+        user = User.objects.filter(username__in=matches).first()
         if user is None or not user.check_password(password):
-            return JsonResponse({"detail": "Неверный телефон или пароль"}, status=401)
+            return JsonResponse({"detail": "Неверный логин или пароль"}, status=401)
 
     token = secrets.token_hex(24)
     AuthToken.objects.create(key=token, user=user)
 
-    try:
-        client = user.client_profile
-    except ClientProfile.DoesNotExist:
+    role = getattr(user, "profile", None).role if hasattr(user, "profile") else "client"
+    
+    if role == "client":
+        try:
+            client = user.client_profile
+            return JsonResponse({"token": token, "user": {"id": str(user.id), "phone": client.phone, "role": "autoservice", "status": client.status}})
+        except ClientProfile.DoesNotExist:
+            return JsonResponse({"detail": "Профиль клиента не создан"}, status=403)
+            
+    if role == "distributor":
         distributor = getattr(user, "distributor_profile", None)
         if distributor is None:
-            if _is_courier_user(user):
-                return JsonResponse({"token": token, "user": {"id": str(user.id), "phone": user.username, "role": "courier", "status": "active"}})
-            if _is_expert_user(user):
-                return JsonResponse({"token": token, "user": {"id": str(user.id), "phone": user.username, "role": "expert", "status": "active"}})
-            return JsonResponse({"detail": "Профиль клиента или дистрибьютора не найден"}, status=403)
+            return JsonResponse({"detail": "Профиль дистрибьютора не создан"}, status=403)
         return JsonResponse({"token": token, "user": {"id": str(user.id), "phone": user.username, "role": "distributor", "status": "active", "distributor": _format_distributor(distributor)}})
 
-    return JsonResponse({"token": token, "user": {"id": str(user.id), "phone": client.phone, "role": "autoservice", "status": client.status}})
+    if role == "courier":
+        return JsonResponse({"token": token, "user": {"id": str(user.id), "phone": user.username, "role": "courier", "status": "active"}})
+
+    if role == "ai_expert":
+        return JsonResponse({"token": token, "user": {"id": str(user.id), "phone": user.username, "role": "expert", "status": "active"}})
+
+    if role == "manager" or role == "admin":
+        return JsonResponse({"token": token, "user": {"id": str(user.id), "phone": user.username, "role": role, "status": "active"}})
+
+    return JsonResponse({"detail": "Неизвестная роль"}, status=403)
 
 
 @require_GET
@@ -729,44 +774,74 @@ def me(request):
     if user is None:
         return JsonResponse({"detail": "Unauthorized"}, status=401)
         
-    try:
-        client = user.client_profile
+    profile = getattr(user, "profile", None)
+    role = profile.role if profile else "client"
+    
+    if role == "client":
+        try:
+            client = user.client_profile
+            return JsonResponse({
+                "id": str(user.id), 
+                "phone": client.phone, 
+                "role": "autoservice", 
+                "status": client.status,
+                "client": _format_client(client), 
+                "distributor": _format_distributor(client.distributor)
+            })
+        except ClientProfile.DoesNotExist:
+            return JsonResponse({"detail": "Профиль клиента не создан"}, status=403)
+
+    if role == "distributor":
+        distributor = getattr(user, "distributor_profile", None)
+        if distributor is None:
+            return JsonResponse({"detail": "Профиль дистрибьютора не создан"}, status=403)
         return JsonResponse({
             "id": str(user.id), 
-            "phone": client.phone, 
-            "role": "autoservice", 
-            "status": client.status,
-            "client": _format_client(client), 
-            "distributor": _format_distributor(client.distributor)
+            "phone": user.username, 
+            "role": "distributor", 
+            "status": "active", 
+            "distributor": _format_distributor(distributor)
         })
-    except ClientProfile.DoesNotExist:
-        distributor = getattr(user, "distributor_profile", None)
-        if distributor is not None:
-            return JsonResponse({
-                "id": str(user.id), 
-                "phone": user.username, 
-                "role": "distributor", 
-                "status": "active", 
-                "distributor": _format_distributor(distributor)
-            })
-            
-        if _is_courier_user(user):
-            return JsonResponse({
-                "id": str(user.id), 
-                "phone": user.username, 
-                "role": "courier", 
-                "status": "active"
-            })
-            
-        if _is_expert_user(user):
-            return JsonResponse({
-                "id": str(user.id), 
-                "phone": user.username, 
-                "role": "expert", 
-                "status": "active"
-            })
-            
-        return JsonResponse({"detail": "Профиль не найден"}, status=403)
+
+    if role == "courier":
+        return JsonResponse({
+            "id": str(user.id), 
+            "phone": user.username, 
+            "role": "courier", 
+            "status": "active"
+        })
+
+    if role == "ai_expert":
+        approved_cards = KnowledgeCard.objects.filter(expert_author=user, status="approved").count()
+        answered_tickets = ExpertTicket.objects.filter(expert_author=user, status="expertAnswered").count()
+        
+        return JsonResponse({
+            "id": str(user.id), 
+            "username": user.username,
+            "email": user.email,
+            "phone": user.username, # Assuming phone is username
+            "role": "expert", 
+            "status": "active",
+            "stats": {
+                "approvedCards": approved_cards,
+                "answeredTickets": answered_tickets,
+                "rating": float(profile.rating),
+            },
+            "specialty": profile.specialty or "Эксперт AutoTerra",
+            "expertId": f"EX-{user.id + 77000 if isinstance(user.id, int) else user.id}",
+            "region": ", ".join(r.name for r in user.managed_regions.all()) or "Все регионы",
+            "dateJoined": user.date_joined.strftime("%d.%m.%Y")
+        })
+
+    if role == "manager" or role == "admin":
+        return JsonResponse({
+            "id": str(user.id), 
+            "phone": user.username, 
+            "role": role, 
+            "status": "active"
+        })
+
+    return JsonResponse({"detail": "Профиль не найден"}, status=403)
 
 
 @require_GET
@@ -1174,60 +1249,86 @@ def erp_stock_update(request):
         
     distributor = token.distributor
     payload = _json(request)
+    dry_run = request.GET.get("dry_run") == "true"
     
     if not isinstance(payload, list):
         return JsonResponse({"detail": "Expected a JSON array"}, status=400)
         
     updated_count = 0
     errors = []
+    results = []
     
     try:
-        with transaction.atomic():
-            for item in payload:
-                sku = item.get("sku")
-                quantity = item.get("quantity")
-                price = item.get("price")
+        for item in payload:
+            sku = item.get("sku")
+            external_id = item.get("external_id")
+            quantity = item.get("quantity")
+            price = item.get("price")
+            
+            if not (sku or external_id) or quantity is None:
+                err = f"Missing (sku or external_id) or quantity in item: {item}"
+                errors.append(err)
+                results.append({"item": item, "status": "error", "message": err})
+                continue
                 
-                if not sku or quantity is None:
-                    errors.append(f"Missing sku or quantity in item: {item}")
-                    continue
-                    
-                try:
-                    product = Product.objects.get(distributor=distributor, sku=sku)
-                    product.quantity = int(quantity)
-                    if price is not None:
-                        product.price = Decimal(str(price))
-                    
-                    if product.quantity > 5:
-                        product.status = "inStock"
-                    elif product.quantity > 0:
-                        product.status = "low"
-                    else:
-                        product.status = "outOfStock"
+            try:
+                product = None
+                if external_id:
+                    product = Product.objects.filter(distributor=distributor, external_id=external_id).first()
+                
+                if not product and sku:
+                    product = Product.objects.filter(distributor=distributor, sku=sku).first()
+
+                if product:
+                    if not dry_run:
+                        product.quantity = int(quantity)
+                        if price is not None:
+                            product.price = Decimal(str(price))
                         
-                    product.save()
-                    updated_count += 1
-                except Product.DoesNotExist:
-                    errors.append(f"Product with sku '{sku}' not found")
-                except Exception as e:
-                    errors.append(f"Error updating '{sku}': {str(e)}")
+                        if product.quantity > 5:
+                            product.status = "inStock"
+                        elif product.quantity > 0:
+                            product.status = "low"
+                        else:
+                            product.status = "outOfStock"
+                        product.save()
                     
-        status = "success" if not errors else "error"
+                    updated_count += 1
+                    results.append({"sku": sku, "external_id": external_id, "status": "updated" if not dry_run else "valid"})
+                else:
+                    err = f"Product not found (sku: {sku}, external_id: {external_id})"
+                    errors.append(err)
+                    results.append({"sku": sku, "external_id": external_id, "status": "error", "message": err})
+                    
+            except Exception as e:
+                err = f"Error processing '{sku or external_id}': {str(e)}"
+                errors.append(err)
+                results.append({"sku": sku, "external_id": external_id, "status": "error", "message": err})
+                
+        status = "success" if not errors else ("partial" if updated_count > 0 else "error")
+        if dry_run:
+            status = f"dry_run_{status}"
+
         details = {
             "updated_count": updated_count,
-            "errors": errors
+            "error_count": len(errors),
+            "dry_run": dry_run,
+            "results": results[:100], # Limit log size
         }
+        
         SyncLog.objects.create(
             distributor=distributor,
             sync_type="stock_update",
-            status=status,
+            status="success" if not errors else "error",
             details=details
         )
         
         return JsonResponse({
             "status": status,
             "updated": updated_count,
-            "errors": errors
+            "errors": errors,
+            "dry_run": dry_run,
+            "total_items": len(payload)
         })
     except Exception as e:
         SyncLog.objects.create(
@@ -1239,8 +1340,158 @@ def erp_stock_update(request):
         return JsonResponse({"detail": "Internal server error"}, status=500)
 
 
+@csrf_exempt
+@require_POST
+def erp_catalog_sync(request):
+    """
+    1C pushes full or partial product catalog.
+    Allows creating new products and updating existing ones by external_id or SKU.
+    """
+    token_str = request.headers.get("X-Integration-Token")
+    if not token_str:
+        return JsonResponse({"detail": "Token is missing"}, status=401)
+    token = IntegrationToken.objects.filter(token=token_str, is_active=True).select_related("distributor").first()
+    if not token:
+        return JsonResponse({"detail": "Invalid token"}, status=401)
+    
+    distributor = token.distributor
+    payload = _json(request)
+    if not isinstance(payload, list):
+        return JsonResponse({"detail": "Expected a JSON array"}, status=400)
+    
+    created_count = 0
+    updated_count = 0
+    errors = []
+    
+    for item in payload:
+        external_id = item.get("external_id")
+        sku = item.get("sku")
+        if not (external_id or sku):
+            errors.append(f"Missing both external_id and sku in item: {item}")
+            continue
+            
+        try:
+            # Try to find existing product
+            product = None
+            if external_id:
+                product = Product.objects.filter(distributor=distributor, external_id=external_id).first()
+            if not product and sku:
+                product = Product.objects.filter(distributor=distributor, sku=sku).first()
+            
+            defaults = {
+                "name": item.get("name", "Новый товар"),
+                "category": item.get("category", "Без категории"),
+                "brand": item.get("brand", "AutoTerra"),
+                "price": Decimal(str(item.get("price", 0))),
+                "quantity": int(item.get("quantity", 0)),
+                "is_active": True,
+            }
+            if external_id: defaults["external_id"] = external_id
+            if sku: defaults["sku"] = sku
+
+            if product:
+                for key, value in defaults.items():
+                    setattr(product, key, value)
+                product.save()
+                updated_count += 1
+            else:
+                Product.objects.create(distributor=distributor, **defaults)
+                created_count += 1
+                
+        except Exception as e:
+            errors.append(f"Error processing {sku or external_id}: {str(e)}")
+
+    SyncLog.objects.create(
+        distributor=distributor,
+        sync_type="catalog_sync",
+        status="success" if not errors else "partial",
+        details={"created": created_count, "updated": updated_count, "errors": errors}
+    )
+    
+    return JsonResponse({
+        "status": "success" if not errors else "partial",
+        "created": created_count,
+        "updated": updated_count,
+        "errors": errors
+    })
+
+
+@csrf_exempt
+@require_POST
+def erp_client_sync(request):
+    """
+    1C pushes client data to map external_id by INN or update existing profiles.
+    """
+    token_str = request.headers.get("X-Integration-Token")
+    if not token_str:
+        return JsonResponse({"detail": "Token is missing"}, status=401)
+    token = IntegrationToken.objects.filter(token=token_str, is_active=True).select_related("distributor").first()
+    if not token:
+        return JsonResponse({"detail": "Invalid token"}, status=401)
+    
+    distributor = token.distributor
+    payload = _json(request)
+    
+    updated_count = 0
+    errors = []
+    
+    for item in payload:
+        inn = item.get("inn")
+        external_id = item.get("external_id")
+        if not (inn or external_id):
+            errors.append("Missing inn or external_id")
+            continue
+            
+        try:
+            client = None
+            if external_id:
+                client = ClientProfile.objects.filter(distributor=distributor, external_id=external_id).first()
+            if not client and inn:
+                client = ClientProfile.objects.filter(distributor=distributor, inn=inn).first()
+            
+            if client:
+                client.external_id = external_id or client.external_id
+                if item.get("partner_status"):
+                    client.partner_status = item.get("partner_status")
+                client.save()
+                updated_count += 1
+            else:
+                errors.append(f"Client not found for mapping: {inn or external_id}")
+        except Exception as e:
+            errors.append(f"Error mapping {inn}: {str(e)}")
+            
+    return JsonResponse({"updated": updated_count, "errors": errors})
+
+
 @require_GET
-def admin_integration_tokens(request):
+def erp_orders_export(request):
+    """
+    1C polls for new orders that haven't been exported yet.
+    """
+    token_str = request.headers.get("X-Integration-Token")
+    if not token_str:
+        return JsonResponse({"detail": "Token is missing"}, status=401)
+    token = IntegrationToken.objects.filter(token=token_str, is_active=True).select_related("distributor").first()
+    if not token:
+        return JsonResponse({"detail": "Invalid token"}, status=401)
+    
+    orders = Order.objects.filter(distributor=token.distributor, external_id__isnull=True).prefetch_related("items")
+    
+    results = []
+    for o in orders:
+        results.append({
+            "id": o.id,
+            "client_inn": o.client.inn,
+            "client_external_id": o.client.external_id,
+            "created_at": o.created_at.isoformat(),
+            "comment": o.comment,
+            "items": [
+                {"sku": i.sku, "name": i.name, "quantity": i.quantity, "price": str(i.price)}
+                for i in o.items.all()
+            ]
+        })
+    
+    return JsonResponse({"orders": results})
     user, is_admin, err = _require_manager_scope(request)
     if err:
         return err
@@ -1272,6 +1523,163 @@ def admin_integration_generate(request, distributor_id):
     distributor.integration_tokens.filter(is_active=True).update(is_active=False)
     
     new_token = secrets.token_hex(32)
+    IntegrationToken.objects.create(distributor=distributor, token=new_token)
+    
+    return JsonResponse({"token": new_token})
+
+
+import xml.etree.ElementTree as ET
+from django.conf import settings
+import os
+
+@csrf_exempt
+def erp_1c_exchange(request):
+    """
+    Standard CommerceML (Bitrix-compatible) exchange protocol.
+    Enables 'Exchange with website' in 1C without coding.
+    """
+    mode = request.GET.get("mode")
+    type_ = request.GET.get("type")
+    token_str = request.GET.get("token") or request.headers.get("X-Integration-Token")
+
+    if not token_str:
+        return HttpResponse("failure\nToken missing", content_type="text/plain")
+
+    token = IntegrationToken.objects.filter(token=token_str, is_active=True).select_related("distributor").first()
+    if not token:
+        return HttpResponse("failure\nInvalid token", content_type="text/plain")
+
+    distributor = token.distributor
+
+    if mode == "checkauth":
+        return HttpResponse(f"success\nautoterra_sid\n{token_str}", content_type="text/plain")
+
+    if mode == "init":
+        return HttpResponse("zip=no\nfile_limit=10000000", content_type="text/plain")
+
+    if mode == "file":
+        filename = request.GET.get("filename")
+        if not filename:
+            return HttpResponse("failure\nNo filename", content_type="text/plain")
+
+        temp_dir = os.path.join(settings.MEDIA_ROOT, "temp_1c", str(distributor.id))
+        os.makedirs(temp_dir, exist_ok=True)
+
+        filepath = os.path.join(temp_dir, filename)
+        with open(filepath, "wb") as f:
+            f.write(request.body)
+
+        return HttpResponse("success", content_type="text/plain")
+
+    if mode == "import":
+        filename = request.GET.get("filename")
+        temp_dir = os.path.join(settings.MEDIA_ROOT, "temp_1c", str(distributor.id))
+        filepath = os.path.join(temp_dir, filename)
+
+        if not os.path.exists(filepath):
+            return HttpResponse("failure\nFile not found", content_type="text/plain")
+
+        try:
+            if "import" in filename:
+                _process_cml_import(filepath, distributor)
+            elif "offers" in filename:
+                _process_cml_offers(filepath, distributor)
+
+            return HttpResponse("success", content_type="text/plain")
+        except Exception as e:
+            return HttpResponse(f"failure\n{str(e)}", content_type="text/plain")
+
+    return HttpResponse("failure\nUnknown mode", content_type="text/plain")
+
+
+def _process_cml_import(filepath, distributor):
+    """Parses import.xml (Catalog/Products)"""
+    tree = ET.parse(filepath)
+    root = tree.getroot()
+
+    # Simple CML parsing (namespace agnostic for robustness)
+    # Finding <Товар> elements
+    for product_node in root.findall(".//{*}Товар"):
+        ext_id = product_node.findtext("{*}Ид")
+        name = product_node.findtext("{*}Наименование")
+        sku = product_node.findtext("{*}Артикул")
+
+        if not ext_id: continue
+
+        # Split ID if it contains '#' (CML property separator)
+        ext_id = ext_id.split("#")[0]
+
+        Product.objects.update_or_create(
+            distributor=distributor,
+            external_id=ext_id,
+            defaults={
+                "name": name or "Без названия",
+                "sku": sku or ext_id,
+                "category": "1C Import",
+                "is_active": True
+            }
+        )
+
+def _process_cml_offers(filepath, distributor):
+    """Parses offers.xml (Stock/Prices)"""
+    tree = ET.parse(filepath)
+    root = tree.getroot()
+
+    for offer_node in root.findall(".//{*}Предложение"):
+        ext_id = offer_node.findtext("{*}Ид")
+        if not ext_id: continue
+        ext_id = ext_id.split("#")[0]
+
+        quantity = offer_node.findtext("{*}Количество")
+        price_node = offer_node.find(".//{*}ЦенаЗаЕдиницу")
+
+        update_fields = {}
+        if quantity is not None:
+            q = int(float(quantity))
+            update_fields["quantity"] = q
+            update_fields["status"] = "inStock" if q > 0 else "outOfStock"
+
+        if price_node is not None:
+            update_fields["price"] = Decimal(price_node.text.replace(",", "."))
+
+        if update_fields:
+            Product.objects.filter(distributor=distributor, external_id=ext_id).update(**update_fields)
+
+@require_GET
+def admin_integration_tokens(request):
+    user, is_admin, err = _require_manager_scope(request)
+    if err:
+        return err
+        
+    distributors = Distributor.objects.prefetch_related('integration_tokens').all()
+    results = []
+    for d in distributors:
+        token = d.integration_tokens.filter(is_active=True).first()
+        results.append({
+            "id": str(d.id),
+            "name": d.name,
+            "token": token.token if token else None,
+            "createdAt": token.created_at.isoformat() if token else None
+        })
+    return JsonResponse({"results": results})
+
+
+@csrf_exempt
+@require_POST
+def admin_integration_generate(request, distributor_id):
+    user, is_admin, err = _require_manager_scope(request)
+    if err:
+        return err
+        
+    distributor = Distributor.objects.filter(id=distributor_id).first()
+    if not distributor:
+        return JsonResponse({"detail": "Distributor not found"}, status=404)
+        
+    # Deactivate old tokens
+    distributor.integration_tokens.update(is_active=False)
+    
+    # Generate new
+    new_token = secrets.token_hex(16)
     IntegrationToken.objects.create(distributor=distributor, token=new_token)
     
     return JsonResponse({"token": new_token})
@@ -1318,20 +1726,83 @@ def admin_analytics(request):
         date__gte=start_of_month
     ).aggregate(total=Sum('total_amount'))['total'] or 0
     
-    open_tickets = ExpertTicket.objects.filter(status="open").count()
+    active_tickets = ExpertTicket.objects.exclude(status="closed").count()
+    new_orders_month = Order.objects.filter(created_at__gte=start_of_month).count()
     
     total_syncs = SyncLog.objects.count()
     successful_syncs = SyncLog.objects.filter(status="success").count()
     sync_success_rate = (successful_syncs / total_syncs * 100) if total_syncs > 0 else 100.0
 
-    # Also maybe some historical data for charts
-    # For simplicity, returning a small mock or actual simple history
+    # Recent actions
+    recent_actions = []
     
+    # 1. New clients
+    for c in ClientProfile.objects.order_by("-created_at")[:5]:
+        recent_actions.append({
+            "title": "Новый клиент",
+            "subtitle": c.company_name,
+            "time": c.created_at.strftime("%H:%M"),
+            "timestamp": c.created_at
+        })
+        
+    # 2. Tickets
+    for t in ExpertTicket.objects.order_by("-created_at")[:5]:
+        recent_actions.append({
+            "title": "Тикет эксперту",
+            "subtitle": f"#{t.id}: {t.category}",
+            "time": t.created_at.strftime("%H:%M"),
+            "timestamp": t.created_at
+        })
+
+    # 3. Syncs
+    for s in SyncLog.objects.order_by("-created_at")[:5]:
+        recent_actions.append({
+            "title": f"Синхронизация {s.distributor.name if s.distributor else 'ERP'}",
+            "subtitle": f"Результат: {s.get_status_display()}",
+            "time": s.created_at.strftime("%H:%M"),
+            "timestamp": s.created_at
+        })
+
+    recent_actions.sort(key=lambda x: x["timestamp"], reverse=True)
+    for a in recent_actions:
+        del a["timestamp"] # Remove from response
+
+    # Charts data
+    turnover_chart = []
+    for i in range(5, -1, -1):
+        m = (today.month - i - 1) % 12 + 1
+        y = today.year + (today.month - i - 1) // 12
+        m_start = date(y, m, 1)
+        if m == 12:
+            m_end = date(y + 1, 1, 1)
+        else:
+            m_end = date(y, m + 1, 1)
+            
+        m_total = Purchase.objects.filter(
+            status="verified", 
+            date__gte=m_start,
+            date__lt=m_end
+        ).aggregate(total=Sum('total_amount'))['total'] or 0
+        
+        turnover_chart.append({
+            "label": m_start.strftime("%b"),
+            "value": float(m_total)
+        })
+
+    categories_chart = []
+    for cat in ["A", "B", "C"]:
+        count = ClientProfile.objects.filter(category=cat).count()
+        categories_chart.append({"label": cat, "value": count})
+
     return JsonResponse({
         "totalClients": total_clients,
         "monthlyTurnover": float(total_purchases_month),
-        "openTickets": open_tickets,
-        "syncSuccessRate": round(sync_success_rate, 1)
+        "newOrders": new_orders_month,
+        "openTickets": active_tickets,
+        "syncSuccessRate": round(sync_success_rate, 1),
+        "turnoverChart": turnover_chart,
+        "categoriesChart": categories_chart,
+        "recentActions": recent_actions[:10]
     })
 
 
@@ -1343,7 +1814,17 @@ def distributor_dashboard(request):
     clients = _scope_clients(distributor, is_admin)
     purchases = _scope_purchases(distributor, is_admin)
     orders_qs = _scope_orders(distributor, is_admin)
-    return JsonResponse({"metrics": {"clients": clients.count(), "purchasesToVerify": purchases.filter(status__in=["pending", "pending_verification"]).count(), "ordersToProcess": orders_qs.filter(status="pending").count()}})
+    
+    # Standard statuses for verification
+    to_verify = ["new", "pending", "pending_verification", "under_review", "duplicate_review"]
+    
+    return JsonResponse({
+        "metrics": {
+            "clients": clients.count(), 
+            "purchasesToVerify": purchases.filter(status__in=to_verify).count(), 
+            "ordersToProcess": orders_qs.count()
+        }
+    })
 
 
 @require_GET
@@ -1362,16 +1843,20 @@ def distributor_purchases(request):
     if err:
         return err
     
-    # Список покупок, ожидающих проверки (или всех покупок для этого дистрибьютора)
+    # Список покупок для этого дистрибьютора
     qs = _scope_purchases(distributor, is_admin).order_by("-date")
     
-    # Фильтрация по статусу (например, только новые и на проверке)
+    # Фильтрация по статусу
     status_filter = request.GET.get("status")
+    to_verify_only = request.GET.get("to_verify") == "true"
+
     if status_filter:
         qs = qs.filter(status=status_filter)
-    else:
-        qs = qs.filter(status__in=["new", "under_review"])
-
+    elif to_verify_only:
+        # Show only what needs attention
+        to_verify_list = ["new", "pending", "pending_verification", "under_review", "duplicate_review"]
+        qs = qs.filter(status__in=to_verify_list)
+    
     return JsonResponse({"results": [_format_purchase(item) for item in qs]})
 
 
@@ -1654,8 +2139,9 @@ def expert_answer_ticket(request, ticket_id):
         
     with transaction.atomic():
         ticket.expert_answer = answer
+        ticket.expert_author = user
         ticket.status = status
-        ticket.save(update_fields=["expert_answer", "status"])
+        ticket.save(update_fields=["expert_answer", "expert_author", "status"])
         
         # If expert wants to create a knowledge card from this
         if payload.get("createKnowledgeCard"):
@@ -1665,7 +2151,8 @@ def expert_answer_ticket(request, ticket_id):
                 problem=ticket.question,
                 solution=answer,
                 status="draft",
-                created_by=user,
+                expert_author=user,
+                source_ticket=ticket,
             )
             ticket.linked_knowledge_card = card
             ticket.save(update_fields=["linked_knowledge_card"])
@@ -1703,11 +2190,45 @@ def update_knowledge_card(request, card_id):
             updated_fields.append(f)
             
     if payload.get("status") == "approved":
-        card.approved_by = user
-        updated_fields.append("approved_by")
+        card.status = "approved"
+        if "status" not in updated_fields:
+            updated_fields.append("status")
         
     card.save(update_fields=updated_fields)
     return JsonResponse({"card": _format_knowledge_card(card)})
+
+
+@csrf_exempt
+@require_POST
+def send_notification(request):
+    user = _current_user(request)
+    profile = getattr(user, "profile", None)
+    if not profile or profile.role not in ["admin", "manager", "ai_expert"]:
+        return JsonResponse({"detail": "Forbidden"}, status=403)
+        
+    payload = _json(request)
+    target_user_id = payload.get("userId")
+    title = payload.get("title")
+    body = payload.get("body")
+    n_type = payload.get("type", "info")
+    link = payload.get("relatedLink", "")
+    
+    if not all([target_user_id, title, body]):
+        return JsonResponse({"detail": "Missing fields"}, status=400)
+        
+    target_user = User.objects.filter(id=target_user_id).first()
+    if not target_user:
+        return JsonResponse({"detail": "User not found"}, status=404)
+        
+    Notification.objects.create(
+        user=target_user,
+        title=title,
+        body=body,
+        type=n_type,
+        related_link=link
+    )
+    
+    return JsonResponse({"status": "ok"})
 
 
 @require_GET
@@ -1838,9 +2359,13 @@ def _score_card(query_words, card):
 @csrf_exempt
 @require_POST
 def ai_chat(request):
-    client, err = _require_client(request)
-    if err:
-        return err
+    user = _current_user(request)
+    if not user:
+        return JsonResponse({"detail": "Unauthorized"}, status=401)
+    
+    profile = getattr(user, "profile", None)
+    is_expert_user = profile and profile.role in ["admin", "manager", "ai_expert"]
+    
     payload = _json(request)
     question = (payload.get("message") or "").strip()
     
@@ -1872,7 +2397,7 @@ def ai_chat(request):
     if card and best_score >= CONFIDENCE_THRESHOLD:
         solution_lower = card.solution.lower()
         # If user asks for specifics but KB doesn't have them explicitly
-        if is_query_dangerous and not any(kw in solution_lower for kw in dangerous_keywords):
+        if is_query_dangerous and not any(kw in solution_lower for kw in dangerous_keywords) and not is_expert_user:
             answer = (f"В базе знаний найдена информация по теме '{card.title or card.problem}', но в ней отсутствуют точные технические параметры (пропорции/гарантии). "
                       "Во избежание нарушения технологии, я не могу дать совет. Рекомендую создать обращение к эксперту.")
             return JsonResponse({
@@ -1891,7 +2416,15 @@ def ai_chat(request):
             "suggestEscalation": False
         })
 
-    # 4. Low confidence or No Match
+    # If it's an expert, maybe we give them a "best guess" or allow them to see what the AI would say?
+    # For now, if no match, we still suggest escalation for clients, but for experts we might give a hint.
+    if is_expert_user:
+        return JsonResponse({
+            "answer": "В базе знаний точного совпадения не найдено. Как эксперт, вы можете создать новую карточку знаний или ответить на тикет вручную.",
+            "suggestEscalation": False
+        })
+
+    # 4. Low confidence or No Match for clients
     return JsonResponse({
         "answer": "Недостаточно данных в базе знаний для точного ответа. Перевожу на эксперта. Пожалуйста, создайте тикет с описанием проблемы и фото.",
         "suggestEscalation": True

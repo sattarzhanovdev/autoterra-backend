@@ -23,6 +23,10 @@ urlpatterns = [
     path("manager/clients/<int:client_id>/unified/", views.manager_client_unified),
     path("reports/export/", views.export_excel),
     path("integration/erp/stock-update/", views.erp_stock_update),
+    path("integration/erp/catalog-sync/", views.erp_catalog_sync),
+    path("integration/erp/client-sync/", views.erp_client_sync),
+    path("integration/erp/orders-export/", views.erp_orders_export),
+    path("integration/1c/exchange/", views.erp_1c_exchange),
     path("admin/integration/tokens/", views.admin_integration_tokens),
     path("admin/integration/generate/<int:distributor_id>/", views.admin_integration_generate),
     path("admin/integration/logs/", views.admin_integration_logs),
@@ -55,5 +59,6 @@ urlpatterns = [
     path("distributors/", views.distributors),
     path("notifications/", views.notifications),
     path("notifications/read/", views.mark_notifications_read),
+    path("notifications/send/", views.send_notification),
     path("ai/chat/", views.ai_chat),
 ]

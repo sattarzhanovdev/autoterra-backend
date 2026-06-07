@@ -56,8 +56,8 @@ CORS_ALLOWED_ORIGINS = [
     "http://89.111.132.221",
     "http://89.111.132.221:8000",
     "https://autoterra.ru",
-    "http://localhost:50215",
-    "http://localhost:52090",
+    "http://localhost:38913",
+    "http://localhost:38913",
 ]
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_METHODS = [
@@ -112,7 +112,7 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = "static/"
-STATIC_ROOT = BASE_DIR / "staticfiles"
+STATIC_ROOT = os.path.join(BASE_DIR, 'static')
 MEDIA_URL = "media/"
 MEDIA_ROOT = BASE_DIR / "media"
 

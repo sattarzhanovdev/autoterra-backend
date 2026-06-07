@@ -37,7 +37,10 @@ class Command(BaseCommand):
         # 3. Create Users & Profiles
         def create_user(username, role, region=None):
             user = User.objects.create_user(username=username, password=password)
-            Profile.objects.create(user=user, role=role)
+            # Profile is created by signal, so we just update it
+            profile, _ = Profile.objects.get_or_create(user=user)
+            profile.role = role
+            profile.save()
             return user
 
         # Distributors

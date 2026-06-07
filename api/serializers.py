@@ -86,6 +86,13 @@ class PurchaseSerializer(BaseSerializer):
             self.errors['date'] = "Invalid date format"
             return False
 
+        self.validated_data = {
+            'document_number': doc_number,
+            'date': parsed_date,
+            'amount': amount,
+        }
+        return True
+
 class CourierTaskSerializer(BaseSerializer):
     def is_valid(self):
         status = self.data.get('status')

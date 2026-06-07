@@ -1,5 +1,7 @@
 from decimal import Decimal, InvalidOperation
 from django.contrib import admin, messages
+from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
+from django.contrib.auth.models import User
 from django.template.response import TemplateResponse
 from django.http import HttpResponse
 from django.shortcuts import redirect, render
@@ -29,6 +31,7 @@ from .models import (
     Region,
     Referral,
     Store,
+    Profile,
 )
 
 admin.site.site_header = "AutoTerra Admin"
@@ -176,6 +179,27 @@ class OrderItemInline(admin.TabularInline):
 class PurchaseItemInline(admin.TabularInline):
     model = PurchaseItem
     extra = 0
+
+
+class ProfileInline(admin.StackedInline):
+    model = Profile
+    can_delete = False
+    verbose_name_plural = "Дополнительная информация (Роль)"
+    fk_name = "user"
+    fields = ("role", "specialty", "rating", "bio")
+
+
+class UserAdmin(BaseUserAdmin):
+    inlines = (ProfileInline,)
+
+    def get_inline_instances(self, request, obj=None):
+        if not obj:
+            return list()
+        return super(UserAdmin, self).get_inline_instances(request, obj)
+
+
+admin.site.unregister(User)
+admin.site.register(User, UserAdmin)
 
 
 @admin.register(Distributor)
