@@ -48,8 +48,7 @@ def _secured(operation):
         {
             "401": _error("Не передан или неверен Bearer token."),
             "403": _error(
-                "Пользователь найден, но для него не создан ClientProfile. "
-                "Создайте профиль клиента в Django admin и привяжите к User."
+                "Пользователь найден, но для него не создан профиль."
             ),
         }
     )
@@ -75,15 +74,34 @@ SCHEMAS = {
             "service": {"type": "string", "example": "autoterra-api"},
         },
     },
+    "RegisterRequest": {
+        "type": "object",
+        "required": ["username", "password", "inn", "region_id", "company_name", "contact_name"],
+        "properties": {
+            "username": {"type": "string", "example": "+996222121217"},
+            "password": {"type": "string", "format": "password", "example": "client12345"},
+            "inn": {"type": "string", "example": "222122004503"},
+            "region_id": {"type": "string", "example": "1"},
+            "company_name": {"type": "string", "example": "СТО АвтоМастер"},
+            "contact_name": {"type": "string", "example": "Иван"},
+        },
+    },
+    "RegisterResponse": {
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "example": "success"},
+            "token": {"type": "string", "example": "b7d5a2f2d1f9..."},
+            "client": _ref("Client"),
+            "requires_approval": {"type": "boolean", "example": False},
+        },
+    },
     "LoginRequest": {
         "type": "object",
         "required": ["phone", "password"],
         "properties": {
             "phone": {
                 "type": "string",
-                "description": (
-                    "Username пользователя. Номер с 8 нормализуется в +7."
-                ),
+                "description": "Номер телефона",
                 "example": "+996222121217",
             },
             "password": {"type": "string", "format": "password", "example": "client12345"},
@@ -103,7 +121,6 @@ SCHEMAS = {
                 "properties": {
                     "id": {"type": "string", "example": "12"},
                     "phone": {"type": "string", "example": "+996222121217"},
-                    "email": {"type": "string", "example": "client@example.com"},
                     "role": {"type": "string", "enum": ["autoservice", "distributor", "courier", "expert"]},
                     "status": {"type": "string", "example": "active"},
                 },
@@ -128,6 +145,16 @@ SCHEMAS = {
             "totalPurchases": {"type": "number", "example": 128500.0},
             "createdAt": {"type": "string", "format": "date-time"},
         },
+    },
+    "MeResponse": {
+        "type": "object",
+        "properties": {
+            "id": {"type": "string"},
+            "phone": {"type": "string"},
+            "role": {"type": "string"},
+            "client": _ref("Client"),
+            "distributor": {"type": "object"},
+        }
     },
     "Distributor": {
         "type": "object",
@@ -219,12 +246,26 @@ PATHS = {
             "responses": {"200": _ok(_ref("Health"))},
         }
     },
+    "/register/": {
+        "post": {
+            "tags": ["Auth"],
+            "requestBody": _body(_ref("RegisterRequest"), "Регистрация"),
+            "responses": {"201": _created(_ref("RegisterResponse"))},
+        }
+    },
     "/login/": {
         "post": {
             "tags": ["Auth"],
-            "requestBody": _body(_ref("LoginRequest"), "Логин"),
+            "requestBody": _body(_ref("LoginRequest"), "Вход в систему"),
             "responses": {"200": _ok(_ref("LoginResponse"))},
         }
+    },
+    "/auth/me/": {
+        "get": _secured({
+            "tags": ["Auth"],
+            "summary": "Получить информацию о текущем пользователе",
+            "responses": {"200": _ok(_ref("MeResponse"))},
+        })
     },
     "/tickets/": {
         "get": _secured({
@@ -265,12 +306,18 @@ PATHS = {
 def _schema(request):
     server_url = request.build_absolute_uri("/api").rstrip("/")
     return {
-        "openapi": "303",
-        "info": {"title": "AutoTerra Q&A Refined API", "version": "1.1.0"},
+        "openapi": "3.0.3",
+        "info": {"title": "AutoTerra API Docs", "version": "1.1.0", "description": "Документация для интеграции и тестирования API. Используйте 'Authorize' для установки Bearer токена."},
         "servers": [{"url": server_url}],
         "paths": PATHS,
         "components": {
-            "securitySchemes": {"BearerAuth": {"type": "http", "scheme": "bearer"}},
+            "securitySchemes": {
+                "BearerAuth": {
+                    "type": "http",
+                    "scheme": "bearer",
+                    "bearerFormat": "JWT"
+                }
+            },
             "schemas": SCHEMAS,
         },
     }
@@ -298,6 +345,8 @@ def swagger_ui(_request):
         url: "/api/schema/",
         dom_id: "#swagger-ui",
         persistAuthorization: true,
+        displayRequestDuration: true,
+        docExpansion: "list"
       });
     </script>
   </body>

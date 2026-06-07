@@ -198,8 +198,8 @@ def _append_task_history(task, status, user=None, comment=""):
 
 
 def _scope_clients(distributor, is_admin):
-    qs = ClientProfile.objects.select_related("distributor", "manager", "user")
-    return qs if is_admin else qs.filter(distributor=distributor)
+    qs = ClientProfile.objects.select_related("distributor", "manager", "user", "region")
+    return qs if is_admin else qs.filter(region__distributor=distributor)
 
 
 def _scope_purchases(distributor, is_admin):
@@ -725,10 +725,48 @@ def login(request):
 
 @require_GET
 def me(request):
-    client, err = _require_client(request)
-    if err:
-        return err
-    return JsonResponse({"id": str(client.user_id), "phone": client.phone, "role": "autoservice", "client": _format_client(client), "distributor": _format_distributor(client.distributor)})
+    user = _current_user(request)
+    if user is None:
+        return JsonResponse({"detail": "Unauthorized"}, status=401)
+        
+    try:
+        client = user.client_profile
+        return JsonResponse({
+            "id": str(user.id), 
+            "phone": client.phone, 
+            "role": "autoservice", 
+            "status": client.status,
+            "client": _format_client(client), 
+            "distributor": _format_distributor(client.distributor)
+        })
+    except ClientProfile.DoesNotExist:
+        distributor = getattr(user, "distributor_profile", None)
+        if distributor is not None:
+            return JsonResponse({
+                "id": str(user.id), 
+                "phone": user.username, 
+                "role": "distributor", 
+                "status": "active", 
+                "distributor": _format_distributor(distributor)
+            })
+            
+        if _is_courier_user(user):
+            return JsonResponse({
+                "id": str(user.id), 
+                "phone": user.username, 
+                "role": "courier", 
+                "status": "active"
+            })
+            
+        if _is_expert_user(user):
+            return JsonResponse({
+                "id": str(user.id), 
+                "phone": user.username, 
+                "role": "expert", 
+                "status": "active"
+            })
+            
+        return JsonResponse({"detail": "Профиль не найден"}, status=403)
 
 
 @require_GET

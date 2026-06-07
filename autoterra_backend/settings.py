@@ -57,6 +57,7 @@ CORS_ALLOWED_ORIGINS = [
     "http://89.111.132.221:8000",
     "https://autoterra.ru",
     "http://localhost:50215",
+    "http://localhost:52090",
 ]
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_METHODS = [
