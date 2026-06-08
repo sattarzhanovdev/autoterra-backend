@@ -649,6 +649,7 @@ def register(request):
     region = validated_data['region']
     company_name = validated_data['company_name']
     contact_name = validated_data['contact_name']
+    store_address = validated_data['store_address']
     
     # 1. Проверка уникальности номера телефона
     if User.objects.filter(username=username).exists():
@@ -686,6 +687,15 @@ def register(request):
                 registration_source="app",
                 distributor=region.distributor,
                 manager=region.manager
+            )
+
+            # Создаем основной магазин/точку для клиента
+            Store.objects.create(
+                client=client,
+                name=company_name,
+                address=store_address,
+                region=region,
+                is_active=True
             )
             
             token = secrets.token_hex(24)
@@ -1102,8 +1112,9 @@ def create_courier_task(request):
     payload = _json(request)
     task = CourierTask.objects.create(
         client=client,
-        type=payload.get("type", "delivery"),
+        task_type=payload.get("type", "delivery"),
         address=payload.get("address", client.city),
+        time_slot=payload.get("timeSlot", "10:00 - 18:00"),
         scheduled_time=_dt(payload.get("scheduledTime")),
         contact_name=payload.get("contactName", client.contact_name),
         contact_phone=payload.get("contactPhone", client.phone),
@@ -1200,25 +1211,51 @@ def assign_courier_task(request, task_id):
 
 @require_GET
 def distributors(request):
+    user = _current_user(request)
+    if not user:
+        return JsonResponse({"detail": "Unauthorized"}, status=401)
+    
+    profile = getattr(user, "profile", None)
+    is_global = user.is_staff or user.is_superuser or (profile and profile.role == "admin")
+    
     qs = Distributor.objects.all()
-    return JsonResponse({"results": [{"id": str(d.id), "name": d.name} for d in qs]})
+    if not is_global and profile and profile.role == "manager":
+        qs = qs.filter(managed_regions__manager=user)
+        
+    return JsonResponse({"results": [{"id": str(d.id), "name": d.name} for d in qs.distinct()]})
 
 
 def _require_manager_scope(request):
     user = _current_user(request)
     if user is None:
         return None, False, JsonResponse({"detail": "Unauthorized"}, status=401)
-    if user.is_staff or user.is_superuser:
-        return user, True, None
+    
+    # Global admin: is_staff, is_superuser, or Profile.Role.ADMIN
     profile = getattr(user, "profile", None)
-    if profile and profile.role in ["manager", "admin"]:
-        return user, False, None
+    is_global = user.is_staff or user.is_superuser or (profile and profile.role == "admin")
+    
+    if profile and profile.role in ["manager", "admin"] or user.is_staff or user.is_superuser:
+        return user, is_global, None
+        
     return None, False, JsonResponse({"detail": "Нет доступа менеджера"}, status=403)
+
+
+def _get_manager_regions(user, is_global):
+    if is_global:
+        return None  # All regions
+    return user.managed_regions.all()
+
+
+def _filter_by_manager_scope(user, is_global, qs, region_path="region"):
+    regions = _get_manager_regions(user, is_global)
+    if regions is None:
+        return qs
+    return qs.filter(**{f"{region_path}__in": regions})
 
 
 @require_GET
 def manager_dashboard(request):
-    user, is_admin, err = _require_manager_scope(request)
+    user, is_global, err = _require_manager_scope(request)
     if err:
         return err
     
@@ -1226,8 +1263,8 @@ def manager_dashboard(request):
     region_id = request.GET.get("region")
     distributor_id = request.GET.get("distributor")
     
-    client_qs = ClientProfile.objects.all()
-    order_qs = Order.objects.all()
+    client_qs = _filter_by_manager_scope(user, is_global, ClientProfile.objects.all()).distinct()
+    order_qs = _filter_by_manager_scope(user, is_global, Order.objects.all(), "client__region").distinct()
     
     if region_id:
         client_qs = client_qs.filter(region_id=region_id)
@@ -1235,6 +1272,13 @@ def manager_dashboard(request):
     if distributor_id:
         client_qs = client_qs.filter(distributor_id=distributor_id)
         order_qs = order_qs.filter(distributor_id=distributor_id)
+
+    # Scoped regions for regionalStats
+    managed_regions = _get_manager_regions(user, is_global)
+    if managed_regions is None:
+        regions_for_stats = Region.objects.all()
+    else:
+        regions_for_stats = managed_regions
 
     stats = {
         "totalClients": client_qs.count(),
@@ -1246,7 +1290,7 @@ def manager_dashboard(request):
                 "region": r.name,
                 "clients": client_qs.filter(region=r).count(),
                 "orders": order_qs.filter(client__region=r).count()
-            } for r in Region.objects.all()
+            } for r in regions_for_stats
         ]
     }
     
@@ -1635,16 +1679,19 @@ def _process_cml_offers(filepath, distributor):
 
 @require_GET
 def admin_integration_tokens(request):
-    user, is_admin, err = _require_manager_scope(request)
+    user, is_global, err = _require_manager_scope(request)
     if err:
         return err
-        
+
+    distributor_qs = Distributor.objects.all()
+    distributor_qs = _filter_by_manager_scope(user, is_global, distributor_qs, region_path="managed_regions")
+
     # Efficiently fetch distributors with their active token
     from django.db.models import Prefetch
     active_tokens = IntegrationToken.objects.filter(is_active=True)
-    distributors = Distributor.objects.prefetch_related(
+    distributors = distributor_qs.prefetch_related(
         Prefetch('integration_tokens', queryset=active_tokens, to_attr='active_tokens_list')
-    ).all()
+    ).distinct()
 
     results = []
     for d in distributors:
@@ -1655,6 +1702,7 @@ def admin_integration_tokens(request):
             "token": token.token if token else None,
             "createdAt": token.created_at.isoformat() if token else None
         })
+
     return JsonResponse({"results": results})
 
 
@@ -1689,12 +1737,13 @@ def admin_integration_generate(request, distributor_id):
 
 @require_GET
 def admin_integration_logs(request):
-    user, is_admin, err = _require_manager_scope(request)
+    user, is_global, err = _require_manager_scope(request)
     if err:
         return err
         
     qs = SyncLog.objects.select_related("distributor").order_by("-created_at")
-    recent_logs = _paginate(request, qs)
+    qs = _filter_by_manager_scope(user, is_global, qs, region_path="distributor__managed_regions")
+    recent_logs = _paginate(request, qs.distinct())
     
     return JsonResponse({
         "results": [
@@ -1712,7 +1761,7 @@ def admin_integration_logs(request):
 
 @require_GET
 def admin_analytics(request):
-    user, is_admin, err = _require_manager_scope(request)
+    user, is_global, err = _require_manager_scope(request)
     if err:
         return err
         
@@ -1722,24 +1771,69 @@ def admin_analytics(request):
     today = date.today()
     start_of_month = today.replace(day=1)
     
-    total_clients = ClientProfile.objects.count()
-    total_purchases_month = Purchase.objects.filter(
+    # Base Querysets
+    client_qs = _filter_by_manager_scope(user, is_global, ClientProfile.objects.all()).distinct()
+    purchase_qs = _filter_by_manager_scope(user, is_global, Purchase.objects.all(), "client__region").distinct()
+    ticket_qs = _filter_by_manager_scope(user, is_global, ExpertTicket.objects.all(), "client__region").distinct()
+    order_qs = _filter_by_manager_scope(user, is_global, Order.objects.all(), "client__region").distinct()
+    sync_log_qs = _filter_by_manager_scope(user, is_global, SyncLog.objects.all(), "distributor__managed_regions").distinct()
+    
+    # System metrics (Global only)
+    system_stats = {}
+    if is_global:
+        system_stats = {
+            "totalManagers": Profile.objects.filter(role="manager").count(),
+            "totalDistributors": Distributor.objects.count(),
+            "totalRegions": Region.objects.count(),
+            "avgOrderValue": float(order_qs.filter(status="fulfilled").aggregate(total=Sum('total_amount'))['total'] or 0) / max(order_qs.filter(status="fulfilled").count(), 1),
+        }
+        
+        # Top 3 Distributors by turnover
+        top_distributors = []
+        for d in Distributor.objects.all():
+            turnover = Purchase.objects.filter(distributor=d, status="verified").aggregate(total=Sum('total_amount'))['total'] or 0
+            if turnover > 0:
+                top_distributors.append({"name": d.name, "value": float(turnover)})
+        top_distributors.sort(key=lambda x: x["value"], reverse=True)
+        system_stats["topDistributors"] = top_distributors[:3]
+
+    # Apply filters from request
+    region_id = request.GET.get("region")
+    distributor_id = request.GET.get("distributor")
+    
+    if region_id:
+        client_qs = client_qs.filter(region_id=region_id)
+        purchase_qs = purchase_qs.filter(client__region_id=region_id)
+        ticket_qs = ticket_qs.filter(client__region_id=region_id)
+        order_qs = order_qs.filter(client__region_id=region_id)
+        # For sync logs, we filter by distributor who has this region
+        sync_log_qs = sync_log_qs.filter(distributor__managed_regions__id=region_id)
+
+    if distributor_id:
+        client_qs = client_qs.filter(distributor_id=distributor_id)
+        purchase_qs = purchase_qs.filter(distributor_id=distributor_id)
+        # ticket_qs = ticket_qs.filter(client__distributor_id=distributor_id) # ExpertTicket doesn't direct link to dist?
+        order_qs = order_qs.filter(distributor_id=distributor_id)
+        sync_log_qs = sync_log_qs.filter(distributor_id=distributor_id)
+
+    total_clients = client_qs.count()
+    total_purchases_month = purchase_qs.filter(
         status="verified", 
         date__gte=start_of_month
     ).aggregate(total=Sum('total_amount'))['total'] or 0
     
-    active_tickets = ExpertTicket.objects.exclude(status="closed").count()
-    new_orders_month = Order.objects.filter(created_at__gte=start_of_month).count()
+    active_tickets = ticket_qs.exclude(status="closed").count()
+    new_orders_month = order_qs.filter(created_at__gte=start_of_month).count()
     
-    total_syncs = SyncLog.objects.count()
-    successful_syncs = SyncLog.objects.filter(status="success").count()
+    total_syncs = sync_log_qs.count()
+    successful_syncs = sync_log_qs.filter(status="success").count()
     sync_success_rate = (successful_syncs / total_syncs * 100) if total_syncs > 0 else 100.0
 
     # Recent actions
     recent_actions = []
     
     # 1. New clients
-    for c in ClientProfile.objects.order_by("-created_at")[:5]:
+    for c in client_qs.order_by("-created_at")[:5]:
         recent_actions.append({
             "title": "Новый клиент",
             "subtitle": c.company_name,
@@ -1748,7 +1842,7 @@ def admin_analytics(request):
         })
         
     # 2. Tickets
-    for t in ExpertTicket.objects.order_by("-created_at")[:5]:
+    for t in ticket_qs.order_by("-created_at")[:5]:
         recent_actions.append({
             "title": "Тикет эксперту",
             "subtitle": f"#{t.id}: {t.category}",
@@ -1757,7 +1851,7 @@ def admin_analytics(request):
         })
 
     # 3. Syncs
-    for s in SyncLog.objects.order_by("-created_at")[:5]:
+    for s in sync_log_qs.select_related("distributor").order_by("-created_at")[:5]:
         recent_actions.append({
             "title": f"Синхронизация {s.distributor.name if s.distributor else 'ERP'}",
             "subtitle": f"Результат: {s.get_status_display()}",
@@ -1780,7 +1874,7 @@ def admin_analytics(request):
         else:
             m_end = date(y, m + 1, 1)
             
-        m_total = Purchase.objects.filter(
+        m_total = purchase_qs.filter(
             status="verified", 
             date__gte=m_start,
             date__lt=m_end
@@ -1793,7 +1887,7 @@ def admin_analytics(request):
 
     categories_chart = []
     for cat_code, cat_label in [("a", "A"), ("b", "B"), ("c", "C")]:
-        count = ClientProfile.objects.filter(category=cat_code).count()
+        count = client_qs.filter(category=cat_code).count()
         if count > 0:
             categories_chart.append({"label": cat_label, "value": count})
 
@@ -1805,7 +1899,8 @@ def admin_analytics(request):
         "syncSuccessRate": round(sync_success_rate, 1),
         "turnoverChart": turnover_chart,
         "categoriesChart": categories_chart,
-        "recentActions": recent_actions[:10]
+        "recentActions": recent_actions[:10],
+        "system": system_stats if is_global else None
     })
 
 
@@ -1879,12 +1974,19 @@ def _log_audit(request, action, obj, changes=None):
 
 @require_GET
 def export_excel(request):
-    user, is_admin, err = _require_manager_scope(request)
+    user, is_global, err = _require_manager_scope(request)
     if err:
         return err
     
     region_id = request.GET.get("region")
     
+    # Data
+    qs = Purchase.objects.select_related("client", "client__region")
+    qs = _filter_by_manager_scope(user, is_global, qs, region_path="client__region")
+    
+    if region_id:
+        qs = qs.filter(client__region_id=region_id)
+        
     # Create workbook
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -1896,11 +1998,6 @@ def export_excel(request):
         cell = ws.cell(row=1, column=col, value=header)
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center")
-
-    # Data
-    qs = Purchase.objects.select_related("client", "client__region")
-    if region_id:
-        qs = qs.filter(client__region_id=region_id)
     
     for row_idx, p in enumerate(qs.order_by("-date"), 2):
         ws.cell(row=row_idx, column=1, value=p.client.region.name if p.client.region else "-")
@@ -2263,7 +2360,17 @@ def send_notification(request):
 
 @require_GET
 def regions(request):
+    user = _current_user(request)
+    if not user:
+        return JsonResponse({"detail": "Unauthorized"}, status=401)
+        
+    profile = getattr(user, "profile", None)
+    is_global = user.is_staff or user.is_superuser or (profile and profile.role == "admin")
+    
     qs = Region.objects.filter(is_active=True).order_by("name")
+    if not is_global and profile and profile.role == "manager":
+        qs = qs.filter(manager=user)
+        
     return JsonResponse({
         "results": [
             {
@@ -2272,7 +2379,7 @@ def regions(request):
                 "name": item.name,
                 "active": item.is_active,
             }
-            for item in qs
+            for item in qs.distinct()
         ]
     })
 
@@ -2300,21 +2407,27 @@ def mark_notifications_read(request):
 
 @require_GET
 def manager_clients(request):
-    user, is_admin, err = _require_manager_scope(request)
+    user, is_global, err = _require_manager_scope(request)
     if err:
         return err
     qs = ClientProfile.objects.all().select_related("region", "distributor")
+    qs = _filter_by_manager_scope(user, is_global, qs)
     qs = _paginate(request, qs)
     return JsonResponse({"results": [_format_client(c) for c in qs]})
 
 
 @require_GET
 def manager_client_unified(request, client_id):
-    user, is_admin, err = _require_manager_scope(request)
+    user, is_global, err = _require_manager_scope(request)
     if err:
         return err
     
     client = get_object_or_404(ClientProfile, id=client_id)
+    
+    # Check scope
+    managed_regions = _get_manager_regions(user, is_global)
+    if managed_regions is not None and client.region not in managed_regions:
+        return JsonResponse({"detail": "Доступ запрещен (вне вашей зоны ответственности)"}, status=403)
     
     # 1. Profile
     profile_data = _format_client(client)

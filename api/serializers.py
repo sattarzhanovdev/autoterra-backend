@@ -25,6 +25,7 @@ class RegistrationSerializer(BaseSerializer):
         region_id = self.data.get('region_id')
         company_name = self.data.get('company_name', '').strip()
         contact_name = self.data.get('contact_name', '').strip()
+        store_address = self.data.get('store_address', '').strip()
 
         if not username:
             self.errors['username'] = "Введите номер телефона"
@@ -38,6 +39,8 @@ class RegistrationSerializer(BaseSerializer):
             self.errors['company_name'] = "Введите название компании"
         if not contact_name:
             self.errors['contact_name'] = "Введите ФИО контактного лица"
+        if not store_address:
+            self.errors['store_address'] = "Введите адрес магазина/точки"
 
         if self.errors:
             return False
@@ -55,6 +58,7 @@ class RegistrationSerializer(BaseSerializer):
             'region': region,
             'company_name': company_name,
             'contact_name': contact_name,
+            'store_address': store_address,
         }
         return True
 
