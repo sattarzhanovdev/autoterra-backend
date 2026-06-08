@@ -1792,9 +1792,10 @@ def admin_analytics(request):
         })
 
     categories_chart = []
-    for cat in ["A", "B", "C"]:
-        count = ClientProfile.objects.filter(category=cat).count()
-        categories_chart.append({"label": cat, "value": count})
+    for cat_code, cat_label in [("a", "A"), ("b", "B"), ("c", "C")]:
+        count = ClientProfile.objects.filter(category=cat_code).count()
+        if count > 0:
+            categories_chart.append({"label": cat_label, "value": count})
 
     return JsonResponse({
         "totalClients": total_clients,
@@ -2133,6 +2134,7 @@ def expert_answer_ticket(request, ticket_id):
         return err
     payload = _json(request)
     answer = (payload.get("answer") or "").strip()
+    causes = (payload.get("causes") or "").strip()
     status = payload.get("status", "expertAnswered")
     
     ticket = ExpertTicket.objects.filter(id=ticket_id).first()
@@ -2151,6 +2153,7 @@ def expert_answer_ticket(request, ticket_id):
                 title=f"Кейс: {ticket.category}",
                 category=ticket.category,
                 problem=ticket.question,
+                causes=causes,
                 solution=answer,
                 status="draft",
                 expert_author=user,
@@ -2171,6 +2174,28 @@ def knowledge_cards(request):
     else:
         qs = KnowledgeCard.objects.filter(status="approved")
     return JsonResponse({"results": [_format_knowledge_card(item) for item in qs]})
+
+
+@csrf_exempt
+@require_POST
+def create_knowledge_card(request):
+    user, is_admin, err = _require_expert_scope(request)
+    if err:
+        return err
+    payload = _json(request)
+    
+    card = KnowledgeCard.objects.create(
+        title=payload.get("title", ""),
+        category=payload.get("category", ""),
+        problem=payload.get("problem", ""),
+        causes=payload.get("causes", ""),
+        solution=payload.get("solution", ""),
+        status=payload.get("status", "draft"),
+        skus=payload.get("skus", []),
+        restrictions=payload.get("restrictions", ""),
+        expert_author=user
+    )
+    return JsonResponse({"card": _format_knowledge_card(card)})
 
 
 @csrf_exempt
@@ -2196,7 +2221,10 @@ def update_knowledge_card(request, card_id):
         if "status" not in updated_fields:
             updated_fields.append("status")
         
-    card.save(update_fields=updated_fields)
+    if updated_fields:
+        card.save(update_fields=updated_fields)
+    else:
+        card.save()
     return JsonResponse({"card": _format_knowledge_card(card)})
 
 
