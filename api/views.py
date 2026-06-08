@@ -15,7 +15,7 @@ from django.contrib.auth.models import User
 from django.conf import settings
 from django.db import models, transaction
 from django.db.utils import IntegrityError
-from django.db.models import Q
+from django.db.models import Q, Sum, F
 from django.http import JsonResponse, HttpResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
@@ -1783,21 +1783,29 @@ def admin_analytics(request):
     # System metrics (Global only)
     system_stats = {}
     if is_global:
+        fulfilled_orders_qs = order_qs.filter(status="fulfilled")
+        # Use aggregation for faster and memory-efficient summation
+        order_total_agg = OrderItem.objects.filter(order__in=fulfilled_orders_qs).aggregate(total=Sum(F('price') * F('quantity')))
+        total_fulfilled_value = order_total_agg['total'] or 0
+        total_fulfilled_count = fulfilled_orders_qs.count()
+        
         system_stats = {
             "totalManagers": Profile.objects.filter(role="manager").count(),
             "totalDistributors": Distributor.objects.count(),
             "totalRegions": Region.objects.count(),
-            "avgOrderValue": float(order_qs.filter(status="fulfilled").aggregate(total=Sum('total_amount'))['total'] or 0) / max(order_qs.filter(status="fulfilled").count(), 1),
+            "avgOrderValue": float(total_fulfilled_value) / max(total_fulfilled_count, 1),
         }
         
         # Top 3 Distributors by turnover
         top_distributors = []
-        for d in Distributor.objects.all():
-            turnover = Purchase.objects.filter(distributor=d, status="verified").aggregate(total=Sum('total_amount'))['total'] or 0
-            if turnover > 0:
-                top_distributors.append({"name": d.name, "value": float(turnover)})
-        top_distributors.sort(key=lambda x: x["value"], reverse=True)
-        system_stats["topDistributors"] = top_distributors[:3]
+        # Use a single query with aggregation for all distributors instead of a loop
+        dist_turnover_agg = Purchase.objects.filter(status="verified").values('distributor__name').annotate(turnover=Sum('total_amount')).order_by('-turnover')[:3]
+        for item in dist_turnover_agg:
+            top_distributors.append({
+                "name": item['distributor__name'] or "N/A", 
+                "value": float(item['turnover'] or 0)
+            })
+        system_stats["topDistributors"] = top_distributors
 
     # Apply filters from request
     region_id = request.GET.get("region")
