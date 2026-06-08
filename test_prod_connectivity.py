@@ -1,7 +1,7 @@
 import requests
 
 def test_production_api():
-    base_url = "http://sigmaadil.pythonanywhere.com/api"
+    base_url = "http://89.111.132.221:8000/api"
     print(f"Testing connectivity to: {base_url}")
     
     try:

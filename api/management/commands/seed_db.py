@@ -60,8 +60,8 @@ class Command(BaseCommand):
         region_kzn.distributor = dist_kzn
         region_kzn.save()
 
-        # Manager
-        u_manager = create_user("manager_main", "manager")
+        # Manager (Admin / Central Office)
+        u_manager = create_user("manager_main", "admin")
 
         # Courier
         u_courier = create_user("courier_msk", "courier")
@@ -104,9 +104,9 @@ class Command(BaseCommand):
             )
 
         # Stores
-        Store.objects.create(name="Главный Склад МСК", address="г. Москва, ул. Ленина 1", region=region_msk)
-        Store.objects.create(name="Пункт выдачи КЗН", address="г. Казань, ул. Баумана 5", region=region_kzn)
-        store_msk = Store.objects.filter(region=region_msk).first()
+        Store.objects.create(client=c1_msk, name="Главный Склад МСК", address="г. Москва, ул. Ленина 1")
+        Store.objects.create(client=c3_kzn, name="Пункт выдачи КЗН", address="г. Казань, ул. Баумана 5")
+        store_msk = Store.objects.filter(client=c1_msk).first()
 
         # Purchases
         clients = [c1_msk, c2_msk, c3_kzn]
@@ -129,7 +129,7 @@ class Command(BaseCommand):
 
         # Orders
         Order.objects.create(client=c1_msk, store=store_msk, distributor=dist_msk, status="new")
-        Order.objects.create(client=c3_kzn, store=Store.objects.filter(region=region_kzn).first(), distributor=dist_kzn, status="accepted")
+        Order.objects.create(client=c3_kzn, store=Store.objects.filter(client=c3_kzn).first(), distributor=dist_kzn, status="accepted")
 
         # Color Lab
         # 1. Self Delivery

@@ -307,6 +307,17 @@ class Order(models.Model):
     comment = models.TextField("Комментарий", blank=True)
     status = models.CharField("Статус", max_length=32, choices=STATUS_CHOICES, default="new")
     rejection_reason = models.TextField("Причина отклонения", blank=True)
+    
+    courier = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="assigned_orders",
+        verbose_name="Курьер",
+        null=True,
+        blank=True,
+    )
+    estimated_delivery_date = models.DateField("Ожидаемая дата доставки", null=True, blank=True)
+    
     created_at = models.DateTimeField("Создан", auto_now_add=True)
 
     class Meta:

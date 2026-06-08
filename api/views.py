@@ -440,6 +440,9 @@ def _format_order(order):
         "status": order.status,
         "comment": order.comment,
         "rejectionReason": order.rejection_reason or None,
+        "courierId": str(order.courier_id) if order.courier_id else None,
+        "courierName": getattr(order.courier, 'profile', None).contact_name if order.courier and hasattr(order.courier, 'profile') else (order.courier.username if order.courier else None),
+        "estimatedDeliveryDate": order.estimated_delivery_date.isoformat() if order.estimated_delivery_date else None,
         "createdAt": order.created_at.isoformat(),
         "items": items,
     }
@@ -1915,6 +1918,24 @@ def admin_analytics(request):
 
 
 @require_GET
+def distributor_couriers(request):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    # Get all users with courier role
+    qs = User.objects.filter(profile__role="courier", is_active=True)
+    return JsonResponse({
+        "results": [
+            {
+                "id": str(c.id),
+                "name": getattr(c, "profile", None).contact_name if hasattr(c, "profile") else c.username,
+                "phone": c.username
+            } for c in qs
+        ]
+    })
+
+
+@require_GET
 def distributor_dashboard(request):
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
@@ -2084,14 +2105,34 @@ def distributor_update_order_status(request, order_id):
     payload = _json(request)
     status = payload.get("status")
     reason = payload.get("rejection_reason")
+    courier_id = payload.get("courier_id")
+    estimated_delivery_date = payload.get("estimated_delivery_date")
 
-    if status not in ["accepted", "rejected", "fulfilled"]:
+    if status not in ["new", "accepted", "rejected", "fulfilled"]:
         return JsonResponse({"detail": "Некорректный статус"}, status=400)
 
     old_status = order.status
     order.status = status
     if status == "rejected" and reason:
         order.rejection_reason = reason
+        
+    if courier_id:
+        try:
+            courier = User.objects.get(id=courier_id)
+            order.courier = courier
+        except User.DoesNotExist:
+            pass
+    elif "courier_id" in payload and courier_id is None:
+        order.courier = None
+
+    if estimated_delivery_date:
+        from datetime import datetime
+        try:
+            order.estimated_delivery_date = datetime.strptime(estimated_delivery_date, "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    elif "estimated_delivery_date" in payload and estimated_delivery_date is None:
+        order.estimated_delivery_date = None
     
     order.save()
     

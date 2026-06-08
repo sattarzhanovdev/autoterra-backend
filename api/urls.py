@@ -31,6 +31,7 @@ urlpatterns = [
     path("admin/integration/generate/<int:distributor_id>/", views.admin_integration_generate),
     path("admin/integration/logs/", views.admin_integration_logs),
     path("admin/analytics/", views.admin_analytics),
+    path("distributor/couriers/", views.distributor_couriers),
     path("distributor/dashboard/", views.distributor_dashboard),
     path("distributor/clients/", views.distributor_clients),
     path("distributor/purchases/", views.distributor_purchases),
