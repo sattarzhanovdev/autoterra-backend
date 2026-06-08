@@ -430,8 +430,8 @@ def _format_order(order):
         "clientName": order.client.company_name,
         "clientInn": order.client.inn,
         "distributorId": str(order.distributor_id),
-        "storeId": str(order.store_id),
-        "storeName": order.store.name,
+        "storeId": str(order.store_id) if order.store_id else None,
+        "storeName": order.store.name if order.store else "Не назначен",
         "documentNumber": f"ORD-{order.id:05d}",
         "date": order.created_at.isoformat(),
         "totalAmount": float(order.total_amount),
@@ -919,15 +919,37 @@ def create_order(request):
     payload = _json(request)
     store_id = payload.get("storeId")
     items = payload.get("items") or []
-    store = Store.objects.filter(id=store_id, client=client, is_active=True).first()
-    if store is None or not items:
-        return JsonResponse({"detail": "Выберите магазин и товары"}, status=400)
+    
+    if not items:
+        return JsonResponse({"detail": "Добавьте товары в заказ"}, status=400)
+        
+    store = None
+    if store_id:
+        store = Store.objects.filter(id=store_id, client=client, is_active=True).first()
+        if store is None:
+            return JsonResponse({"detail": "Указанный магазин не найден"}, status=400)
+
     with transaction.atomic():
-        order = Order.objects.create(client=client, store=store, distributor=client.distributor, comment=(payload.get("comment") or "").strip())
+        order = Order.objects.create(
+            client=client, 
+            store=store, 
+            distributor=client.distributor, 
+            comment=(payload.get("comment") or "").strip()
+        )
         for raw in items:
             product = Product.objects.filter(id=raw.get("productId"), distributor=client.distributor, is_active=True).first()
             if product:
-                OrderItem.objects.create(order=order, product=product, sku=product.sku, name=product.name, category=product.category, brand=product.brand, volume=product.volume, price=product.price, quantity=int(raw.get("quantity") or 1))
+                OrderItem.objects.create(
+                    order=order, 
+                    product=product, 
+                    sku=product.sku, 
+                    name=product.name, 
+                    category=product.category, 
+                    brand=product.brand, 
+                    volume=product.volume, 
+                    price=product.price, 
+                    quantity=int(raw.get("quantity") or 1)
+                )
     return JsonResponse({"order": _format_order(order)}, status=201)
 
 
@@ -1492,40 +1514,6 @@ def erp_orders_export(request):
         })
     
     return JsonResponse({"orders": results})
-    user, is_admin, err = _require_manager_scope(request)
-    if err:
-        return err
-        
-    distributors = Distributor.objects.prefetch_related('integration_tokens').all()
-    results = []
-    for d in distributors:
-        active_token = d.integration_tokens.filter(is_active=True).first()
-        results.append({
-            "id": str(d.id),
-            "name": d.name,
-            "token": active_token.token if active_token else None,
-            "createdAt": active_token.created_at.isoformat() if active_token else None,
-        })
-        
-    return JsonResponse({"results": results})
-
-
-@csrf_exempt
-@require_POST
-def admin_integration_generate(request, distributor_id):
-    user, is_admin, err = _require_manager_scope(request)
-    if err:
-        return err
-        
-    from django.shortcuts import get_object_or_404
-    distributor = get_object_or_404(Distributor, id=distributor_id)
-        
-    distributor.integration_tokens.filter(is_active=True).update(is_active=False)
-    
-    new_token = secrets.token_hex(32)
-    IntegrationToken.objects.create(distributor=distributor, token=new_token)
-    
-    return JsonResponse({"token": new_token})
 
 
 import xml.etree.ElementTree as ET
@@ -1651,10 +1639,16 @@ def admin_integration_tokens(request):
     if err:
         return err
         
-    distributors = Distributor.objects.prefetch_related('integration_tokens').all()
+    # Efficiently fetch distributors with their active token
+    from django.db.models import Prefetch
+    active_tokens = IntegrationToken.objects.filter(is_active=True)
+    distributors = Distributor.objects.prefetch_related(
+        Prefetch('integration_tokens', queryset=active_tokens, to_attr='active_tokens_list')
+    ).all()
+
     results = []
     for d in distributors:
-        token = d.integration_tokens.filter(is_active=True).first()
+        token = d.active_tokens_list[0] if d.active_tokens_list else None
         results.append({
             "id": str(d.id),
             "name": d.name,
@@ -1673,16 +1667,24 @@ def admin_integration_generate(request, distributor_id):
         
     distributor = Distributor.objects.filter(id=distributor_id).first()
     if not distributor:
-        return JsonResponse({"detail": "Distributor not found"}, status=404)
+        return JsonResponse({"detail": "Дистрибьютор не найден"}, status=404)
         
-    # Deactivate old tokens
-    distributor.integration_tokens.update(is_active=False)
-    
-    # Generate new
-    new_token = secrets.token_hex(16)
-    IntegrationToken.objects.create(distributor=distributor, token=new_token)
-    
-    return JsonResponse({"token": new_token})
+    try:
+        with transaction.atomic():
+            # Deactivate old tokens using all().update() for maximum compatibility
+            distributor.integration_tokens.all().update(is_active=False)
+            
+            # Generate new 32-byte (64 hex chars) token
+            new_token = secrets.token_hex(32)
+            IntegrationToken.objects.create(
+                distributor=distributor, 
+                token=new_token,
+                is_active=True
+            )
+            
+            return JsonResponse({"token": new_token})
+    except Exception as e:
+        return JsonResponse({"detail": f"Ошибка генерации: {str(e)}"}, status=500)
 
 
 @require_GET

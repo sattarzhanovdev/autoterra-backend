@@ -301,7 +301,7 @@ class Order(models.Model):
     ]
 
     client = models.ForeignKey(ClientProfile, on_delete=models.CASCADE, related_name="orders", verbose_name="Клиент")
-    store = models.ForeignKey(Store, on_delete=models.PROTECT, related_name="orders", verbose_name="Где забрать")
+    store = models.ForeignKey(Store, on_delete=models.SET_NULL, related_name="orders", verbose_name="Где забрать", null=True, blank=True)
     distributor = models.ForeignKey(Distributor, on_delete=models.PROTECT, related_name="orders", verbose_name="Дистрибьютор")
     external_id = models.CharField("Внешний ID (1C)", max_length=128, blank=True, null=True, db_index=True)
     comment = models.TextField("Комментарий", blank=True)
