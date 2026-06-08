@@ -837,3 +837,19 @@ class KnowledgeCard(models.Model):
 
     def __str__(self):
         return self.problem or self.title
+
+
+@receiver(post_save, sender=ClientProfile)
+def sync_client_distributor_data(sender, instance, **kwargs):
+    """
+    If a client's distributor is updated, migrate all historical and pending
+    orders, purchases, and color requests to the new distributor.
+    """
+    if instance.distributor:
+        # Sync orders
+        instance.orders.all().update(distributor=instance.distributor)
+        # Sync purchases
+        instance.purchases.all().update(distributor=instance.distributor)
+        # Sync color requests
+        instance.color_requests.all().update(assigned_distributor=instance.distributor)
+
