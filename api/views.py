@@ -699,7 +699,6 @@ def register(request):
                 client=client,
                 name=company_name,
                 address=store_address,
-                region=region,
                 is_active=True
             )
             
@@ -781,6 +780,49 @@ def login(request):
         return JsonResponse({"token": token, "user": {"id": str(user.id), "phone": user.username, "role": role, "status": "active"}})
 
     return JsonResponse({"detail": "Неизвестная роль"}, status=403)
+
+
+@csrf_exempt
+@require_POST
+def password_reset(request):
+    payload = _json(request)
+    login_input = (payload.get("phone") or payload.get("username") or "").strip()
+    inn = _normalize_inn(payload.get("inn"))
+    new_password = payload.get("new_password") or payload.get("password") or ""
+
+    if not login_input:
+        return JsonResponse({"detail": "Введите телефон или логин"}, status=400)
+    if len(new_password) < 8:
+        return JsonResponse({"detail": "Пароль должен быть не менее 8 символов"}, status=400)
+    if len(inn) not in (10, 12):
+        return JsonResponse({"detail": "ИНН должен состоять из 10 или 12 цифр"}, status=400)
+
+    matches = [login_input]
+    normalized = _normalize_phone(login_input)
+    if normalized and normalized != login_input:
+        matches.append(normalized)
+
+    user = User.objects.filter(username__in=matches).first()
+    if user is None:
+        return JsonResponse({"detail": "Аккаунт с такими данными не найден"}, status=404)
+
+    role = getattr(user, "profile", None).role if hasattr(user, "profile") else "client"
+    account_inn = None
+    if role == "client":
+        client = getattr(user, "client_profile", None)
+        account_inn = client.inn if client else None
+    elif role == "distributor":
+        distributor = getattr(user, "distributor_profile", None)
+        account_inn = distributor.inn if distributor else None
+
+    if account_inn != inn:
+        return JsonResponse({"detail": "Аккаунт с такими данными не найден"}, status=404)
+
+    user.set_password(new_password)
+    user.save(update_fields=["password"])
+    user.auth_tokens.all().delete()
+
+    return JsonResponse({"status": "success", "detail": "Пароль обновлен"})
 
 
 @require_GET
@@ -2412,15 +2454,13 @@ def send_notification(request):
 @require_GET
 def regions(request):
     user = _current_user(request)
-    if not user:
-        return JsonResponse({"detail": "Unauthorized"}, status=401)
-        
-    profile = getattr(user, "profile", None)
-    is_global = user.is_staff or user.is_superuser or (profile and profile.role == "admin")
-    
     qs = Region.objects.filter(is_active=True).order_by("name")
-    if not is_global and profile and profile.role == "manager":
-        qs = qs.filter(manager=user)
+
+    if user:
+        profile = getattr(user, "profile", None)
+        is_global = user.is_staff or user.is_superuser or (profile and profile.role == "admin")
+        if not is_global and profile and profile.role == "manager":
+            qs = qs.filter(manager=user)
         
     return JsonResponse({
         "results": [
