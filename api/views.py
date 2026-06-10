@@ -110,20 +110,38 @@ def _find_region(value):
         .first()
     )
 
-
 def _dt(value):
-    if not value:
-        return timezone.now()
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if timezone.is_naive(parsed):
-        return timezone.make_aware(parsed)
-    return parsed
+    if not value or str(value).lower() in ["null", "none", ""]:
+        return None
+    try:
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+        if timezone.is_naive(parsed):
+            return timezone.make_aware(parsed)
+        return parsed
+    except (ValueError, TypeError):
+        return None
 
 
 def _date(value):
-    if not value:
-        return timezone.localdate()
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+    if not value or str(value).lower() in ["null", "none", ""]:
+        return None
+    try:
+        if isinstance(value, date):
+            return value
+        dt_val = _dt(value)
+        return dt_val.date() if dt_val else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _bool(value):
+    if value is None:
+        return False
+    return str(value).lower() in {"true", "1", "yes", "y", "on"}
 
 
 def _current_user(request):
@@ -438,6 +456,7 @@ def _format_order(order):
         "date": order.created_at.isoformat(),
         "totalAmount": float(order.total_amount),
         "status": order.status,
+        "deliveryMethod": order.delivery_method,
         "comment": order.comment,
         "rejectionReason": order.rejection_reason or None,
         "courierId": str(order.courier_id) if order.courier_id else None,
@@ -991,6 +1010,7 @@ def create_order(request):
             client=client, 
             store=store, 
             distributor=client.distributor, 
+            delivery_method=payload.get("deliveryMethod", "courier"),
             comment=(payload.get("comment") or "").strip()
         )
         for raw in items:
@@ -1112,31 +1132,34 @@ def create_color_request(request):
         return err
     payload = request.POST if (request.content_type or "").startswith("multipart/form-data") else _json(request)
     files = _attachment_files(request)
-    with transaction.atomic():
-        urgent = str(payload.get("urgent")).lower() in {"true", "1", "yes"}
-        item = ColorRequest.objects.create(
-            client=client,
-            car_brand=(payload.get("carBrand") or "").strip(),
-            car_model=(payload.get("carModel") or "").strip(),
-            car_year=(payload.get("carYear") or "").strip()[:4],
-            vin=(payload.get("vin") or "").strip(),
-            color_code=(payload.get("colorCode") or "").strip(),
-            color_name=(payload.get("colorName") or "").strip(),
-            urgent=urgent,
-            comment=(payload.get("comment") or "").strip(),
-            transfer_method=(payload.get("transferMethod") or "courier").strip(),
-            pickup_address=(payload.get("pickupAddress") or payload.get("address") or client.city).strip(),
-            pickup_time=_dt(payload.get("pickupTime") or payload.get("pickupDate") or payload.get("scheduledTime")) if payload.get("pickupTime") or payload.get("pickupDate") or payload.get("scheduledTime") else None,
-            contact_person=(payload.get("contactPerson") or payload.get("contactName") or client.contact_name).strip(),
-            contact_phone=(payload.get("contactPhone") or client.phone).strip(),
-            assigned_distributor=client.distributor,
-        )
-        sla_hours = 4 if item.urgent else 24
-        item.sla_deadline = timezone.now() + timezone.timedelta(hours=sla_hours)
-        _append_color_history(item, "created", _current_user(request), "Заявка создана")
-        item.save(update_fields=["sla_deadline", "status_history"])
-        _create_attachments(request, item, files, description="Фото для Color Lab")
-    return JsonResponse({"request": _format_color_request(item)}, status=201)
+    try:
+        with transaction.atomic():
+            urgent = _bool(payload.get("urgent"))
+            item = ColorRequest.objects.create(
+                client=client,
+                car_brand=(payload.get("carBrand") or "").strip(),
+                car_model=(payload.get("carModel") or "").strip(),
+                car_year=(payload.get("carYear") or "").strip()[:4],
+                vin=(payload.get("vin") or "").strip(),
+                color_code=(payload.get("colorCode") or "").strip(),
+                color_name=(payload.get("colorName") or "").strip(),
+                urgent=urgent,
+                comment=(payload.get("comment") or "").strip(),
+                transfer_method=(payload.get("transferMethod") or "courier").strip(),
+                pickup_address=(payload.get("pickupAddress") or payload.get("address") or client.city).strip(),
+                pickup_time=_dt(payload.get("pickupTime") or payload.get("pickupDate") or payload.get("scheduledTime")),
+                contact_person=(payload.get("contactPerson") or payload.get("contactName") or client.contact_name).strip(),
+                contact_phone=(payload.get("contactPhone") or client.phone).strip(),
+                assigned_distributor=client.distributor,
+            )
+            sla_hours = 4 if item.urgent else 24
+            item.sla_deadline = timezone.now() + timezone.timedelta(hours=sla_hours)
+            _append_color_history(item, "created", _current_user(request), "Заявка создана")
+            item.save(update_fields=["sla_deadline", "status_history"])
+            _create_attachments(request, item, files, description="Фото для Color Lab")
+        return JsonResponse({"request": _format_color_request(item)}, status=201)
+    except Exception as e:
+        return JsonResponse({"detail": f"Ошибка создания заявки: {str(e)}"}, status=400)
 
 
 # Courier Views
@@ -1263,7 +1286,7 @@ def distributors(request):
         return JsonResponse({"detail": "Unauthorized"}, status=401)
     
     profile = getattr(user, "profile", None)
-    is_global = user.is_staff or user.is_superuser or (profile and profile.role == "admin")
+    is_global = _is_user_global(user, profile)
     
     qs = Distributor.objects.all()
     if not is_global and profile and profile.role == "manager":
@@ -1272,14 +1295,21 @@ def distributors(request):
     return JsonResponse({"results": [{"id": str(d.id), "name": d.name} for d in qs.distinct()]})
 
 
+def _is_user_global(user, profile=None):
+    if user.is_superuser:
+        return True
+    if profile is None:
+        profile = getattr(user, "profile", None)
+    return profile and profile.role == "admin"
+
+
 def _require_manager_scope(request):
     user = _current_user(request)
     if user is None:
         return None, False, JsonResponse({"detail": "Unauthorized"}, status=401)
     
-    # Global admin: is_staff, is_superuser, or Profile.Role.ADMIN
     profile = getattr(user, "profile", None)
-    is_global = user.is_staff or user.is_superuser or (profile and profile.role == "admin")
+    is_global = _is_user_global(user, profile)
     
     if profile and profile.role in ["manager", "admin"] or user.is_staff or user.is_superuser:
         return user, is_global, None
@@ -1841,16 +1871,15 @@ def admin_analytics(request):
             "avgOrderValue": float(total_fulfilled_value) / max(total_fulfilled_count, 1),
         }
         
-        # Top 3 Distributors by turnover
-        top_distributors = []
-        # Use a single query with aggregation for all distributors instead of a loop
-        dist_turnover_agg = Purchase.objects.filter(status="verified").values('distributor__name').annotate(turnover=Sum('total_amount')).order_by('-turnover')[:3]
-        for item in dist_turnover_agg:
-            top_distributors.append({
-                "name": item['distributor__name'] or "N/A", 
-                "value": float(item['turnover'] or 0)
-            })
-        system_stats["topDistributors"] = top_distributors
+    # Top 3 Distributors by turnover (Scoped for both Admin and Manager)
+    top_distributors = []
+    dist_turnover_agg = purchase_qs.filter(status="verified").values('distributor__name').annotate(turnover=Sum('total_amount')).order_by('-turnover')[:3]
+    for item in dist_turnover_agg:
+        top_distributors.append({
+            "name": item['distributor__name'] or "N/A", 
+            "value": float(item['turnover'] or 0)
+        })
+    system_stats["topDistributors"] = top_distributors
 
     # Apply filters from request
     region_id = request.GET.get("region")
@@ -2458,7 +2487,7 @@ def regions(request):
 
     if user:
         profile = getattr(user, "profile", None)
-        is_global = user.is_staff or user.is_superuser or (profile and profile.role == "admin")
+        is_global = _is_user_global(user, profile)
         if not is_global and profile and profile.role == "manager":
             qs = qs.filter(manager=user)
         

@@ -300,9 +300,15 @@ class Order(models.Model):
         ("fulfilled", "Выполнен"),
     ]
 
+    DELIVERY_CHOICES = [
+        ("courier", "Курьерская доставка"),
+        ("self_pickup", "Самовывоз"),
+    ]
+
     client = models.ForeignKey(ClientProfile, on_delete=models.CASCADE, related_name="orders", verbose_name="Клиент")
     store = models.ForeignKey(Store, on_delete=models.SET_NULL, related_name="orders", verbose_name="Где забрать", null=True, blank=True)
     distributor = models.ForeignKey(Distributor, on_delete=models.PROTECT, related_name="orders", verbose_name="Дистрибьютор")
+    delivery_method = models.CharField("Способ получения", max_length=32, choices=DELIVERY_CHOICES, default="courier")
     external_id = models.CharField("Внешний ID (1C)", max_length=128, blank=True, null=True, db_index=True)
     comment = models.TextField("Комментарий", blank=True)
     status = models.CharField("Статус", max_length=32, choices=STATUS_CHOICES, default="new")
@@ -597,6 +603,33 @@ class CourierTask(models.Model):
 # Signals for CourierTask
 from django.db.models.signals import post_save
 from django.dispatch import receiver
+
+@receiver(post_save, sender=Order)
+def manage_order_courier_task(sender, instance, created, **kwargs):
+    """
+    Авто-создание задачи курьеру при переводе заказа в 'accepted' с методом 'courier',
+    или при назначении курьера на уже принятый заказ.
+    """
+    if instance.status == "accepted" and instance.delivery_method == "courier":
+        task, created_task = CourierTask.objects.get_or_create(
+            order=instance,
+            defaults={
+                "client": instance.client,
+                "task_type": "delivery",
+                "address": instance.client.city, # Default
+                "time_slot": "10:00 - 18:00",
+                "status": "assigned" if instance.courier else "created",
+                "courier": instance.courier,
+                "comment": f"Доставка заказа ORD-{instance.id:05d}",
+            }
+        )
+        if not created_task:
+            # Sync courier if updated
+            if task.courier != instance.courier:
+                task.courier = instance.courier
+                task.status = "assigned" if instance.courier else "created"
+                task.save(update_fields=["courier", "status"])
+
 
 @receiver(post_save, sender=ColorRequest)
 def create_color_lab_courier_task(sender, instance, created, **kwargs):

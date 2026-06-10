@@ -17,9 +17,9 @@ def _load_env_file(path):
 
 _load_env_file(BASE_DIR / ".env")
 
-SECRET_KEY = "dev-autoterra-change-me"
-DEBUG = True
-ALLOWED_HOSTS = ["*"]
+SECRET_KEY = os.environ.get("SECRET_KEY", "dev-autoterra-change-me")
+DEBUG = os.environ.get("DEBUG", "True").lower() in ("true", "1", "t")
+ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "*").split(",")
 
 INSTALLED_APPS = [
     "django.contrib.admin",
