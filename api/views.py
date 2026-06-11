@@ -1995,11 +1995,16 @@ def distributor_couriers(request):
         return err
     # Get all users with courier role
     qs = User.objects.filter(profile__role="courier", is_active=True)
+    
+    def _get_courier_name(c):
+        full_name = f"{c.first_name} {c.last_name}".strip()
+        return full_name if full_name else f"Курьер {c.username}"
+        
     return JsonResponse({
         "results": [
             {
                 "id": str(c.id),
-                "name": getattr(c, "profile", None).contact_name if hasattr(c, "profile") else c.username,
+                "name": _get_courier_name(c),
                 "phone": c.username
             } for c in qs
         ]
