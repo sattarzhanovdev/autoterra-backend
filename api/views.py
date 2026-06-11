@@ -1022,6 +1022,7 @@ def create_order(request):
         for raw in items:
             product = Product.objects.filter(id=raw.get("productId"), distributor=client.distributor, is_active=True).first()
             if product:
+                qty = int(raw.get("quantity") or 1)
                 OrderItem.objects.create(
                     order=order, 
                     product=product, 
@@ -1031,8 +1032,16 @@ def create_order(request):
                     brand=product.brand, 
                     volume=product.volume, 
                     price=product.price, 
-                    quantity=int(raw.get("quantity") or 1)
+                    quantity=qty
                 )
+                product.quantity = max(0, product.quantity - qty)
+                if product.quantity > 5:
+                    product.status = "inStock"
+                elif product.quantity > 0:
+                    product.status = "low"
+                else:
+                    product.status = "onOrder"
+                product.save(update_fields=["quantity", "status"])
     return JsonResponse({"order": _format_order(order)}, status=201)
 
 
