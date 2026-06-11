@@ -536,6 +536,7 @@ class CourierTask(models.Model):
         ("color_lab_pickup", "Забор для Color Lab"),
     ]
     STATUS_CHOICES = [
+        ("created", "Создан"),
         ("assigned", "Назначен"),
         ("in_progress", "В пути"),
         ("delivered", "Доставлено"),
@@ -579,7 +580,7 @@ class CourierTask(models.Model):
     address = models.CharField("Адрес", max_length=255)
     time_slot = models.CharField("Временной интервал", max_length=64)
     status = models.CharField(
-        "Статус", max_length=32, choices=STATUS_CHOICES, default="assigned"
+        "Статус", max_length=32, choices=STATUS_CHOICES, default="created"
     )
     status_history = models.JSONField("История статусов", default=list, blank=True)
     car_description = models.CharField("Автомобиль", max_length=255, blank=True)

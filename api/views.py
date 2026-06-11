@@ -444,6 +444,12 @@ def _format_order_item(item):
 
 def _format_order(order):
     items = [_format_order_item(item) for item in order.items.all()]
+    def _get_courier_name(c):
+        if not c:
+            return None
+        full_name = f"{c.first_name} {c.last_name}".strip()
+        return full_name if full_name else f"Курьер {c.username}"
+
     return {
         "id": str(order.id),
         "clientId": str(order.client_id),
@@ -460,7 +466,7 @@ def _format_order(order):
         "comment": order.comment,
         "rejectionReason": order.rejection_reason or None,
         "courierId": str(order.courier_id) if order.courier_id else None,
-        "courierName": getattr(order.courier, 'profile', None).contact_name if order.courier and hasattr(order.courier, 'profile') else (order.courier.username if order.courier else None),
+        "courierName": _get_courier_name(order.courier),
         "estimatedDeliveryDate": order.estimated_delivery_date.isoformat() if order.estimated_delivery_date else None,
         "createdAt": order.created_at.isoformat(),
         "items": items,
