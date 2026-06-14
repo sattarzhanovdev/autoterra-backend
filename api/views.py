@@ -2458,6 +2458,37 @@ def distributor_stock(request):
 
 @csrf_exempt
 @require_POST
+def distributor_add_product(request):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    if is_admin:
+        return JsonResponse({"detail": "Admin must specify distributorId"}, status=400)
+        
+    payload = _json(request)
+    sku = payload.get("sku")
+    if not sku:
+        return JsonResponse({"detail": "SKU обязателен"}, status=400)
+        
+    if Product.objects.filter(distributor=distributor, sku=sku).exists():
+        return JsonResponse({"detail": f"Товар с артикулом {sku} уже существует"}, status=400)
+        
+    product = Product.objects.create(
+        distributor=distributor,
+        sku=sku,
+        name=payload.get("name", "Новый товар"),
+        category=payload.get("category", "Общее"),
+        brand=payload.get("brand", "AutoTerra"),
+        price=_money_value(payload.get("price")),
+        quantity=int(payload.get("quantity", 0)),
+        status=payload.get("status", "inStock")
+    )
+    
+    return JsonResponse({"status": "ok", "product": _format_product(product)})
+
+
+@csrf_exempt
+@require_POST
 def distributor_stock_upload(request):
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:

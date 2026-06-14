@@ -43,6 +43,7 @@ urlpatterns = [
     path("distributor/delivery-tasks/", views.distributor_delivery_tasks),
     path("distributor/delivery-tasks/<int:task_id>/status/", views.distributor_update_delivery_status),
     path("distributor/stock/", views.distributor_stock),
+    path("distributor/stock/add/", views.distributor_add_product),
     path("distributor/stock/upload/", views.distributor_stock_upload),
     path("distributor/reports/", views.distributor_reports),
     path("color-requests/", views.color_requests),
