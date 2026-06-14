@@ -251,6 +251,11 @@ def _scope_orders(distributor, is_admin):
     return qs if is_admin else qs.filter(distributor=distributor)
 
 
+def _scope_courier_tasks(distributor, is_admin):
+    qs = CourierTask.objects.select_related("client", "courier", "order", "color_request")
+    return qs if is_admin else qs.filter(client__distributor=distributor)
+
+
 def _scope_products(distributor, is_admin):
     qs = Product.objects.select_related("distributor")
     return qs if is_admin else qs.filter(distributor=distributor)
@@ -561,6 +566,8 @@ def _format_courier_task(item):
         "clientInn": item.client.inn,
         "orderId": str(item.order_id) if item.order_id else None,
         "colorRequestId": str(item.color_request_id) if item.color_request_id else None,
+        "courierId": str(item.courier_id) if item.courier_id else None,
+        "courierName": item.courier.get_full_name() or item.courier.username if item.courier else None,
         "taskType": item.task_type,
         "typeDisplay": item.get_task_type_display(),
         "address": item.address,
@@ -1023,6 +1030,15 @@ def create_order(request):
             product = Product.objects.filter(id=raw.get("productId"), distributor=client.distributor, is_active=True).first()
             if product:
                 qty = int(raw.get("quantity") or 1)
+                
+                # STOCK VALIDATION
+                # If NOT onOrder, check if we have enough quantity
+                if product.status != "onOrder" and product.quantity < qty:
+                    transaction.set_rollback(True)
+                    return JsonResponse({
+                        "detail": f"Недостаточно товара '{product.name}' на складе. Доступно: {product.quantity}"
+                    }, status=400)
+
                 OrderItem.objects.create(
                     order=order, 
                     product=product, 
@@ -1034,13 +1050,18 @@ def create_order(request):
                     price=product.price, 
                     quantity=qty
                 )
+                
+                # Update quantity
                 product.quantity = max(0, product.quantity - qty)
                 if product.quantity > 5:
                     product.status = "inStock"
                 elif product.quantity > 0:
                     product.status = "low"
                 else:
-                    product.status = "onOrder"
+                    # If it was already onOrder, keep it onOrder (allowing further backorders)
+                    # Otherwise, it becomes outOfStock
+                    if product.status != "onOrder":
+                        product.status = "outOfStock"
                 product.save(update_fields=["quantity", "status"])
     return JsonResponse({"order": _format_order(order)}, status=201)
 
@@ -1317,10 +1338,10 @@ def assign_courier_task(request, task_id):
     courier_id = _json(request).get("courierId")
     task = CourierTask.objects.filter(id=task_id).first()
     if task:
-        task.assigned_courier_id = courier_id
+        task.courier_id = courier_id
         task.status = "assigned"
         _append_task_history(task, "assigned", user, f"Назначен курьер {courier_id}")
-        task.save(update_fields=["assigned_courier", "status", "status_history"])
+        task.save(update_fields=["courier", "status", "status_history"])
     return JsonResponse({"task": _format_courier_task(task)})
 
 
@@ -2066,6 +2087,7 @@ def distributor_dashboard(request):
     clients = _scope_clients(distributor, is_admin)
     purchases = _scope_purchases(distributor, is_admin)
     orders_qs = _scope_orders(distributor, is_admin)
+    delivery_qs = _scope_courier_tasks(distributor, is_admin)
     
     # Standard statuses for verification
     to_verify = ["new", "pending", "pending_verification", "under_review", "duplicate_review"]
@@ -2074,7 +2096,8 @@ def distributor_dashboard(request):
         "metrics": {
             "clients": clients.count(), 
             "purchasesToVerify": purchases.filter(status__in=to_verify).count(), 
-            "ordersToProcess": orders_qs.count()
+            "ordersToProcess": orders_qs.filter(status="new").count(),
+            "deliveriesToAssign": delivery_qs.filter(status="created").count()
         }
     })
 
@@ -2212,6 +2235,56 @@ def distributor_orders(request):
         qs = qs.filter(status=status_filter)
 
     return JsonResponse({"results": [_format_order(item) for item in qs]})
+
+
+@require_GET
+def distributor_delivery_tasks(request):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    
+    qs = _scope_courier_tasks(distributor, is_admin).order_by("-created_at")
+    
+    status_filter = request.GET.get("status")
+    if status_filter:
+        qs = qs.filter(status=status_filter)
+
+    return JsonResponse({"results": [_format_courier_task(item) for item in qs]})
+
+
+@csrf_exempt
+@require_POST
+def distributor_update_delivery_status(request, task_id):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    
+    task = _scope_courier_tasks(distributor, is_admin).filter(id=task_id).first()
+    if not task:
+        return JsonResponse({"detail": "Заявка не найдена"}, status=404)
+        
+    payload = _json(request)
+    status = payload.get("status")
+    courier_id = payload.get("courierId")
+    reason = payload.get("reason")
+    
+    old_status = task.status
+    if status:
+        task.status = status
+    if courier_id:
+        task.courier_id = courier_id
+        if task.status == "created":
+            task.status = "assigned"
+            
+    if status == "cancelled" and reason:
+        # logic for reason if added to model, but CourierTask doesn't have it explicitly in models.py
+        # we can log it in history
+        pass
+        
+    _append_task_history(task, task.status, _current_user(request), f"Обновлено дистрибьютором. Статус: {task.status}, Курьер: {courier_id}")
+    task.save()
+    
+    return JsonResponse({"task": _format_courier_task(task)})
 
 
 @csrf_exempt
