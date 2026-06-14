@@ -1045,6 +1045,38 @@ def create_order(request):
     return JsonResponse({"order": _format_order(order)}, status=201)
 
 
+@csrf_exempt
+@require_POST
+def cancel_order(request, order_id):
+    client, err = _require_client(request)
+    if err:
+        return err
+    
+    order = client.orders.filter(id=order_id).first()
+    if not order:
+        return JsonResponse({"detail": "Заказ не найден"}, status=404)
+        
+    if order.status != "new":
+        return JsonResponse({"detail": "Нельзя отменить заказ, который уже принят в работу"}, status=400)
+        
+    with transaction.atomic():
+        # Restore stock
+        for item in order.items.all():
+            product = item.product
+            product.quantity += item.quantity
+            if product.quantity > 5:
+                product.status = "inStock"
+            elif product.quantity > 0:
+                product.status = "low"
+            product.save(update_fields=["quantity", "status"])
+            
+        order.status = "rejected"
+        order.rejection_reason = "Отменено клиентом"
+        order.save(update_fields=["status", "rejection_reason"])
+        
+    return JsonResponse({"status": "success", "order": _format_order(order)})
+
+
 @require_GET
 def purchases(request):
     client, err = _require_client(request)

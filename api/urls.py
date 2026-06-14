@@ -17,6 +17,7 @@ urlpatterns = [
     path("order-config/", views.order_config),
     path("orders/", views.orders),
     path("orders/create/", views.create_order),
+    path("orders/<int:order_id>/cancel/", views.cancel_order),
     path("purchases/", views.purchases),
     path("purchases/create/", views.create_purchase),
     path("manager/dashboard/", views.manager_dashboard),
