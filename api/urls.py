@@ -51,6 +51,8 @@ urlpatterns = [
     path("color-requests/<int:request_id>/update/", views.update_color_request),
     path("courier-tasks/", views.courier_tasks),
     path("courier-tasks/create/", views.create_courier_task),
+    path("courier-tasks/<int:task_id>/cancel/", views.cancel_courier_task),
+    path("courier-tasks/<int:task_id>/update/", views.update_courier_task),
     path("courier-tasks/<int:task_id>/proof/", views.courier_task_proof),
     path("courier/tasks/", views.courier_my_tasks),
     path("courier/tasks/<int:task_id>/status/", views.courier_update_task_status),

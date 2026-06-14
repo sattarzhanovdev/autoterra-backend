@@ -1316,6 +1316,53 @@ def create_courier_task(request):
 
 @csrf_exempt
 @require_POST
+def cancel_courier_task(request, task_id):
+    client, err = _require_client(request)
+    if err:
+        return err
+    
+    task = client.courier_tasks.filter(id=task_id).first()
+    if not task:
+        return JsonResponse({"detail": "Заявка не найдена"}, status=404)
+        
+    if task.status != "created":
+        return JsonResponse({"detail": "Нельзя отменить заявку, которая уже в работе"}, status=400)
+        
+    task.status = "cancelled"
+    task.save(update_fields=["status"])
+    _append_task_history(task, "cancelled", client.user, "Отменено клиентом")
+    
+    return JsonResponse({"status": "success"})
+
+
+@csrf_exempt
+@require_POST
+def update_courier_task(request, task_id):
+    client, err = _require_client(request)
+    if err:
+        return err
+    
+    task = client.courier_tasks.filter(id=task_id).first()
+    if not task:
+        return JsonResponse({"detail": "Заявка не найдена"}, status=404)
+        
+    if task.status != "created":
+        return JsonResponse({"detail": "Нельзя изменить заявку, которая уже в работе"}, status=400)
+        
+    payload = _json(request)
+    task.task_type = payload.get("type", task.task_type)
+    task.address = payload.get("address", task.address)
+    task.contact_name = payload.get("contactName", task.contact_name)
+    task.contact_phone = payload.get("contactPhone", task.contact_phone)
+    task.time_slot = payload.get("timeSlot", task.time_slot)
+    task.comment = payload.get("comment", task.comment)
+    
+    task.save()
+    return JsonResponse({"task": _format_courier_task(task)})
+
+
+@csrf_exempt
+@require_POST
 def courier_task_proof(request, task_id):
     client, err = _require_client(request)
     if err:
