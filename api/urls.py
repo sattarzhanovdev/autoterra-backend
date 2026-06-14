@@ -47,6 +47,8 @@ urlpatterns = [
     path("distributor/reports/", views.distributor_reports),
     path("color-requests/", views.color_requests),
     path("color-requests/create/", views.create_color_request),
+    path("color-requests/<int:request_id>/cancel/", views.cancel_color_request),
+    path("color-requests/<int:request_id>/update/", views.update_color_request),
     path("courier-tasks/", views.courier_tasks),
     path("courier-tasks/create/", views.create_courier_task),
     path("courier-tasks/<int:task_id>/proof/", views.courier_task_proof),

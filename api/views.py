@@ -1182,6 +1182,56 @@ def color_requests(request):
     return JsonResponse({"results": [_format_color_request(item) for item in qs]})
 
 
+@csrf_exempt
+@require_POST
+def cancel_color_request(request, request_id):
+    client, err = _require_client(request)
+    if err:
+        return err
+    
+    color_request = client.color_requests.filter(id=request_id).first()
+    if not color_request:
+        return JsonResponse({"detail": "Заявка не найдена"}, status=404)
+        
+    if color_request.status != "created":
+        return JsonResponse({"detail": "Нельзя отменить заявку, которая уже в работе"}, status=400)
+        
+    color_request.status = "cancelled"
+    color_request.save(update_fields=["status"])
+    
+    return JsonResponse({"status": "success"})
+
+
+@csrf_exempt
+@require_POST
+def update_color_request(request, request_id):
+    client, err = _require_client(request)
+    if err:
+        return err
+    
+    color_request = client.color_requests.filter(id=request_id).first()
+    if not color_request:
+        return JsonResponse({"detail": "Заявка не найдена"}, status=404)
+        
+    if color_request.status != "created":
+        return JsonResponse({"detail": "Нельзя изменить заявку, которая уже в работе"}, status=400)
+        
+    payload = _json(request)
+    color_request.car_brand = payload.get("carBrand", color_request.car_brand)
+    color_request.car_model = payload.get("carModel", color_request.car_model)
+    color_request.vin = payload.get("vin", color_request.vin)
+    color_request.color_code = payload.get("colorCode", color_request.color_code)
+    color_request.color_name = payload.get("colorName", color_request.color_name)
+    color_request.pickup_address = payload.get("pickupAddress", color_request.pickup_address)
+    color_request.contact_person = payload.get("contactPerson", color_request.contact_person)
+    color_request.contact_phone = payload.get("contactPhone", color_request.contact_phone)
+    color_request.comment = payload.get("comment", color_request.comment)
+    color_request.transfer_method = payload.get("transferMethod", color_request.transfer_method)
+    
+    color_request.save()
+    return JsonResponse({"request": _format_color_request(color_request)})
+
+
 def _append_color_history(item, status, user=None, comment=""):
     history_item = {
         "status": status,
