@@ -2207,6 +2207,19 @@ def distributor_update_order_status(request, order_id):
     if status == "rejected" and reason:
         order.rejection_reason = reason
         
+    # Restore stock if order was NOT rejected before but IS rejected now
+    if status == "rejected" and old_status != "rejected":
+        with transaction.atomic():
+            for item in order.items.all():
+                product = item.product
+                product.quantity += item.quantity
+                if product.quantity > 5:
+                    product.status = "inStock"
+                elif product.quantity > 0:
+                    product.status = "low"
+                # Else stays onOrder or whatever it was
+                product.save(update_fields=["quantity", "status"])
+        
     if courier_id:
         try:
             courier = User.objects.get(id=courier_id)
