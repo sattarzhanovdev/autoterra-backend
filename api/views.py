@@ -529,6 +529,7 @@ def _format_color_request(item):
     return {
         "id": str(item.id),
         "clientId": str(item.client_id),
+        "clientName": item.client.company_name,
         "carBrand": item.car_brand,
         "carModel": item.car_model,
         "carYear": item.car_year or None,
@@ -2185,6 +2186,7 @@ def distributor_dashboard(request):
     purchases = _scope_purchases(distributor, is_admin)
     orders_qs = _scope_orders(distributor, is_admin)
     delivery_qs = _scope_courier_tasks(distributor, is_admin)
+    color_qs = ColorRequest.objects.filter(assigned_distributor=distributor) if not is_admin else ColorRequest.objects.all()
     
     # Standard statuses for verification
     to_verify = ["new", "pending", "pending_verification", "under_review", "duplicate_review"]
@@ -2194,9 +2196,70 @@ def distributor_dashboard(request):
             "clients": clients.count(), 
             "purchasesToVerify": purchases.filter(status__in=to_verify).count(), 
             "ordersToProcess": orders_qs.filter(status="new").count(),
-            "deliveriesToAssign": delivery_qs.filter(status="created").count()
+            "deliveriesToAssign": delivery_qs.filter(status="created").count(),
+            "colorLabPending": color_qs.filter(status__in=["created", "pickedUp", "inProgress"]).count()
         }
     })
+
+
+@require_GET
+def distributor_color_requests(request):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    qs = ColorRequest.objects.all()
+    if not is_admin:
+        qs = qs.filter(assigned_distributor=distributor)
+    
+    status = request.GET.get("status")
+    if status:
+        qs = qs.filter(status=status)
+    
+    qs = _paginate(request, qs)
+    return JsonResponse({"results": [_format_color_request(item) for item in qs]})
+
+
+@csrf_exempt
+@require_POST
+def distributor_update_color_request(request, request_id):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    
+    item = ColorRequest.objects.filter(id=request_id).first()
+    if not item:
+        return JsonResponse({"detail": "Заявка не найдена"}, status=404)
+        
+    if not is_admin and item.assigned_distributor != distributor:
+        return JsonResponse({"detail": "Access denied"}, status=403)
+        
+    payload = _json(request)
+    new_status = payload.get("status")
+    recipe = payload.get("recipe")
+    
+    if new_status:
+        old_status = item.status
+        item.status = new_status
+        _append_color_history(item, new_status, _current_user(request), payload.get("comment", "Статус обновлен дистрибьютором"))
+        
+        # If becoming ready and it was a courier pickup, create return task
+        if new_status == "ready" and old_status != "ready" and item.transfer_method == "courier":
+            CourierTask.objects.create(
+                client=item.client,
+                color_request=item,
+                task_type="return",
+                address=item.pickup_address,
+                contact_name=item.contact_person,
+                contact_phone=item.contact_phone,
+                comment=f"Возврат лючка для заявки {item.color_code}",
+                status="created"
+            )
+        
+    if recipe is not None:
+        item.recipe = recipe
+        
+    item.save()
+    return JsonResponse({"request": _format_color_request(item)})
 
 
 @require_GET
