@@ -820,6 +820,34 @@ class Notification(models.Model):
         verbose_name_plural = "Уведомления"
         ordering = ("-created_at",)
 
+
+class UserDeviceToken(models.Model):
+    PLATFORM_CHOICES = [
+        ("android", "Android"),
+        ("ios", "iOS"),
+    ]
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="device_tokens",
+        verbose_name="Пользователь",
+    )
+    token = models.TextField("FCM-токен", unique=True)
+    platform = models.CharField(
+        "Платформа", max_length=10, choices=PLATFORM_CHOICES, default="android"
+    )
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+    updated_at = models.DateTimeField("Обновлено", auto_now=True)
+
+    class Meta:
+        verbose_name = "FCM-токен устройства"
+        verbose_name_plural = "FCM-токены устройств"
+
+    def __str__(self):
+        return f"{self.user_id} / {self.platform} / {self.token[:20]}..."
+
+
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 

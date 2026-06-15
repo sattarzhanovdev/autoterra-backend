@@ -21,6 +21,12 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "dev-autoterra-change-me")
 DEBUG = os.environ.get("DEBUG", "True").lower() in ("true", "1", "t")
 ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "*").split(",")
 
+# Firebase Cloud Messaging — path to the service-account JSON from Firebase Console
+FCM_SERVICE_ACCOUNT_FILE = os.environ.get(
+    "FCM_SERVICE_ACCOUNT_FILE",
+    str(BASE_DIR / "firebase-service-account.json"),
+)
+
 # Upload limits (20MB)
 DATA_UPLOAD_MAX_MEMORY_SIZE = 20 * 1024 * 1024
 FILE_UPLOAD_MAX_MEMORY_SIZE = 20 * 1024 * 1024

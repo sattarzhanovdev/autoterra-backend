@@ -74,5 +74,6 @@ urlpatterns = [
     path("notifications/", views.notifications),
     path("notifications/read/", views.mark_notifications_read),
     path("notifications/send/", views.send_notification),
+    path("notifications/token/", views.register_device_token),
     path("ai/chat/", views.ai_chat),
 ]

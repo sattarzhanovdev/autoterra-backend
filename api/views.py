@@ -2778,35 +2778,64 @@ def update_knowledge_card(request, card_id):
 
 @csrf_exempt
 @require_POST
+def register_device_token(request):
+    """Save or refresh the FCM token for the authenticated user's device."""
+    user = _current_user(request)
+    if user is None:
+        return JsonResponse({"detail": "Unauthorized"}, status=401)
+
+    payload = _json(request)
+    token = (payload.get("token") or "").strip()
+    platform = payload.get("platform", "android")
+
+    if not token:
+        return JsonResponse({"detail": "token is required"}, status=400)
+    if platform not in ("android", "ios"):
+        return JsonResponse({"detail": "platform must be 'android' or 'ios'"}, status=400)
+
+    from api.models import UserDeviceToken
+
+    obj, created = UserDeviceToken.objects.update_or_create(
+        token=token,
+        defaults={"user": user, "platform": platform},
+    )
+    return JsonResponse({"status": "created" if created else "updated"})
+
+
+@csrf_exempt
+@require_POST
 def send_notification(request):
     user = _current_user(request)
     profile = getattr(user, "profile", None)
     if not profile or profile.role not in ["admin", "manager", "ai_expert"]:
         return JsonResponse({"detail": "Forbidden"}, status=403)
-        
+
     payload = _json(request)
     target_user_id = payload.get("userId")
     title = payload.get("title")
     body = payload.get("body")
     n_type = payload.get("type", "info")
     link = payload.get("relatedLink", "")
-    
+
     if not all([target_user_id, title, body]):
         return JsonResponse({"detail": "Missing fields"}, status=400)
-        
+
     target_user = User.objects.filter(id=target_user_id).first()
     if not target_user:
         return JsonResponse({"detail": "User not found"}, status=404)
-        
-    Notification.objects.create(
+
+    notification = Notification.objects.create(
         user=target_user,
         title=title,
         body=body,
         type=n_type,
-        related_link=link
+        related_link=link,
     )
-    
-    return JsonResponse({"status": "ok"})
+
+    from api.services.push_notifications import PushNotificationService
+    push_result = PushNotificationService().send(notification)
+
+    return JsonResponse({"status": "ok", "push": push_result})
 
 
 @require_GET
