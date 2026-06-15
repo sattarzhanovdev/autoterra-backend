@@ -3084,7 +3084,17 @@ def manager_clients(request):
                 status=409,
             )
 
+        # Optional: manager may specify a distributor; otherwise auto-assigned from region
+        explicit_distributor = None
+        distributor_id = data.get('distributorId')
+        if distributor_id:
+            try:
+                explicit_distributor = Distributor.objects.get(id=distributor_id)
+            except Distributor.DoesNotExist:
+                return JsonResponse({'detail': 'Дистрибьютор не найден'}, status=404)
+
         phone = data.get('phone', '').strip()
+        email = data.get('email', '').strip()
         category = data.get('category', 'b').lower()
         city = data.get('city', '').strip()
         contact_name = data.get('contact', '').strip() or company_name
@@ -3103,6 +3113,7 @@ def manager_clients(request):
                     username=username,
                     password=User.objects.make_random_password(),
                     first_name=company_name[:30],
+                    email=email,
                 )
                 Profile.objects.filter(user=user_account).update(role='client')
 
@@ -3119,7 +3130,10 @@ def manager_clients(request):
                     registration_source='manager',
                     status='new',
                 )
-                # Use save() so auto-assign-distributor logic runs
+                # Explicit distributor overrides auto-assign from region
+                if explicit_distributor:
+                    client.distributor = explicit_distributor
+                # save() runs auto-assign logic only when distributor is still None
                 client.save()
         except IntegrityError as exc:
             return JsonResponse({'detail': f'Ошибка: {exc}'}, status=409)
