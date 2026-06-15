@@ -1,115 +1,132 @@
 """
-Daily push-notification digest for AutoTerra B2B platform.
+Daily push-notification digest command for AutoTerra B2B platform.
 
-Three analytical scenarios run sequentially (no Celery needed — this is
-executed by cron as a standalone process, so blocking FCM calls are fine):
+Three analytical scenarios run sequentially (no Celery — this is a cron process,
+so synchronous FCM calls are fine and daemon threads would exit prematurely):
 
-  1. inactive_clients  — no verified purchase in ≥14 days  → AI upsell push
-  2. sku_reorder       — frequency-based reorder prediction → AI restock push
-  3. inactive_regions  — no new clients/purchases in 7 days → SYSTEM alert
+  1. inactive_clients  — no verified purchase for ≥14 days    → AI upsell push
+  2. sku_reorder       — bought SKU >3 times, last >30 days ago → AI restock push
+  3. inactive_regions  — 0 new clients/purchases in 7 days     → SYSTEM alert
 
 Design principles
 ─────────────────
-• Every DB-heavy step uses Subquery / Exists / annotation — zero N+1 queries.
-• Anti-spam guards: each scenario has its own title fingerprint so filters
-  don't cross-contaminate.
-• --dry-run shows exactly what would happen without touching DB or FCM.
-• --scenario lets you re-run a single scenario after fixing data.
+• Every DB-heavy step is a single ORM query using Subquery / Exists / annotate.
+  Zero N+1 queries anywhere.
+• Anti-spam: per (user, title[, body]) per calendar day — no duplicate push
+  even if cron fires twice.
+• --dry-run shows exactly what would be sent without touching DB or FCM.
+• --scenario lets ops re-run one scenario after a data fix.
 
-Crontab (run at 09:00 Moscow = 06:00 UTC):
-  0 6 * * * /srv/autoterra/venv/bin/python /srv/autoterra/manage.py send_push_digests \
+Crontab (09:00 Moscow = 06:00 UTC):
+  0 6 * * * /srv/autoterra/venv/bin/python /srv/autoterra/manage.py send_push_digests \\
             >> /var/log/autoterra/digests.log 2>&1
 """
 
 import logging
+import time
 from datetime import date, timedelta
 from typing import Any
 
 from django.contrib.auth.models import User
 from django.core.management.base import BaseCommand, CommandParser
-from django.db.models import Count, Exists, Max, Min, OuterRef, Q, Subquery
+from django.db.models import Count, Exists, Max, OuterRef, Q, Subquery
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
 
-# ── Tunable constants (override via env/settings if needed) ──────────────────
-INACTIVE_PURCHASE_DAYS = 14   # Send push if no verified purchase for N days
-ANTI_SPAM_DAYS = 7            # Never re-send the same scenario within N days
-REGION_INACTIVE_DAYS = 7      # Alert manager if region quiet for N days
-SKU_MIN_PURCHASES = 2         # Minimum purchase events to build frequency model
-SKU_REORDER_WINDOW_DAYS = 3   # Push if predicted reorder is within ±N days
-SKU_MAX_HISTORY_DAYS = 180    # Ignore purchase events older than N days
-SKU_MAX_PER_USER = 3          # Cap SKU alerts bundled into one notification
+# ── Tunable thresholds ────────────────────────────────────────────────────────
+INACTIVE_PURCHASE_DAYS = 14   # client is inactive if no verified purchase for N days
+SKU_MIN_PURCHASES = 3         # must have purchased the SKU *more than* this many times
+SKU_LAST_PURCHASE_DAYS = 30   # push only if the last purchase of that SKU was > N days ago
+SKU_HISTORY_DAYS = 180        # only count purchases within the last N days
+SKU_MAX_PER_PUSH = 3          # max SKUs bundled into a single notification
+REGION_INACTIVE_DAYS = 7      # alert manager if territory is quiet for N days
 
 
 class Command(BaseCommand):
-    help = "Send personalised daily push-notification digests based on DB analytics."
+    help = "Send personalised daily push-notification digests (analytics-driven, cron-scheduled)."
 
     def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument(
             "--dry-run",
             action="store_true",
-            help="Preview without writing to DB or calling FCM.",
+            help="Preview what would be sent without writing to DB or calling FCM.",
         )
         parser.add_argument(
             "--scenario",
             choices=["inactive_clients", "sku_reorder", "inactive_regions"],
             default=None,
-            help="Run a single scenario (default: all three).",
+            help="Run a single scenario instead of all three.",
         )
 
     def handle(self, *args: Any, **options: Any) -> None:
         dry_run: bool = options["dry_run"]
         scenario: str | None = options["scenario"]
+        t0 = time.monotonic()
 
         if dry_run:
-            self.stdout.write(self.style.WARNING("══ DRY RUN MODE — nothing will be written ══\n"))
+            self.stdout.write(self.style.WARNING("══ DRY RUN — nothing will be written ══\n"))
 
         now = timezone.now()
         today = now.date()
         totals: dict[str, int] = {}
 
-        run_list = [scenario] if scenario else ["inactive_clients", "sku_reorder", "inactive_regions"]
+        run_list = [scenario] if scenario else [
+            "inactive_clients",
+            "sku_reorder",
+            "inactive_regions",
+        ]
 
         for name in run_list:
             self.stdout.write(self.style.MIGRATE_HEADING(f"\n▶ {name}"))
             try:
-                method = getattr(self, f"_run_{name}")
-                count = method(now, today, dry_run)
+                count = getattr(self, f"_run_{name}")(now, today, dry_run)
                 totals[name] = count
                 self.stdout.write(self.style.SUCCESS(f"  ✓ {count} notification(s) dispatched"))
             except Exception:
-                logger.exception("Scenario %s failed", name)
+                logger.exception("Digest scenario %s raised an unhandled exception", name)
                 self.stderr.write(self.style.ERROR(f"  ✗ {name} aborted — see logs"))
                 totals[name] = -1
 
+        elapsed = time.monotonic() - t0
+        total_sent = sum(v for v in totals.values() if v >= 0)
+        logger.info(
+            "digest finished | elapsed=%.1fs sent=%d scenarios=%s",
+            elapsed, total_sent, totals,
+        )
         self.stdout.write(
-            self.style.SUCCESS(f"\n{'─'*40}\nTotal sent: {sum(v for v in totals.values() if v >= 0)} | {totals}\n")
+            self.style.SUCCESS(
+                f"\n{'─' * 44}\n"
+                f"Finished in {elapsed:.1f}s | total sent={total_sent} | {totals}\n"
+            )
         )
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Scenario 1 — Inactive clients
+    # Scenario 1 — Inactive clients  (retention / re-engagement)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _run_inactive_clients(self, now, today: date, dry_run: bool) -> int:
         """
-        Find active clients whose last *verified* purchase is older than
-        INACTIVE_PURCHASE_DAYS (or who have never made a purchase at all).
+        Find active ClientProfiles whose last *verified* Purchase was more than
+        INACTIVE_PURCHASE_DAYS ago (or who have never made one) and send an
+        AI upsell push.
 
-        ORM strategy
+        ORM approach
         ────────────
-        Subquery → last verified purchase date per client (avoids GROUP BY on
-        the full purchase table for clients we don't care about).
-        Exists   → spam guard without a JOIN on the outer table.
-        .only()  → fetch only the columns we actually use.
+        • Correlated Subquery returns the most-recent verified purchase date
+          without a GROUP BY across the full table.
+        • Exists anti-spam sub-select is evaluated by the DB — no extra Python
+          round-trip per candidate.
+        • .iterator(chunk_size=200) streams rows so memory stays flat even with
+          thousands of inactive clients.
         """
         from api.models import ClientProfile, Notification, Purchase
 
         cutoff = today - timedelta(days=INACTIVE_PURCHASE_DAYS)
-        anti_spam_since = now - timedelta(days=ANTI_SPAM_DAYS)
         TITLE = "Время пополнить запасы"
+        BODY = "Вы не делали заказов уже 2 недели. Проверьте остатки на складе."
 
-        # Correlated subquery: most recent verified purchase date for this client
+        # Most-recent verified purchase date for each ClientProfile (correlated)
         last_purchase_sq = (
             Purchase.objects
             .filter(client=OuterRef("pk"), status="verified")
@@ -117,12 +134,12 @@ class Command(BaseCommand):
             .values("date")[:1]
         )
 
-        # Exists guard: did we already send this exact notification recently?
-        already_notified_sq = Notification.objects.filter(
+        # Anti-spam: was this exact notification already sent to this user today?
+        already_sent_sq = Notification.objects.filter(
             user_id=OuterRef("user_id"),
             type="ai",
             title=TITLE,
-            created_at__gte=anti_spam_since,
+            created_at__date=today,
         )
 
         candidates = (
@@ -130,29 +147,27 @@ class Command(BaseCommand):
             .filter(status="active")
             .annotate(last_purchase_date=Subquery(last_purchase_sq))
             .filter(
-                Q(last_purchase_date__lt=cutoff) | Q(last_purchase_date__isnull=True)
+                Q(last_purchase_date__lt=cutoff)
+                | Q(last_purchase_date__isnull=True)
             )
-            .annotate(already_notified=Exists(already_notified_sq))
-            .filter(already_notified=False)
+            .annotate(already_sent=Exists(already_sent_sq))
+            .filter(already_sent=False)
             .select_related("user")
-            .only("id", "company_name", "user")
+            .only("id", "company_name", "user_id")
         )
 
         count = 0
         for client in candidates.iterator(chunk_size=200):
             days_ago = (
                 f"{(today - client.last_purchase_date).days} дней"
-                if client.last_purchase_date else "никогда"
+                if client.last_purchase_date
+                else "никогда"
             )
             self.stdout.write(f"  {client.company_name} (последняя покупка: {days_ago})")
-
             self._notify(
                 user=client.user,
                 title=TITLE,
-                body=(
-                    "Вы давно не делали заказ. "
-                    "Проверьте остатки материалов AutoTerra и сделайте заявку."
-                ),
+                body=BODY,
                 n_type="ai",
                 related_link="/purchases",
                 dry_run=dry_run,
@@ -162,37 +177,36 @@ class Command(BaseCommand):
         return count
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Scenario 2 — SKU reorder prediction
+    # Scenario 2 — SKU reorder prediction  (sales generation)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _run_sku_reorder(self, now, today: date, dry_run: bool) -> int:
         """
-        Build a simple purchase-frequency model per (client, SKU):
+        MVP rule: client bought a given SKU more than SKU_MIN_PURCHASES times
+        within the last SKU_HISTORY_DAYS days AND their most recent purchase of
+        that SKU was more than SKU_LAST_PURCHASE_DAYS days ago.
 
-          avg_interval_days = (last_date − first_date) / (purchase_count − 1)
-          predicted_next    = last_date + avg_interval_days
-
-        Send a push if predicted_next is within [-1, +REORDER_WINDOW] days.
-
-        ORM strategy
+        ORM approach
         ────────────
-        One aggregated query returns all (client, sku) patterns in a single
-        round-trip.  All frequency arithmetic is done in Python on the small
-        result set (already filtered to ≥2 purchases within 180 days).
-        User instances are bulk-fetched (one query) after prediction filtering.
+        • One annotated GROUP BY query returns all (client × SKU) patterns.
+          Both the count filter and the last-purchase filter are pushed to the DB.
+        • Anti-spam is resolved via a pre-fetched set (one query, O(1) lookup).
+        • User objects are bulk-fetched after filtering (one query).
+        • Multiple eligible SKUs per user are bundled into a single notification
+          (capped at SKU_MAX_PER_PUSH to keep the body readable).
         """
         from api.models import Notification, PurchaseItem
 
-        anti_spam_since = now - timedelta(days=ANTI_SPAM_DAYS)
-        pattern_cutoff = today - timedelta(days=SKU_MAX_HISTORY_DAYS)
-        TITLE = "Пора заказать материал"
+        history_cutoff = today - timedelta(days=SKU_HISTORY_DAYS)
+        reorder_cutoff = today - timedelta(days=SKU_LAST_PURCHASE_DAYS)
+        TITLE = "Заканчивается товар?"
 
-        # One DB round-trip: aggregate per (client, sku)
+        # Single aggregated round-trip: (client, sku) patterns that meet both rules
         sku_patterns = (
             PurchaseItem.objects
             .filter(
                 purchase__status="verified",
-                purchase__date__gte=pattern_cutoff,
+                purchase__date__gte=history_cutoff,
             )
             .values(
                 "sku",
@@ -204,85 +218,61 @@ class Command(BaseCommand):
             .annotate(
                 purchase_count=Count("purchase_id", distinct=True),
                 last_purchase=Max("purchase__date"),
-                first_purchase=Min("purchase__date"),
             )
-            .filter(purchase_count__gte=SKU_MIN_PURCHASES)
-            .order_by("purchase__client__user_id", "sku")
+            .filter(
+                purchase_count__gt=SKU_MIN_PURCHASES,   # strictly > 3
+                last_purchase__lt=reorder_cutoff,        # last purchase > 30 days ago
+            )
+            .order_by("purchase__client__user_id", "-last_purchase")
         )
 
-        # Pre-fetch recently-alerted users (one query, no per-row hits)
+        # Pre-fetch users already alerted today (one query → O(1) lookup below)
         alerted_user_ids: set[int] = set(
             Notification.objects
-            .filter(type="ai", title=TITLE, created_at__gte=anti_spam_since)
+            .filter(type="ai", title=TITLE, created_at__date=today)
             .values_list("user_id", flat=True)
         )
 
-        # Group predicted reorders by user_id to bundle into one notification
-        pending: dict[int, list[dict]] = {}   # {user_id: [row, …]}
-
+        # Group qualifying (user, sku) rows for bundling
+        pending: dict[int, list[dict]] = {}
         for row in sku_patterns.iterator(chunk_size=500):
-            user_id: int = row["purchase__client__user_id"]
-            if user_id in alerted_user_ids:
+            uid: int = row["purchase__client__user_id"]
+            if uid in alerted_user_ids:
                 continue
-
-            span = (row["last_purchase"] - row["first_purchase"]).days
-            if span == 0:
-                continue  # Only bought on the same day twice — no interval
-
-            avg_interval = span / (row["purchase_count"] - 1)
-            predicted_next = row["last_purchase"] + timedelta(days=avg_interval)
-            days_until = (predicted_next - today).days
-
-            if not (-1 <= days_until <= SKU_REORDER_WINDOW_DAYS):
-                continue
-
-            pending.setdefault(user_id, []).append({**row, "days_until": days_until})
+            pending.setdefault(uid, []).append(row)
 
         if not pending:
             return 0
 
-        # Bulk-fetch users (single query)
+        # Bulk-fetch User objects — one query instead of one per user
         user_map: dict[int, User] = {
             u.pk: u
             for u in User.objects.filter(pk__in=pending.keys())
         }
 
         count = 0
-        for user_id, rows in pending.items():
-            user = user_map.get(user_id)
+        for uid, rows in pending.items():
+            user = user_map.get(uid)
             if user is None:
                 continue
 
-            # Cap and sort by urgency (days_until ascending)
-            rows.sort(key=lambda r: r["days_until"])
-            rows = rows[:SKU_MAX_PER_USER]
-
+            rows = rows[:SKU_MAX_PER_PUSH]
             company = rows[0]["purchase__client__company_name"]
+
             if len(rows) == 1:
-                row = rows[0]
-                title = TITLE
-                body = (
-                    f"По нашим данным, {row['name']} (SKU: {row['sku']}) "
-                    f"скоро закончится. Средний цикл закупки: "
-                    f"{(row['last_purchase'] - row['first_purchase']).days // (row['purchase_count'] - 1)} дней. "
-                    f"Пополните запасы заранее."
-                )
+                body = f"Пора заказать {rows[0]['name']}."
             else:
-                sku_list = ", ".join(r["sku"] for r in rows)
-                title = TITLE
-                body = (
-                    f"Несколько позиций скоро потребуют пополнения: {sku_list}. "
-                    f"Проверьте остатки и сделайте заявку."
-                )
+                names = ", ".join(r["name"] for r in rows)
+                body = f"Пора заказать: {names}."
 
             self.stdout.write(
-                f"  {company} | SKU(s): {', '.join(r['sku'] for r in rows)} "
-                f"| days_until: {[r['days_until'] for r in rows]}"
+                f"  {company} | "
+                f"SKU: {', '.join(r['sku'] for r in rows)} | "
+                f"last: {[str(r['last_purchase']) for r in rows]}"
             )
-
             self._notify(
                 user=user,
-                title=title,
+                title=TITLE,
                 body=body,
                 n_type="ai",
                 related_link="/purchases",
@@ -293,43 +283,42 @@ class Command(BaseCommand):
         return count
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Scenario 3 — Inactive regions
+    # Scenario 3 — Inactive regions  (management alert)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _run_inactive_regions(self, now, today: date, dry_run: bool) -> int:
         """
-        Alert the region's manager and the distributor's account user when
-        their territory shows no activity (no new registrations, no purchases)
-        in the past REGION_INACTIVE_DAYS days.
+        Alert the region's responsible manager (and distributor account, if
+        different) when the territory shows zero new-client registrations AND
+        zero purchases within REGION_INACTIVE_DAYS days.
 
-        ORM strategy
+        ORM approach
         ────────────
-        Two annotation-based subqueries build the "active region" exclusion
-        list in a single pass, avoiding a correlated subquery per region.
-        The anti-spam check per recipient is an Exists on the Notification
-        table (one query per Region × recipients, typically a very small N).
+        • Two value-list queries build the "active" exclusion set; their union
+          is subtracted in Python — avoids a complex UNION subquery.
+        • The inactive-region queryset then uses a single JOIN-based SELECT.
+        • Anti-spam filters on (user, title, body, date) so a manager who
+          oversees two inactive regions still receives one alert per region.
         """
         from api.models import ClientProfile, Notification, Region
 
         activity_since = now - timedelta(days=REGION_INACTIVE_DAYS)
-        anti_spam_since = now - timedelta(days=ANTI_SPAM_DAYS)
+        TITLE = "Падение активности"
 
-        # Regions that had a new client registration recently
-        regions_with_new_clients = (
-            Region.objects
-            .filter(clients__created_at__gte=activity_since)
-            .values_list("id", flat=True)
+        # Build exclusion set (regions that showed any activity)
+        active_ids: set[int] = (
+            set(
+                Region.objects
+                .filter(clients__created_at__gte=activity_since)
+                .values_list("id", flat=True)
+            )
+            |
+            set(
+                Region.objects
+                .filter(clients__purchases__created_at__gte=activity_since)
+                .values_list("id", flat=True)
+            )
         )
-
-        # Regions that had any purchase submission recently
-        regions_with_purchases = (
-            Region.objects
-            .filter(clients__purchases__created_at__gte=activity_since)
-            .values_list("id", flat=True)
-        )
-
-        # Union → set of IDs to exclude
-        active_ids = set(regions_with_new_clients) | set(regions_with_purchases)
 
         inactive_regions = (
             Region.objects
@@ -343,39 +332,30 @@ class Command(BaseCommand):
 
         count = 0
         for region in inactive_regions.iterator(chunk_size=50):
-            active_client_count = ClientProfile.objects.filter(
-                region=region, status="active"
-            ).count()
+            body = f"В регионе {region.name} нет продаж и регистраций 7 дней."
 
-            body = (
-                f"В регионе «{region.name}» нет новых регистраций или покупок "
-                f"за последние {REGION_INACTIVE_DAYS} дней "
-                f"(активных клиентов: {active_client_count}). "
-                f"Проверьте активность команды."
-            )
-            title = f"Низкая активность: {region.name}"
-
-            # Collect unique recipients (manager may be same person as distributor user)
-            recipient_ids: dict[int, User] = {}
+            # Unique recipients for this region (manager may be same as distributor user)
+            recipients: dict[int, User] = {}
             if region.manager:
-                recipient_ids[region.manager.pk] = region.manager
+                recipients[region.manager.pk] = region.manager
             if region.distributor and region.distributor.user:
-                recipient_ids.setdefault(region.distributor.user.pk, region.distributor.user)
+                recipients.setdefault(region.distributor.user.pk, region.distributor.user)
 
-            for user in recipient_ids.values():
-                already = Notification.objects.filter(
+            for user in recipients.values():
+                # Anti-spam includes body so each region generates an independent alert
+                if Notification.objects.filter(
                     user=user,
                     type="system",
-                    title=title,
-                    created_at__gte=anti_spam_since,
-                ).exists()
-                if already:
+                    title=TITLE,
+                    body=body,
+                    created_at__date=today,
+                ).exists():
                     continue
 
                 self.stdout.write(f"  Region: {region.name} → {user.username}")
                 self._notify(
                     user=user,
-                    title=title,
+                    title=TITLE,
                     body=body,
                     n_type="system",
                     related_link="/admin",
@@ -400,10 +380,11 @@ class Command(BaseCommand):
         dry_run: bool = False,
     ) -> None:
         """
-        Create a Notification row and send FCM push synchronously.
-        Synchronous FCM is intentional here: this runs as a cron process,
-        not inside an HTTP request, so blocking is acceptable and daemon
-        threads would exit prematurely when the process ends.
+        Create a Notification row then fire FCM synchronously.
+
+        FCM is called synchronously because this is a cron process: there is no
+        event loop to await, and daemon threads would be killed the moment the
+        management command process exits.  Blocking here is intentional.
         """
         if dry_run:
             self.stdout.write(
@@ -424,7 +405,7 @@ class Command(BaseCommand):
         try:
             result = PushNotificationService().send(notification)
             logger.info(
-                "digest_push | user=%s type=%s title=%r sent=%s failed=%s",
+                "digest_push | user=%s type=%s title=%r sent=%d failed=%d",
                 user.pk, n_type, title, result["sent"], result["failed"],
             )
         except Exception:
@@ -433,5 +414,8 @@ class Command(BaseCommand):
                 notification.pk, user.pk,
             )
             self.stderr.write(
-                self.style.ERROR(f"    FCM error for user={user.pk} — notification saved, push skipped")
+                self.style.ERROR(
+                    f"    FCM error for user={user.pk} — "
+                    f"Notification #{notification.pk} saved, push skipped"
+                )
             )

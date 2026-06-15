@@ -78,16 +78,11 @@ CORS_ALLOW_METHODS = [
     "POST",
     "PUT",
 ]
+from corsheaders.defaults import default_headers  # noqa: E402
+
 CORS_ALLOW_HEADERS = [
-    "accept",
-    "accept-encoding",
-    "authorization",
-    "content-type",
-    "dnt",
-    "origin",
-    "user-agent",
-    "x-csrftoken",
-    "x-requested-with",
+    *default_headers,
+    "x-integration-token",
 ]
 
 ROOT_URLCONF = "autoterra_backend.urls"

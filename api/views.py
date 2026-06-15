@@ -1818,11 +1818,11 @@ def erp_1c_exchange(request):
     token_str = request.GET.get("token") or request.headers.get("X-Integration-Token")
 
     if not token_str:
-        return HttpResponse("failure\nToken missing", content_type="text/plain")
+        return HttpResponse("failure\nToken missing", content_type="text/plain", status=401)
 
     token = IntegrationToken.objects.filter(token=token_str, is_active=True).select_related("distributor").first()
     if not token:
-        return HttpResponse("failure\nInvalid token", content_type="text/plain")
+        return HttpResponse("failure\nInvalid token", content_type="text/plain", status=401)
 
     distributor = token.distributor
 
@@ -1919,6 +1919,42 @@ def _process_cml_offers(filepath, distributor):
 
         if update_fields:
             Product.objects.filter(distributor=distributor, external_id=ext_id).update(**update_fields)
+
+@require_GET
+def distributor_integration_token(request):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    if is_admin or distributor is None:
+        return JsonResponse({"detail": "Используйте /api/admin/integration/tokens/ для администраторов"}, status=403)
+
+    token = IntegrationToken.objects.filter(distributor=distributor, is_active=True).first()
+    return JsonResponse({
+        "token": token.token if token else None,
+        "createdAt": token.created_at.isoformat() if token else None,
+    })
+
+
+@csrf_exempt
+@require_POST
+def distributor_integration_generate(request):
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    if is_admin or distributor is None:
+        return JsonResponse({"detail": "Используйте /api/admin/integration/generate/ для администраторов"}, status=403)
+
+    with transaction.atomic():
+        distributor.integration_tokens.all().update(is_active=False)
+        new_token = secrets.token_hex(32)
+        IntegrationToken.objects.create(
+            distributor=distributor,
+            token=new_token,
+            is_active=True,
+        )
+
+    return JsonResponse({"token": new_token})
+
 
 @require_GET
 def admin_integration_tokens(request):
