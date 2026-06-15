@@ -73,6 +73,7 @@ urlpatterns = [
     path("knowledge-cards/<int:card_id>/update/", views.update_knowledge_card),
     path("regions/", views.regions),
     path("distributors/", views.distributors),
+    path("debug/push/", views.push_diagnostics),
     path("notifications/", views.notifications),
     path("notifications/read/", views.mark_notifications_read),
     path("notifications/send/", views.send_notification),

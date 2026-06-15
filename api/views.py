@@ -379,7 +379,12 @@ def _format_client(client):
         "registrationSource": client.registration_source,
         "status": client.status,
         "partnerStatus": client.partner_status,
-        "totalPurchases": float(client.total_purchases),
+        "totalPurchases": float(
+            Purchase.objects
+            .filter(client=client, status="verified")
+            .aggregate(total=Sum("total_amount"))["total"]
+            or 0
+        ),
         "createdAt": client.created_at.isoformat(),
     }
 
@@ -2410,11 +2415,21 @@ def distributor_verify_purchase(request, purchase_id):
     purchase.status = status
     if status == "rejected" and reason:
         purchase.rejection_reason = reason
-    
+
     purchase.save()
-    
+
+    # Keep the cached total_purchases field in sync
+    client = purchase.client
+    verified_total = (
+        Purchase.objects
+        .filter(client=client, status="verified")
+        .aggregate(total=Sum("total_amount"))["total"]
+        or 0
+    )
+    ClientProfile.objects.filter(pk=client.pk).update(total_purchases=verified_total)
+
     _log_audit(request, f"Purchase status change: {old_status} -> {status}", purchase, {"reason": reason})
-    
+
     return JsonResponse({"purchase": _format_purchase(purchase)})
 
 
@@ -2872,6 +2887,66 @@ def send_notification(request):
     push_result = PushNotificationService().send(notification)
 
     return JsonResponse({"status": "ok", "push": push_result})
+
+
+@require_GET
+def push_diagnostics(request):
+    """
+    Admin-only: diagnose the full FCM push pipeline.
+
+    Returns:
+      - firebase_ok: whether Firebase Admin SDK initialises without error
+      - device_tokens: tokens registered for the calling user
+      - send_result: result of a live test push (if ?send=1 is passed)
+
+    Usage from PythonAnywhere bash:
+      curl -H "Authorization: Bearer <token>" \
+           "https://sigmaadil.pythonanywhere.com/api/debug/push/?send=1"
+    """
+    user = _current_user(request)
+    if user is None:
+        return JsonResponse({"detail": "Unauthorized"}, status=401)
+    profile = getattr(user, "profile", None)
+    if not (user.is_staff or user.is_superuser or (profile and profile.role in ("admin", "manager"))):
+        return JsonResponse({"detail": "Forbidden"}, status=403)
+
+    from api.models import UserDeviceToken, Notification
+    from api.services.push_notifications import PushNotificationService, _get_firebase_app
+
+    report: dict = {}
+
+    # 1. Firebase SDK init
+    try:
+        app = _get_firebase_app()
+        report["firebase_ok"] = True
+        report["firebase_app_name"] = app.name
+    except Exception as exc:
+        report["firebase_ok"] = False
+        report["firebase_error"] = str(exc)
+
+    # 2. Device tokens for this user
+    tokens = list(UserDeviceToken.objects.filter(user=user).values("token", "platform", "created_at"))
+    report["device_token_count"] = len(tokens)
+    report["device_tokens"] = [{"platform": t["platform"], "suffix": t["token"][-8:]} for t in tokens]
+
+    # 3. Optional live test push
+    if request.GET.get("send") == "1":
+        if not tokens:
+            report["send_result"] = "skipped — no device tokens registered for this user"
+        else:
+            try:
+                notification = Notification.objects.create(
+                    user=user,
+                    title="FCM диагностика",
+                    body="Если вы видите это — push работает корректно ✓",
+                    type="system",
+                )
+                result = PushNotificationService().send(notification)
+                report["send_result"] = result
+            except Exception as exc:
+                report["send_result"] = {"error": str(exc)}
+
+    return JsonResponse(report)
 
 
 @require_GET

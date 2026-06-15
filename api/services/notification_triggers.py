@@ -68,11 +68,21 @@ def _create_and_push(*, user, title: str, body: str, n_type: str, related_link: 
 
 
 def _dispatch_push(service, notification) -> None:
-    """Non-blocking FCM dispatch. Swap body for Celery when ready."""
+    """Non-blocking FCM dispatch. Swap body for Celery when ready.
+
+    Uses daemon=False so the thread is not killed when the HTTP response is
+    sent in uWSGI/PythonAnywhere worker processes.  The 30 s join timeout
+    prevents a stuck FCM call from blocking the WSGI process indefinitely.
+    """
 
     def _run() -> None:
         try:
-            service.send(notification)
+            result = service.send(notification)
+            logger.info(
+                "FCM push ok | notification_id=%s user_id=%s sent=%s failed=%s",
+                notification.pk, notification.user_id,
+                result.get("sent"), result.get("failed"),
+            )
         except Exception:
             logger.exception(
                 "FCM push failed | notification_id=%s user_id=%s",
@@ -80,7 +90,8 @@ def _dispatch_push(service, notification) -> None:
                 notification.user_id,
             )
 
-    threading.Thread(target=_run, daemon=True).start()
+    t = threading.Thread(target=_run, daemon=False)
+    t.start()
 
 
 # ── Public trigger functions ──────────────────────────────────────────────────

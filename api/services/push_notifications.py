@@ -10,16 +10,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_firebase_app = None
-
-
 def _get_firebase_app() -> firebase_admin.App:
-    """Lazily initialise the Firebase Admin SDK singleton."""
-    global _firebase_app
-    if _firebase_app is None:
+    """Return the Firebase Admin SDK app, initialising it exactly once per process.
+
+    Uses get_app() first to handle:
+    - uWSGI worker restarts where the process-global `_firebase_app` var is
+      reset but the SDK's internal registry still has the default app.
+    - Concurrent first-requests that race on initialisation.
+    """
+    try:
+        return firebase_admin.get_app()
+    except ValueError:
         cred = credentials.Certificate(settings.FCM_SERVICE_ACCOUNT_FILE)
-        _firebase_app = firebase_admin.initialize_app(cred)
-    return _firebase_app
+        return firebase_admin.initialize_app(cred)
 
 
 class PushNotificationService:
