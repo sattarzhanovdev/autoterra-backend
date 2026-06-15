@@ -18,10 +18,12 @@ from .models import (
     AuthToken,
     ClientProfile,
     ColorRequest,
+    ContactHistory,
     CourierTask,
     Distributor,
     ExpertTicket,
     KnowledgeCard,
+    ManagerTask,
     Notification,
     Order,
     OrderItem,
@@ -606,3 +608,7 @@ class AttachmentAdmin(admin.ModelAdmin):
     list_filter = ("file_type", "content_type", "uploaded_at")
     search_fields = ("file", "description", "uploaded_by__username", "uploaded_by__email")
     readonly_fields = ("uploaded_at",)
+
+
+admin.site.register(ManagerTask)
+admin.site.register(ContactHistory)

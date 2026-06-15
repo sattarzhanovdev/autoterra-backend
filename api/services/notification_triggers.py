@@ -18,7 +18,6 @@ No other code needs to change.
 """
 
 import logging
-import threading
 
 logger = logging.getLogger(__name__)
 
@@ -68,30 +67,25 @@ def _create_and_push(*, user, title: str, body: str, n_type: str, related_link: 
 
 
 def _dispatch_push(service, notification) -> None:
-    """Non-blocking FCM dispatch. Swap body for Celery when ready.
+    """FCM dispatch — synchronous for PythonAnywhere debugging.
 
-    Uses daemon=False so the thread is not killed when the HTTP response is
-    sent in uWSGI/PythonAnywhere worker processes.  The 30 s join timeout
-    prevents a stuck FCM call from blocking the WSGI process indefinitely.
+    TEMPORARY: runs synchronously so connection errors surface immediately
+    in the PythonAnywhere error log with a full traceback.
+    Restore the threading version once outbound FCM connectivity is confirmed.
     """
-
-    def _run() -> None:
-        try:
-            result = service.send(notification)
-            logger.info(
-                "FCM push ok | notification_id=%s user_id=%s sent=%s failed=%s",
-                notification.pk, notification.user_id,
-                result.get("sent"), result.get("failed"),
-            )
-        except Exception:
-            logger.exception(
-                "FCM push failed | notification_id=%s user_id=%s",
-                notification.pk,
-                notification.user_id,
-            )
-
-    t = threading.Thread(target=_run, daemon=False)
-    t.start()
+    try:
+        result = service.send(notification)
+        logger.info(
+            "FCM push ok | notification_id=%s user_id=%s sent=%s failed=%s",
+            notification.pk, notification.user_id,
+            result.get("sent"), result.get("failed"),
+        )
+    except Exception:
+        logger.exception(
+            "FCM push failed | notification_id=%s user_id=%s",
+            notification.pk,
+            notification.user_id,
+        )
 
 
 # ── Public trigger functions ──────────────────────────────────────────────────

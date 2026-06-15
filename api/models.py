@@ -903,6 +903,72 @@ class KnowledgeCard(models.Model):
         return self.problem or self.title
 
 
+class ManagerTask(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Ожидает'),
+        ('completed', 'Выполнено'),
+    ]
+    client = models.ForeignKey(
+        ClientProfile,
+        on_delete=models.CASCADE,
+        related_name='manager_tasks',
+        verbose_name='Клиент',
+    )
+    manager = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='manager_tasks',
+        verbose_name='Менеджер',
+    )
+    text = models.TextField('Задача')
+    deadline = models.DateField('Дедлайн', null=True, blank=True)
+    status = models.CharField('Статус', max_length=16, choices=STATUS_CHOICES, default='pending')
+    comment = models.TextField('Комментарий', blank=True)
+    created_at = models.DateTimeField('Создана', auto_now_add=True)
+    updated_at = models.DateTimeField('Обновлена', auto_now=True)
+
+    class Meta:
+        verbose_name = 'Задача менеджера'
+        verbose_name_plural = 'Задачи менеджера'
+        ordering = ('deadline', '-created_at')
+
+    def __str__(self):
+        return f"{self.client.company_name}: {self.text[:50]}"
+
+
+class ContactHistory(models.Model):
+    CONTACT_TYPES = [
+        ('call', 'Звонок'),
+        ('visit', 'Визит'),
+        ('email', 'Email'),
+        ('other', 'Другое'),
+    ]
+    client = models.ForeignKey(
+        ClientProfile,
+        on_delete=models.CASCADE,
+        related_name='contact_history',
+        verbose_name='Клиент',
+    )
+    manager = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='contact_history_entries',
+        verbose_name='Менеджер',
+    )
+    contact_type = models.CharField('Тип', max_length=16, choices=CONTACT_TYPES, default='call')
+    result = models.TextField('Результат')
+    date = models.DateTimeField('Дата контакта')
+    created_at = models.DateTimeField('Создана', auto_now_add=True)
+
+    class Meta:
+        verbose_name = 'История контакта'
+        verbose_name_plural = 'История контактов'
+        ordering = ('-date',)
+
+    def __str__(self):
+        return f"{self.client.company_name} · {self.get_contact_type_display()} · {self.date:%d.%m.%Y}"
+
+
 @receiver(post_save, sender=ClientProfile)
 def sync_client_distributor_data(sender, instance, **kwargs):
     """

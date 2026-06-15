@@ -44,6 +44,8 @@ from .models import (
     Store,
     IntegrationToken,
     SyncLog,
+    ManagerTask,
+    ContactHistory,
 )
 from .serializers import RegistrationSerializer, PurchaseSerializer
 
@@ -1499,6 +1501,39 @@ def _filter_by_manager_scope(user, is_global, qs, region_path="region"):
     if regions is None:
         return qs
     return qs.filter(**{f"{region_path}__in": regions})
+
+
+def _format_manager_client(client):
+    base = _format_client(client)
+    base['distributorName'] = client.distributor.name if client.distributor else None
+    base['regionId'] = str(client.region_id) if client.region_id else None
+    return base
+
+
+def _format_manager_task(task):
+    return {
+        'id': str(task.id),
+        'clientId': str(task.client_id),
+        'clientName': task.client.company_name,
+        'text': task.text,
+        'deadline': task.deadline.isoformat() if task.deadline else None,
+        'status': task.status,
+        'comment': task.comment,
+        'createdAt': task.created_at.isoformat(),
+    }
+
+
+def _format_contact_history(entry):
+    return {
+        'id': str(entry.id),
+        'clientId': str(entry.client_id),
+        'type': entry.contact_type,
+        'typeDisplay': entry.get_contact_type_display(),
+        'result': entry.result,
+        'date': entry.date.isoformat(),
+        'authorId': str(entry.manager_id),
+        'authorName': entry.manager.get_full_name() or entry.manager.username,
+    }
 
 
 @require_GET
@@ -2994,15 +3029,106 @@ def mark_notifications_read(request):
     return JsonResponse({"ok": True})
 
 
-@require_GET
+@csrf_exempt
 def manager_clients(request):
-    user, is_global, err = _require_manager_scope(request)
-    if err:
-        return err
-    qs = ClientProfile.objects.all().select_related("region", "distributor")
-    qs = _filter_by_manager_scope(user, is_global, qs)
-    qs = _paginate(request, qs)
-    return JsonResponse({"results": [_format_client(c) for c in qs]})
+    if request.method == 'GET':
+        user, is_global, err = _require_manager_scope(request)
+        if err:
+            return err
+
+        qs = ClientProfile.objects.all().select_related('region', 'distributor')
+        qs = _filter_by_manager_scope(user, is_global, qs)
+
+        status_filter = request.GET.get('status')
+        category_filter = request.GET.get('category')
+        region_filter = request.GET.get('region')
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        if category_filter:
+            qs = qs.filter(category=category_filter.lower())
+        if region_filter:
+            qs = qs.filter(region_id=region_filter)
+
+        return JsonResponse({'results': [_format_manager_client(c) for c in qs]})
+
+    if request.method == 'POST':
+        user, is_global, err = _require_manager_scope(request)
+        if err:
+            return err
+
+        try:
+            data = json.loads(request.body)
+        except json.JSONDecodeError:
+            return JsonResponse({'detail': 'Invalid JSON'}, status=400)
+
+        inn = data.get('inn', '').strip()
+        if not inn or not inn.isdigit() or len(inn) not in (10, 12):
+            return JsonResponse({'detail': 'ИНН должен содержать 10 или 12 цифр'}, status=400)
+
+        company_name = data.get('name', '').strip()
+        if not company_name:
+            return JsonResponse({'detail': 'Название обязательно'}, status=400)
+
+        region_id = data.get('regionId')
+        if not region_id:
+            return JsonResponse({'detail': 'Регион обязателен'}, status=400)
+
+        try:
+            region = Region.objects.get(id=region_id)
+        except Region.DoesNotExist:
+            return JsonResponse({'detail': 'Регион не найден'}, status=404)
+
+        if ClientProfile.objects.filter(inn=inn, region=region).exists():
+            return JsonResponse(
+                {'detail': f'Клиент с ИНН {inn} уже зарегистрирован в регионе {region.name}'},
+                status=409,
+            )
+
+        phone = data.get('phone', '').strip()
+        category = data.get('category', 'b').lower()
+        city = data.get('city', '').strip()
+        contact_name = data.get('contact', '').strip() or company_name
+
+        # Build a unique username from INN + region code
+        base_username = f"client_{inn}_{region.code or region_id}"
+        username = base_username
+        suffix = 1
+        while User.objects.filter(username=username).exists():
+            username = f"{base_username}_{suffix}"
+            suffix += 1
+
+        try:
+            with transaction.atomic():
+                user_account = User.objects.create_user(
+                    username=username,
+                    password=User.objects.make_random_password(),
+                    first_name=company_name[:30],
+                )
+                Profile.objects.filter(user=user_account).update(role='client')
+
+                client = ClientProfile(
+                    user=user_account,
+                    inn=inn,
+                    company_name=company_name,
+                    category=category,
+                    region=region,
+                    city=city,
+                    contact_name=contact_name,
+                    phone=phone,
+                    manager=user,
+                    registration_source='manager',
+                    status='new',
+                )
+                # Use save() so auto-assign-distributor logic runs
+                client.save()
+        except IntegrityError as exc:
+            return JsonResponse({'detail': f'Ошибка: {exc}'}, status=409)
+        except Exception as exc:
+            return JsonResponse({'detail': str(exc)}, status=400)
+
+        return JsonResponse({'client': _format_manager_client(client)}, status=201)
+
+    return JsonResponse({'detail': 'Method not allowed'}, status=405)
 
 
 @require_GET
@@ -3044,6 +3170,164 @@ def manager_client_unified(request, client_id):
         "tickets": tickets,
         "referrals": referrals,
     })
+
+
+@csrf_exempt
+@require_http_methods(['PUT', 'PATCH'])
+def manager_client_status(request, client_id):
+    user, is_global, err = _require_manager_scope(request)
+    if err:
+        return err
+
+    client = get_object_or_404(ClientProfile.objects.select_related('region', 'distributor'), id=client_id)
+
+    managed_regions = _get_manager_regions(user, is_global)
+    if managed_regions is not None and client.region not in managed_regions:
+        return JsonResponse({'detail': 'Доступ запрещён'}, status=403)
+
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({'detail': 'Invalid JSON'}, status=400)
+
+    new_status = data.get('status')
+    valid_statuses = [s[0] for s in ClientProfile.STATUS_CHOICES]
+    if new_status not in valid_statuses:
+        return JsonResponse({'detail': f'Недопустимый статус. Допустимые: {valid_statuses}'}, status=400)
+
+    client.status = new_status
+    if new_status == 'active' and not client.distributor and client.region and client.region.distributor:
+        client.distributor = client.region.distributor
+
+    client.save(update_fields=['status', 'distributor'])
+    return JsonResponse({'client': _format_manager_client(client)})
+
+
+@csrf_exempt
+def manager_client_history(request, client_id):
+    user, is_global, err = _require_manager_scope(request)
+    if err:
+        return err
+
+    client = get_object_or_404(ClientProfile.objects.select_related('region'), id=client_id)
+
+    managed_regions = _get_manager_regions(user, is_global)
+    if managed_regions is not None and client.region not in managed_regions:
+        return JsonResponse({'detail': 'Доступ запрещён'}, status=403)
+
+    if request.method == 'GET':
+        entries = client.contact_history.select_related('manager').order_by('-date')
+        return JsonResponse({'results': [_format_contact_history(e) for e in entries]})
+
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+        except json.JSONDecodeError:
+            return JsonResponse({'detail': 'Invalid JSON'}, status=400)
+
+        result_text = data.get('result', '').strip()
+        if not result_text:
+            return JsonResponse({'detail': 'Результат обязателен'}, status=400)
+
+        contact_type = data.get('type', 'call')
+        valid_types = [t[0] for t in ContactHistory.CONTACT_TYPES]
+        if contact_type not in valid_types:
+            contact_type = 'call'
+
+        entry = ContactHistory.objects.create(
+            client=client,
+            manager=user,
+            contact_type=contact_type,
+            result=result_text,
+            date=timezone.now(),
+        )
+        return JsonResponse({'entry': _format_contact_history(entry)}, status=201)
+
+    return JsonResponse({'detail': 'Method not allowed'}, status=405)
+
+
+@csrf_exempt
+def manager_tasks(request):
+    user, is_global, err = _require_manager_scope(request)
+    if err:
+        return err
+
+    if request.method == 'GET':
+        qs = ManagerTask.objects.select_related('client').filter(manager=user)
+        status_filter = request.GET.get('status')
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        return JsonResponse({'results': [_format_manager_task(t) for t in qs]})
+
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+        except json.JSONDecodeError:
+            return JsonResponse({'detail': 'Invalid JSON'}, status=400)
+
+        text = data.get('text', '').strip()
+        if not text:
+            return JsonResponse({'detail': 'Текст задачи обязателен'}, status=400)
+
+        client_id = data.get('clientId')
+        client = get_object_or_404(ClientProfile, id=client_id)
+
+        deadline = None
+        deadline_str = data.get('deadline')
+        if deadline_str:
+            try:
+                deadline = datetime.strptime(deadline_str, '%Y-%m-%d').date()
+            except ValueError:
+                pass
+
+        task = ManagerTask.objects.create(
+            client=client,
+            manager=user,
+            text=text,
+            deadline=deadline,
+            comment=data.get('comment', ''),
+        )
+        return JsonResponse({'task': _format_manager_task(task)}, status=201)
+
+    return JsonResponse({'detail': 'Method not allowed'}, status=405)
+
+
+@csrf_exempt
+@require_http_methods(['PUT', 'PATCH'])
+def manager_update_task(request, task_id):
+    user, is_global, err = _require_manager_scope(request)
+    if err:
+        return err
+
+    task = get_object_or_404(ManagerTask, id=task_id, manager=user)
+
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({'detail': 'Invalid JSON'}, status=400)
+
+    update_fields = []
+    if 'status' in data and data['status'] in ('pending', 'completed'):
+        task.status = data['status']
+        update_fields.append('status')
+    if 'comment' in data:
+        task.comment = data['comment']
+        update_fields.append('comment')
+    if 'text' in data:
+        task.text = data['text']
+        update_fields.append('text')
+    if 'deadline' in data:
+        try:
+            task.deadline = datetime.strptime(data['deadline'], '%Y-%m-%d').date() if data['deadline'] else None
+        except ValueError:
+            pass
+        update_fields.append('deadline')
+
+    if update_fields:
+        update_fields.append('updated_at')
+        task.save(update_fields=update_fields)
+
+    return JsonResponse({'task': _format_manager_task(task)})
 
 
 def _normalize_words(text):
