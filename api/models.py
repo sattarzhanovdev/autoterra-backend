@@ -720,16 +720,7 @@ class Referral(models.Model):
             self.gift = "Сертификат на 5000 ₽"
             updates.append("condition_met")
             updates.append("gift")
-            
-            # Notify inviter
-            Notification.objects.create(
-                user=self.inviter.user,
-                client=self.inviter,
-                title="Бонус начислен!",
-                body=f"Ваша рекомендация {self.invitee_name} совершила покупки на сумму более 30 000 ₽. Вам начислен подарок!",
-                type="referral",
-                related_link="/referral"
-            )
+            # Notification + FCM push are sent via api.signals._referral_post_save
 
         if updates:
             self.save(update_fields=updates)
