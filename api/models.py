@@ -910,9 +910,11 @@ class ManagerTask(models.Model):
     ]
     client = models.ForeignKey(
         ClientProfile,
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
         related_name='manager_tasks',
         verbose_name='Клиент',
+        null=True,
+        blank=True,
     )
     manager = models.ForeignKey(
         User,

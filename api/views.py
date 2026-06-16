@@ -1515,8 +1515,8 @@ def _format_manager_client(client):
 def _format_manager_task(task):
     return {
         'id': str(task.id),
-        'clientId': str(task.client_id),
-        'clientName': task.client.company_name,
+        'clientId': str(task.client_id) if task.client_id else None,
+        'clientName': task.client.company_name if task.client_id else '',
         'managerId': str(task.manager_id),
         'managerName': task.manager.get_full_name() or task.manager.username,
         'text': task.text,
@@ -3524,10 +3524,10 @@ def admin_manager_tasks(request):
         except User.DoesNotExist:
             return JsonResponse({'detail': 'Менеджер не найден'}, status=404)
 
+        client = None
         client_id = data.get('clientId')
-        if not client_id:
-            return JsonResponse({'detail': 'Клиент обязателен'}, status=400)
-        client = get_object_or_404(ClientProfile, id=client_id)
+        if client_id:
+            client = get_object_or_404(ClientProfile, id=client_id)
 
         deadline = None
         deadline_str = data.get('deadline')
