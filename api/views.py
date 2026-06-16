@@ -17,7 +17,9 @@ from django.db import models, transaction
 from django.db.utils import IntegrityError
 from django.db.models import Q, Sum, F
 from django.http import JsonResponse, HttpResponse
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.utils.crypto import get_random_string
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
@@ -1515,6 +1517,8 @@ def _format_manager_task(task):
         'id': str(task.id),
         'clientId': str(task.client_id),
         'clientName': task.client.company_name,
+        'managerId': str(task.manager_id),
+        'managerName': task.manager.get_full_name() or task.manager.username,
         'text': task.text,
         'deadline': task.deadline.isoformat() if task.deadline else None,
         'status': task.status,
@@ -3111,7 +3115,7 @@ def manager_clients(request):
             with transaction.atomic():
                 user_account = User.objects.create_user(
                     username=username,
-                    password=User.objects.make_random_password(),
+                    password=get_random_string(16),
                     first_name=company_name[:30],
                     email=email,
                 )
@@ -3187,7 +3191,7 @@ def manager_client_unified(request, client_id):
 
 
 @csrf_exempt
-@require_http_methods(['PUT', 'PATCH'])
+@require_http_methods(['POST', 'PUT', 'PATCH'])
 def manager_client_status(request, client_id):
     user, is_global, err = _require_manager_scope(request)
     if err:
@@ -3307,7 +3311,7 @@ def manager_tasks(request):
 
 
 @csrf_exempt
-@require_http_methods(['PUT', 'PATCH'])
+@require_http_methods(['POST', 'PUT', 'PATCH'])
 def manager_update_task(request, task_id):
     user, is_global, err = _require_manager_scope(request)
     if err:
@@ -3459,6 +3463,122 @@ def ai_chat(request):
         "answer": "Недостаточно данных в базе знаний для точного ответа. Перевожу на эксперта. Пожалуйста, создайте тикет с описанием проблемы и фото.",
         "suggestEscalation": True
     })
+
+
+@csrf_exempt
+def admin_managers(request):
+    """GET — list all users with manager role (for admin task assignment)."""
+    user = _current_user(request)
+    if user is None or not (getattr(getattr(user, 'profile', None), 'role', None) in ('admin',) or user.is_staff or user.is_superuser):
+        return JsonResponse({'detail': 'Нет доступа'}, status=403)
+
+    if request.method != 'GET':
+        return JsonResponse({'detail': 'Method not allowed'}, status=405)
+
+    from .models import Profile
+    managers = User.objects.filter(profile__role='manager').select_related('profile').order_by('username')
+    results = [
+        {
+            'id': str(u.id),
+            'username': u.username,
+            'name': u.get_full_name() or u.username,
+            'regions': [r.name for r in u.managed_regions.all()],
+        }
+        for u in managers
+    ]
+    return JsonResponse({'results': results})
+
+
+@csrf_exempt
+def admin_manager_tasks(request):
+    """GET — list all manager tasks. POST — create a task for a specific manager."""
+    user = _current_user(request)
+    if user is None or not (getattr(getattr(user, 'profile', None), 'role', None) in ('admin',) or user.is_staff or user.is_superuser):
+        return JsonResponse({'detail': 'Нет доступа'}, status=403)
+
+    if request.method == 'GET':
+        qs = ManagerTask.objects.select_related('client', 'manager').order_by('-created_at')
+        manager_id = request.GET.get('managerId')
+        if manager_id:
+            qs = qs.filter(manager_id=manager_id)
+        status_filter = request.GET.get('status')
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        return JsonResponse({'results': [_format_manager_task(t) for t in qs]})
+
+    if request.method == 'POST':
+        try:
+            data = json.loads(request.body)
+        except json.JSONDecodeError:
+            return JsonResponse({'detail': 'Invalid JSON'}, status=400)
+
+        text = data.get('text', '').strip()
+        if not text:
+            return JsonResponse({'detail': 'Текст задачи обязателен'}, status=400)
+
+        manager_id = data.get('managerId')
+        if not manager_id:
+            return JsonResponse({'detail': 'Менеджер обязателен'}, status=400)
+        try:
+            manager = User.objects.get(id=manager_id)
+        except User.DoesNotExist:
+            return JsonResponse({'detail': 'Менеджер не найден'}, status=404)
+
+        client_id = data.get('clientId')
+        if not client_id:
+            return JsonResponse({'detail': 'Клиент обязателен'}, status=400)
+        client = get_object_or_404(ClientProfile, id=client_id)
+
+        deadline = None
+        deadline_str = data.get('deadline')
+        if deadline_str:
+            try:
+                deadline = datetime.strptime(deadline_str, '%Y-%m-%d').date()
+            except ValueError:
+                pass
+
+        task = ManagerTask.objects.create(
+            client=client,
+            manager=manager,
+            text=text,
+            deadline=deadline,
+            comment=data.get('comment', ''),
+        )
+        return JsonResponse({'task': _format_manager_task(task)}, status=201)
+
+    return JsonResponse({'detail': 'Method not allowed'}, status=405)
+
+
+@csrf_exempt
+def admin_manager_task_detail(request, task_id):
+    """DELETE — remove a task (admin only)."""
+    user = _current_user(request)
+    if user is None or not (getattr(getattr(user, 'profile', None), 'role', None) in ('admin',) or user.is_staff or user.is_superuser):
+        return JsonResponse({'detail': 'Нет доступа'}, status=403)
+
+    task = get_object_or_404(ManagerTask.objects.select_related('client', 'manager'), id=task_id)
+
+    if request.method == 'DELETE':
+        task.delete()
+        return JsonResponse({'detail': 'Удалено'})
+
+    return JsonResponse({'detail': 'Method not allowed'}, status=405)
+
+
+@csrf_exempt
+def admin_manager_clients(request, manager_id):
+    """GET — list clients accessible to a specific manager."""
+    user = _current_user(request)
+    if user is None or not (getattr(getattr(user, 'profile', None), 'role', None) in ('admin',) or user.is_staff or user.is_superuser):
+        return JsonResponse({'detail': 'Нет доступа'}, status=403)
+    if request.method != 'GET':
+        return JsonResponse({'detail': 'Method not allowed'}, status=405)
+    manager = get_object_or_404(User, id=manager_id)
+    is_global = not manager.managed_regions.exists()
+    qs = ClientProfile.objects.all().select_related('region', 'distributor')
+    qs = _filter_by_manager_scope(manager, is_global, qs)
+    results = [{'id': str(c.id), 'name': c.company_name} for c in qs]
+    return JsonResponse({'results': results})
 
 
 def _auto_create_ticket(client, question, category):

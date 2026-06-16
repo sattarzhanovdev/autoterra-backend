@@ -67,8 +67,14 @@ CORS_ALLOWED_ORIGINS = [
     "http://89.111.132.221:8000",
     "https://autoterra.ru",
     "http://localhost:38913",
-    "http://localhost:38913",
+    # Flutter web dev server
+    "http://localhost:5000",
+    "http://127.0.0.1:5000",
+    "http://localhost:8081",
+    "http://localhost:8082",
+    "http://localhost:9090",
 ]
+CORS_ALLOW_ALL_ORIGINS = DEBUG  # wildcard only when DEBUG=True (local dev)
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_METHODS = [
     "DELETE",
