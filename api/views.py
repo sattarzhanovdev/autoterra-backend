@@ -2022,9 +2022,20 @@ def distributor_integration_token(request):
         return JsonResponse({"detail": "Используйте /api/admin/integration/tokens/ для администраторов"}, status=403)
 
     token = IntegrationToken.objects.filter(distributor=distributor, is_active=True).first()
+    recent_logs = SyncLog.objects.filter(distributor=distributor).order_by("-created_at")[:20]
     return JsonResponse({
         "token": token.token if token else None,
         "createdAt": token.created_at.isoformat() if token else None,
+        "logs": [
+            {
+                "id": log.id,
+                "type": log.sync_type,
+                "status": log.status,
+                "details": log.details,
+                "createdAt": log.created_at.isoformat(),
+            }
+            for log in recent_logs
+        ],
     })
 
 
