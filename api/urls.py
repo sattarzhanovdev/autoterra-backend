@@ -14,6 +14,7 @@ urlpatterns = [
     path("auth/me/", views.me),
     path("dashboard/", views.dashboard),
     path("stores/", views.stores),
+    path("stores/<int:store_id>/", views.store_detail),
     path("products/", views.products),
     path("order-config/", views.order_config),
     path("orders/", views.orders),

@@ -959,13 +959,62 @@ def dashboard(request):
     })
 
 
-@require_GET
+@csrf_exempt
 def stores(request):
     client, err = _require_client(request)
     if err:
         return err
-    qs = client.stores.filter(is_active=True)
-    return JsonResponse({"results": [_format_store(item) for item in qs]})
+
+    if request.method == "GET":
+        qs = client.stores.filter(is_active=True)
+        return JsonResponse({"results": [_format_store(item) for item in qs]})
+
+    if request.method == "POST":
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"detail": "Неверный JSON"}, status=400)
+        name = (body.get("name") or "").strip()
+        address = (body.get("address") or "").strip()
+        if not name:
+            return JsonResponse({"detail": "Название обязательно"}, status=400)
+        if not address:
+            return JsonResponse({"detail": "Адрес обязателен"}, status=400)
+        store = Store.objects.create(client=client, name=name, address=address)
+        return JsonResponse({"store": _format_store(store)}, status=201)
+
+    return JsonResponse({"detail": "Method not allowed"}, status=405)
+
+
+@csrf_exempt
+def store_detail(request, store_id):
+    client, err = _require_client(request)
+    if err:
+        return err
+    store = get_object_or_404(Store, id=store_id, client=client)
+
+    if request.method in ("PUT", "PATCH"):
+        try:
+            body = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse({"detail": "Неверный JSON"}, status=400)
+        name = (body.get("name") or "").strip()
+        address = (body.get("address") or "").strip()
+        if not name:
+            return JsonResponse({"detail": "Название обязательно"}, status=400)
+        if not address:
+            return JsonResponse({"detail": "Адрес обязателен"}, status=400)
+        store.name = name
+        store.address = address
+        store.save(update_fields=["name", "address"])
+        return JsonResponse({"store": _format_store(store)})
+
+    if request.method == "DELETE":
+        store.is_active = False
+        store.save(update_fields=["is_active"])
+        return JsonResponse({"ok": True})
+
+    return JsonResponse({"detail": "Method not allowed"}, status=405)
 
 
 @require_GET
