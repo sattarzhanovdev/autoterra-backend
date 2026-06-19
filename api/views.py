@@ -352,7 +352,10 @@ def _upload_error(file_obj):
     content_type = (getattr(file_obj, "content_type", "") or "").lower()
     if extension not in ALLOWED_UPLOAD_EXTENSIONS:
         return JsonResponse({"detail": "Недопустимый тип файла", "code": "invalid_file_type"}, status=400)
-    if content_type and content_type not in ALLOWED_UPLOAD_CONTENT_TYPES:
+    # Mobile clients often send a missing or generic content type (octet-stream) even
+    # for valid JPG/PDF uploads. The extension is already validated above, so only
+    # reject when the client sent a specific, disallowed content type.
+    if content_type and content_type not in ALLOWED_UPLOAD_CONTENT_TYPES and content_type != "application/octet-stream":
         return JsonResponse({"detail": "Недопустимый тип файла", "code": "invalid_file_type"}, status=400)
     if getattr(file_obj, "size", 0) > MAX_UPLOAD_SIZE:
         return JsonResponse({"detail": "Файл больше 10 МБ", "code": "file_too_large"}, status=400)
@@ -1267,7 +1270,11 @@ def create_purchase(request):
                 price=_money_value(raw.get("price"))
             )
         
-        _create_attachments(request, purchase, files, description="Документ к покупке")
+        _, attach_error = _create_attachments(request, purchase, files, description="Документ к покупке")
+        if attach_error:
+            # Don't keep a purchase whose proof-of-payment failed to upload.
+            transaction.set_rollback(True)
+            return attach_error
 
     _notify(
         getattr(client.distributor, "user", None),
