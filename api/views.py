@@ -1334,6 +1334,7 @@ def update_color_request(request, request_id):
     payload = _json(request)
     color_request.car_brand = payload.get("carBrand", color_request.car_brand)
     color_request.car_model = payload.get("carModel", color_request.car_model)
+    color_request.car_year = (payload.get("carYear", color_request.car_year) or "").strip()[:4]
     color_request.vin = payload.get("vin", color_request.vin)
     color_request.color_code = payload.get("colorCode", color_request.color_code)
     color_request.color_name = payload.get("colorName", color_request.color_name)
@@ -1342,7 +1343,11 @@ def update_color_request(request, request_id):
     color_request.contact_phone = payload.get("contactPhone", color_request.contact_phone)
     color_request.comment = payload.get("comment", color_request.comment)
     color_request.transfer_method = payload.get("transferMethod", color_request.transfer_method)
-    
+    if "urgent" in payload:
+        color_request.urgent = _bool(payload.get("urgent"))
+    if "pickupTime" in payload:
+        color_request.pickup_time = _dt(payload.get("pickupTime"))
+
     color_request.save()
     return JsonResponse({"request": _format_color_request(color_request)})
 
