@@ -50,7 +50,7 @@ from .models import (
     ManagerTask,
     ContactHistory,
 )
-from .serializers import RegistrationSerializer, PurchaseSerializer
+from .serializers import RegistrationSerializer, PurchaseSerializer, coerce_decimal
 
 try:
     import certifi
@@ -297,10 +297,13 @@ def _scope_products(distributor, is_admin):
 
 
 def _money_value(value):
-    try:
-        return Decimal(str(value or "0").replace(" ", "").replace(",", "."))
-    except (InvalidOperation, ValueError, TypeError):
-        return None
+    # Normalise common input quirks (spaces as thousands separators, comma decimals)
+    # then bound the result to the DecimalField(max_digits=12, decimal_places=2) used by
+    # Product.price / PurchaseItem.price. Falls back to 0 so an invalid or oversized
+    # value can never be stored and later crash the SQLite decimal converter on read.
+    cleaned = str(value or "0").replace(" ", "").replace(",", ".")
+    coerced = coerce_decimal(cleaned, max_digits=12, decimal_places=2)
+    return coerced if coerced is not None and coerced >= 0 else Decimal("0")
 
 
 def _parse_items(value):
