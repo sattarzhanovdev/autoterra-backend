@@ -1,4 +1,5 @@
 import json
+import logging
 import secrets
 import ssl
 import urllib.error
@@ -55,6 +56,36 @@ try:
     import certifi
 except ImportError:
     certifi = None
+
+
+logger = logging.getLogger(__name__)
+
+
+def _notify(user, title, body, n_type="info", link=""):
+    """Create a Notification for ``user`` and best-effort send a push.
+
+    Never raises — notification/push failures must not break the request that
+    triggered them (order/purchase/delivery/color-request creation).
+    """
+    if user is None:
+        return None
+    try:
+        notification = Notification.objects.create(
+            user=user,
+            title=title,
+            body=body,
+            type=n_type,
+            related_link=link,
+        )
+    except Exception:
+        logger.exception("Failed to create notification for user %s", getattr(user, "id", None))
+        return None
+    try:
+        from api.services.push_notifications import PushNotificationService
+        PushNotificationService().send(notification)
+    except Exception:
+        logger.exception("Failed to send push for notification %s", notification.pk)
+    return notification
 
 
 MAX_UPLOAD_SIZE = 10 * 1024 * 1024
@@ -1122,6 +1153,14 @@ def create_order(request):
                     if product.status != "onOrder":
                         product.status = "outOfStock"
                 product.save(update_fields=["quantity", "status"])
+
+    _notify(
+        getattr(client.distributor, "user", None),
+        "Новый заказ",
+        f"{client.company_name}: новый заказ ({order.items.count()} поз.)",
+        "order",
+        link="/distributor",
+    )
     return JsonResponse({"order": _format_order(order)}, status=201)
 
 
@@ -1226,7 +1265,14 @@ def create_purchase(request):
             )
         
         _create_attachments(request, purchase, files, description="Документ к покупке")
-            
+
+    _notify(
+        getattr(client.distributor, "user", None),
+        "Новая покупка на проверку",
+        f"{client.company_name}: покупка {purchase.document_number} на {purchase.total_amount} ₽",
+        "action_required",
+        link="/distributor",
+    )
     return JsonResponse({"purchase": _format_purchase(purchase)}, status=201)
 
 
@@ -1334,6 +1380,13 @@ def create_color_request(request):
             _append_color_history(item, "created", _current_user(request), "Заявка создана")
             item.save(update_fields=["sla_deadline", "status_history"])
             _create_attachments(request, item, files, description="Фото для Color Lab")
+        _notify(
+            getattr(client.distributor, "user", None),
+            "Новая заявка на подбор цвета",
+            f"{client.company_name}: {item.car_brand} {item.car_model}, код {item.color_code}",
+            "color",
+            link="/distributor/color-lab",
+        )
         return JsonResponse({"request": _format_color_request(item)}, status=201)
     except Exception as e:
         return JsonResponse({"detail": f"Ошибка создания заявки: {str(e)}"}, status=400)
@@ -1370,6 +1423,13 @@ def create_courier_task(request):
     )
     _append_task_history(task, "created", _current_user(request), "Создано клиентом")
     task.save(update_fields=["status_history"])
+    _notify(
+        getattr(client.distributor, "user", None),
+        "Новая заявка на доставку",
+        f"{client.company_name}: {task.get_task_type_display()} · {task.address}",
+        "delivery",
+        link="/distributor",
+    )
     return JsonResponse({"task": _format_courier_task(task)}, status=201)
 
 
