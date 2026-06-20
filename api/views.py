@@ -2660,15 +2660,25 @@ def distributor_update_delivery_status(request, task_id):
         task.courier_id = courier_id
         if task.status == "created":
             task.status = "assigned"
-            
+
     if status == "cancelled" and reason:
         # logic for reason if added to model, but CourierTask doesn't have it explicitly in models.py
         # we can log it in history
         pass
-        
+
     _append_task_history(task, task.status, _current_user(request), f"Обновлено дистрибьютором. Статус: {task.status}, Курьер: {courier_id}")
     task.save()
-    
+
+    # Keep the Color Lab view in sync. The post-matching delivery (return лючка) task and
+    # the Color Lab "Назначить курьера" button refer to the same hand-off: assigning a
+    # courier here means the request leaves the active Color Lab list, so the button can't
+    # linger there. (And vice-versa — Color Lab now assigns this same task.)
+    if courier_id and task.color_request_id and task.color_request.status == "ready":
+        color_request = task.color_request
+        color_request.status = "delivered"
+        _append_color_history(color_request, "delivered", _current_user(request), "Курьер назначен на доставку")
+        color_request.save()
+
     return JsonResponse({"task": _format_courier_task(task)})
 
 
