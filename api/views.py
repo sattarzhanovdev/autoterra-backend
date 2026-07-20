@@ -49,6 +49,7 @@ from .models import (
     SyncLog,
     ManagerTask,
     ContactHistory,
+    grown_partner_status,
 )
 from .serializers import RegistrationSerializer, PurchaseSerializer
 
@@ -86,6 +87,237 @@ def _notify(user, title, body, n_type="info", link=""):
     except Exception:
         logger.exception("Failed to send push for notification %s", notification.pk)
     return notification
+
+
+def _send_order_email(order):
+    """Best-effort email to the manager mailbox on a new order.
+
+    Never raises — email failures must not break order creation. Delivery is
+    controlled by ORDER_NOTIFICATION_EMAILS in settings/.env; if empty, nothing
+    is sent.
+    """
+    recipients = getattr(settings, "ORDER_NOTIFICATION_EMAILS", None)
+    if not recipients:
+        return
+    try:
+        from django.core.mail import EmailMultiAlternatives
+
+        client = order.client
+        store_name = order.store.name if order.store else "—"
+        delivery = dict(Order.DELIVERY_CHOICES).get(order.delivery_method, order.delivery_method)
+        order_no = f"ORD-{order.id:05d}"
+        items = list(order.items.all())
+
+        # ── Plain-text fallback ────────────────────────────────────────────────
+        lines = [
+            f"Новый заказ {order_no}",
+            "",
+            f"Клиент: {client.company_name}",
+            f"ИНН: {client.inn}",
+            f"Дистрибьютор: {order.distributor.name}",
+            f"Способ получения: {delivery}",
+            f"Магазин/точка: {store_name}",
+            f"Дата: {order.created_at.strftime('%d.%m.%Y %H:%M')}",
+        ]
+        if order.comment:
+            lines.append(f"Комментарий: {order.comment}")
+        lines.append("")
+        lines.append("Позиции:")
+        for item in items:
+            lines.append(
+                f"  • {item.name} ({item.sku}) — {item.quantity} шт. x {item.price} = {item.total}"
+            )
+        lines.append("")
+        lines.append(f"Итого: {order.total_amount} ₽")
+        text_body = "\n".join(lines)
+
+        # ── HTML version ───────────────────────────────────────────────────────
+        rows = "".join(
+            f"""
+            <tr>
+              <td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:16px;color:#222;">
+                <strong>{item.name}</strong><br>
+                <span style="color:#888;font-size:14px;">Артикул: {item.sku}</span>
+              </td>
+              <td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:16px;color:#222;text-align:center;">{item.quantity}&nbsp;шт.</td>
+              <td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:16px;color:#222;text-align:right;white-space:nowrap;">{item.price} ₽</td>
+              <td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:16px;color:#222;text-align:right;white-space:nowrap;"><strong>{item.total} ₽</strong></td>
+            </tr>"""
+            for item in items
+        )
+
+        info_row = lambda label, value: f"""
+            <tr>
+              <td style="padding:6px 0;font-size:16px;color:#888;width:190px;">{label}</td>
+              <td style="padding:6px 0;font-size:16px;color:#222;"><strong>{value}</strong></td>
+            </tr>"""
+
+        comment_row = info_row("Комментарий", order.comment) if order.comment else ""
+
+        html_body = f"""\
+<!DOCTYPE html>
+<html lang="ru">
+<body style="margin:0;padding:0;background:#f4f5f7;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f5f7;padding:24px 0;">
+    <tr><td align="center">
+      <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 4px 16px rgba(240,29,44,0.12);border:1px solid #f0e0e1;">
+        <tr>
+          <td style="background:#f01d2c;padding:30px 32px;border-bottom:4px solid #111111;">
+            <div style="font-size:14px;color:#ffd9dc;letter-spacing:2px;text-transform:uppercase;font-weight:700;">AutoTerra</div>
+            <div style="font-size:27px;color:#ffffff;font-weight:800;margin-top:8px;">Новый заказ {order_no}</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:28px 32px 8px 32px;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+              {info_row("Клиент", client.company_name)}
+              {info_row("ИНН", client.inn)}
+              {info_row("Дистрибьютор", order.distributor.name)}
+              {info_row("Способ получения", delivery)}
+              {info_row("Магазин / точка", store_name)}
+              {info_row("Дата", order.created_at.strftime("%d.%m.%Y %H:%M"))}
+              {comment_row}
+            </table>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:16px 32px 0 32px;">
+            <div style="font-size:18px;color:#f01d2c;font-weight:800;margin-bottom:10px;">Позиции заказа</div>
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #eee;border-radius:8px;overflow:hidden;">
+              <tr style="background:#111111;">
+                <td style="padding:11px 16px;font-size:13px;color:#ffffff;text-transform:uppercase;letter-spacing:0.5px;">Товар</td>
+                <td style="padding:11px 16px;font-size:13px;color:#ffffff;text-transform:uppercase;letter-spacing:0.5px;text-align:center;">Кол-во</td>
+                <td style="padding:11px 16px;font-size:13px;color:#ffffff;text-transform:uppercase;letter-spacing:0.5px;text-align:right;">Цена</td>
+                <td style="padding:11px 16px;font-size:13px;color:#ffffff;text-transform:uppercase;letter-spacing:0.5px;text-align:right;">Сумма</td>
+              </tr>
+              {rows}
+            </table>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:20px 32px 28px 32px;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#fff2f3;border:1px solid #ffd9dc;border-radius:10px;">
+              <tr>
+                <td style="padding:16px 20px;font-size:20px;color:#111111;font-weight:700;">Итого:</td>
+                <td style="padding:16px 20px;font-size:26px;color:#f01d2c;font-weight:800;text-align:right;">{order.total_amount} ₽</td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+        <tr>
+          <td style="background:#111111;padding:18px 32px;text-align:center;font-size:13px;color:#bbbbbb;">
+            Это письмо сформировано автоматически платформой <span style="color:#f01d2c;font-weight:700;">AutoTerra</span>.
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+        msg = EmailMultiAlternatives(
+            subject=f"Новый заказ {order_no} — {client.company_name}",
+            body=text_body,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=list(recipients),
+        )
+        msg.attach_alternative(html_body, "text/html")
+        msg.send(fail_silently=False)
+    except Exception:
+        logger.exception("Failed to send order email for order %s", getattr(order, "id", None))
+
+
+def _send_order_status_email(order, old_status, new_status):
+    """Best-effort email on order status change. Never raises."""
+    recipients = getattr(settings, "ORDER_NOTIFICATION_EMAILS", None)
+    if not recipients or old_status == new_status:
+        return
+    try:
+        from django.core.mail import EmailMultiAlternatives
+
+        status_labels = dict(Order.STATUS_CHOICES)
+        # Header colour per status: accepted/fulfilled → red brand, rejected → black
+        accent = "#111111" if new_status == "rejected" else "#f01d2c"
+        old_label = status_labels.get(old_status, old_status)
+        new_label = status_labels.get(new_status, new_status)
+        order_no = f"ORD-{order.id:05d}"
+        client = order.client
+
+        text_lines = [
+            f"Заказ {order_no} — статус изменён",
+            "",
+            f"Клиент: {client.company_name}",
+            f"Было: {old_label}",
+            f"Стало: {new_label}",
+        ]
+        if new_status == "rejected" and order.rejection_reason:
+            text_lines.append(f"Причина: {order.rejection_reason}")
+        text_lines.append(f"Сумма заказа: {order.total_amount} ₽")
+        text_body = "\n".join(text_lines)
+
+        reason_block = ""
+        if new_status == "rejected" and order.rejection_reason:
+            reason_block = f"""
+              <tr>
+                <td style="padding:6px 0;font-size:16px;color:#888;width:190px;">Причина</td>
+                <td style="padding:6px 0;font-size:16px;color:#222;"><strong>{order.rejection_reason}</strong></td>
+              </tr>"""
+
+        html_body = f"""\
+<!DOCTYPE html>
+<html lang="ru">
+<body style="margin:0;padding:0;background:#f4f5f7;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f5f7;padding:24px 0;">
+    <tr><td align="center">
+      <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 4px 16px rgba(240,29,44,0.12);border:1px solid #f0e0e1;">
+        <tr>
+          <td style="background:{accent};padding:30px 32px;border-bottom:4px solid #111111;">
+            <div style="font-size:14px;color:#ffd9dc;letter-spacing:2px;text-transform:uppercase;font-weight:700;">AutoTerra</div>
+            <div style="font-size:27px;color:#ffffff;font-weight:800;margin-top:8px;">Заказ {order_no}</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:28px 32px 12px 32px;">
+            <div style="font-size:20px;color:#111111;font-weight:700;margin-bottom:18px;">
+              Статус: <span style="color:#888;">{old_label}</span> &nbsp;→&nbsp; <span style="color:{accent};">{new_label}</span>
+            </div>
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+              <tr>
+                <td style="padding:6px 0;font-size:16px;color:#888;width:190px;">Клиент</td>
+                <td style="padding:6px 0;font-size:16px;color:#222;"><strong>{client.company_name}</strong></td>
+              </tr>
+              <tr>
+                <td style="padding:6px 0;font-size:16px;color:#888;width:190px;">ИНН</td>
+                <td style="padding:6px 0;font-size:16px;color:#222;"><strong>{client.inn}</strong></td>
+              </tr>
+              <tr>
+                <td style="padding:6px 0;font-size:16px;color:#888;width:190px;">Сумма заказа</td>
+                <td style="padding:6px 0;font-size:16px;color:#222;"><strong>{order.total_amount} ₽</strong></td>
+              </tr>{reason_block}
+            </table>
+          </td>
+        </tr>
+        <tr>
+          <td style="background:#111111;padding:18px 32px;text-align:center;font-size:13px;color:#bbbbbb;">
+            Это письмо сформировано автоматически платформой <span style="color:#f01d2c;font-weight:700;">AutoTerra</span>.
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+        msg = EmailMultiAlternatives(
+            subject=f"Заказ {order_no}: {new_label} — {client.company_name}",
+            body=text_body,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=list(recipients),
+        )
+        msg.attach_alternative(html_body, "text/html")
+        msg.send(fail_silently=False)
+    except Exception:
+        logger.exception("Failed to send status email for order %s", getattr(order, "id", None))
 
 
 MAX_UPLOAD_SIZE = 10 * 1024 * 1024
@@ -1161,6 +1393,7 @@ def create_order(request):
         "order",
         link="/distributor",
     )
+    _send_order_email(order)
     return JsonResponse({"order": _format_order(order)}, status=201)
 
 
@@ -1192,7 +1425,9 @@ def cancel_order(request, order_id):
         order.status = "rejected"
         order.rejection_reason = "Отменено клиентом"
         order.save(update_fields=["status", "rejection_reason"])
-        
+
+    _send_order_status_email(order, "new", "rejected")
+
     return JsonResponse({"status": "success", "order": _format_order(order)})
 
 
@@ -2577,7 +2812,7 @@ def distributor_verify_purchase(request, purchase_id):
 
     purchase.save()
 
-    # Keep the cached total_purchases field in sync
+    # Keep the cached total_purchases field in sync and grow the partner status.
     client = purchase.client
     verified_total = (
         Purchase.objects
@@ -2585,7 +2820,11 @@ def distributor_verify_purchase(request, purchase_id):
         .aggregate(total=Sum("total_amount"))["total"]
         or 0
     )
-    ClientProfile.objects.filter(pk=client.pk).update(total_purchases=verified_total)
+    new_partner_status = grown_partner_status(client.partner_status, verified_total)
+    ClientProfile.objects.filter(pk=client.pk).update(
+        total_purchases=verified_total,
+        partner_status=new_partner_status,
+    )
 
     _log_audit(request, f"Purchase status change: {old_status} -> {status}", purchase, {"reason": reason})
 
@@ -2714,9 +2953,10 @@ def distributor_update_order_status(request, order_id):
         order.estimated_delivery_date = None
     
     order.save()
-    
+
     _log_audit(request, f"Order status change: {old_status} -> {status}", order, {"reason": reason})
-    
+    _send_order_status_email(order, old_status, status)
+
     return JsonResponse({"order": _format_order(order)})
 
 

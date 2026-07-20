@@ -143,6 +143,33 @@ class SyncLog(models.Model):
         return f"{self.created_at:%d.%m.%Y %H:%M} · {self.get_sync_type_display()} · {self.get_status_display()}"
 
 
+# Партнёрский статус растёт по накопленной сумме подтверждённых закупок.
+# Порядок — от младшего к старшему; каждый порог в рублях.
+PARTNER_TIERS = ["Silver", "Gold", "Platinum", "Certified Partner"]
+PARTNER_THRESHOLDS = {
+    "Silver": 0,
+    "Gold": 500_000,
+    "Platinum": 2_000_000,
+    "Certified Partner": 5_000_000,
+}
+
+
+def partner_tier_for_total(total):
+    """Возвращает заслуженный статус по сумме закупок."""
+    earned = "Silver"
+    for tier in PARTNER_TIERS:
+        if (total or 0) >= PARTNER_THRESHOLDS[tier]:
+            earned = tier
+    return earned
+
+
+def grown_partner_status(current, total):
+    """Повышает статус до заслуженного по сумме закупок, но не понижает."""
+    earned = partner_tier_for_total(total)
+    current = current if current in PARTNER_TIERS else "Silver"
+    return earned if PARTNER_TIERS.index(earned) > PARTNER_TIERS.index(current) else current
+
+
 class ClientProfile(models.Model):
     inn_validator = RegexValidator(
         regex=r"^\d{10}(\d{2})?$",
