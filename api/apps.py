@@ -8,3 +8,6 @@ class ApiConfig(AppConfig):
 
     def ready(self) -> None:
         import api.signals  # noqa: F401 — registers all signal handlers
+        from api.db_patches import patch_sqlite_decimal_converter
+
+        patch_sqlite_decimal_converter()

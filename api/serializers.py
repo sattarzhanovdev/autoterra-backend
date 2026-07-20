@@ -1,9 +1,31 @@
 import json
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator
 from .models import ClientProfile, Region, Purchase, Distributor
+
+
+def coerce_decimal(value, max_digits, decimal_places):
+    """Parse ``value`` into a finite Decimal that fits a DecimalField's bounds.
+
+    Returns the value quantized to ``decimal_places``, or ``None`` if it is not a
+    finite number or does not fit within ``max_digits`` once quantized. This guards
+    against values such as ``Infinity``/``NaN`` or oversized numbers that pass a bare
+    ``Decimal(...)`` parse but later raise ``decimal.InvalidOperation`` when the SQLite
+    backend reads the column back and quantizes it to the field's precision.
+    """
+    try:
+        amount = Decimal(str(value))
+        if not amount.is_finite():
+            return None
+        quantized = amount.quantize(Decimal(1).scaleb(-decimal_places), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if abs(quantized) >= Decimal(10) ** (max_digits - decimal_places):
+        return None
+    return quantized
+
 
 class BaseSerializer:
     def __init__(self, data):
@@ -78,9 +100,9 @@ class PurchaseSerializer(BaseSerializer):
         if self.errors:
             return False
 
-        try:
-            amount = Decimal(str(amount_str))
-        except (InvalidOperation, ValueError):
+        # Purchase.total_amount is DecimalField(max_digits=12, decimal_places=2)
+        amount = coerce_decimal(amount_str, max_digits=12, decimal_places=2)
+        if amount is None or amount < 0:
             self.errors['amount'] = "Invalid amount format"
             return False
 

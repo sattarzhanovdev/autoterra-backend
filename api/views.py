@@ -51,7 +51,7 @@ from .models import (
     ContactHistory,
     grown_partner_status,
 )
-from .serializers import RegistrationSerializer, PurchaseSerializer
+from .serializers import RegistrationSerializer, PurchaseSerializer, coerce_decimal
 
 try:
     import certifi
@@ -529,10 +529,13 @@ def _scope_products(distributor, is_admin):
 
 
 def _money_value(value):
-    try:
-        return Decimal(str(value or "0").replace(" ", "").replace(",", "."))
-    except (InvalidOperation, ValueError, TypeError):
-        return None
+    # Normalise common input quirks (spaces as thousands separators, comma decimals)
+    # then bound the result to the DecimalField(max_digits=12, decimal_places=2) used by
+    # Product.price / PurchaseItem.price. Falls back to 0 so an invalid or oversized
+    # value can never be stored and later crash the SQLite decimal converter on read.
+    cleaned = str(value or "0").replace(" ", "").replace(",", ".")
+    coerced = coerce_decimal(cleaned, max_digits=12, decimal_places=2)
+    return coerced if coerced is not None and coerced >= 0 else Decimal("0")
 
 
 def _parse_items(value):
@@ -581,7 +584,10 @@ def _upload_error(file_obj):
     content_type = (getattr(file_obj, "content_type", "") or "").lower()
     if extension not in ALLOWED_UPLOAD_EXTENSIONS:
         return JsonResponse({"detail": "Недопустимый тип файла", "code": "invalid_file_type"}, status=400)
-    if content_type and content_type not in ALLOWED_UPLOAD_CONTENT_TYPES:
+    # Mobile clients often send a missing or generic content type (octet-stream) even
+    # for valid JPG/PDF uploads. The extension is already validated above, so only
+    # reject when the client sent a specific, disallowed content type.
+    if content_type and content_type not in ALLOWED_UPLOAD_CONTENT_TYPES and content_type != "application/octet-stream":
         return JsonResponse({"detail": "Недопустимый тип файла", "code": "invalid_file_type"}, status=400)
     if getattr(file_obj, "size", 0) > MAX_UPLOAD_SIZE:
         return JsonResponse({"detail": "Файл больше 10 МБ", "code": "file_too_large"}, status=400)
@@ -1499,7 +1505,11 @@ def create_purchase(request):
                 price=_money_value(raw.get("price"))
             )
         
-        _create_attachments(request, purchase, files, description="Документ к покупке")
+        _, attach_error = _create_attachments(request, purchase, files, description="Документ к покупке")
+        if attach_error:
+            # Don't keep a purchase whose proof-of-payment failed to upload.
+            transaction.set_rollback(True)
+            return attach_error
 
     _notify(
         getattr(client.distributor, "user", None),
@@ -1559,6 +1569,7 @@ def update_color_request(request, request_id):
     payload = _json(request)
     color_request.car_brand = payload.get("carBrand", color_request.car_brand)
     color_request.car_model = payload.get("carModel", color_request.car_model)
+    color_request.car_year = (payload.get("carYear", color_request.car_year) or "").strip()[:4]
     color_request.vin = payload.get("vin", color_request.vin)
     color_request.color_code = payload.get("colorCode", color_request.color_code)
     color_request.color_name = payload.get("colorName", color_request.color_name)
@@ -1567,7 +1578,11 @@ def update_color_request(request, request_id):
     color_request.contact_phone = payload.get("contactPhone", color_request.contact_phone)
     color_request.comment = payload.get("comment", color_request.comment)
     color_request.transfer_method = payload.get("transferMethod", color_request.transfer_method)
-    
+    if "urgent" in payload:
+        color_request.urgent = _bool(payload.get("urgent"))
+    if "pickupTime" in payload:
+        color_request.pickup_time = _dt(payload.get("pickupTime"))
+
     color_request.save()
     return JsonResponse({"request": _format_color_request(color_request)})
 
@@ -2884,15 +2899,25 @@ def distributor_update_delivery_status(request, task_id):
         task.courier_id = courier_id
         if task.status == "created":
             task.status = "assigned"
-            
+
     if status == "cancelled" and reason:
         # logic for reason if added to model, but CourierTask doesn't have it explicitly in models.py
         # we can log it in history
         pass
-        
+
     _append_task_history(task, task.status, _current_user(request), f"Обновлено дистрибьютором. Статус: {task.status}, Курьер: {courier_id}")
     task.save()
-    
+
+    # Keep the Color Lab view in sync. The post-matching delivery (return лючка) task and
+    # the Color Lab "Назначить курьера" button refer to the same hand-off: assigning a
+    # courier here means the request leaves the active Color Lab list, so the button can't
+    # linger there. (And vice-versa — Color Lab now assigns this same task.)
+    if courier_id and task.color_request_id and task.color_request.status == "ready":
+        color_request = task.color_request
+        color_request.status = "delivered"
+        _append_color_history(color_request, "delivered", _current_user(request), "Курьер назначен на доставку")
+        color_request.save()
+
     return JsonResponse({"task": _format_courier_task(task)})
 
 
