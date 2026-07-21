@@ -20,6 +20,15 @@ urlpatterns = [
     path("orders/", views.orders),
     path("orders/create/", views.create_order),
     path("orders/<int:order_id>/cancel/", views.cancel_order),
+    # Безопасный поток заказа
+    path("orders/<int:order_id>/confirm/", views.confirm_order),          # оператор
+    path("orders/<int:order_id>/adjust/", views.adjust_order),            # оператор
+    path("orders/<int:order_id>/reject/", views.reject_order),            # оператор
+    path("orders/<int:order_id>/ship/", views.ship_order),                # оператор
+    path("orders/<int:order_id>/accept-adjustment/", views.accept_adjustment),  # клиент
+    path("orders/<int:order_id>/pay/", views.pay_order),                  # клиент
+    # Webhook от YooKassa (без авторизации, вызывается платёжной системой)
+    path("payments/yookassa/webhook/", views.yookassa_webhook),
     path("purchases/", views.purchases),
     path("purchases/create/", views.create_purchase),
     path("manager/dashboard/", views.manager_dashboard),
@@ -59,6 +68,7 @@ urlpatterns = [
     path("distributor/stock/", views.distributor_stock),
     path("distributor/stock/add/", views.distributor_add_product),
     path("distributor/stock/upload/", views.distributor_stock_upload),
+    path("distributor/stock/upload-file/", views.distributor_stock_upload_file),
     path("distributor/reports/", views.distributor_reports),
     path("color-requests/", views.color_requests),
     path("color-requests/create/", views.create_color_request),

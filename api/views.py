@@ -36,7 +36,9 @@ from .models import (
     KnowledgeCard,
     Notification,
     Order,
+    OrderAdjustment,
     OrderItem,
+    Payment,
     Product,
     Profile,
     Purchase,
@@ -227,9 +229,15 @@ def _send_order_email(order):
         logger.exception("Failed to send order email for order %s", getattr(order, "id", None))
 
 
-def _send_order_status_email(order, old_status, new_status):
-    """Best-effort email on order status change. Never raises."""
-    recipients = getattr(settings, "ORDER_NOTIFICATION_EMAILS", None)
+def _send_order_status_email(order, old_status, new_status, recipients=None):
+    """Best-effort email on order status change. Never raises.
+
+    ``recipients`` overrides the default operator mailbox — used to email the
+    client (order.client.user.email) directly.
+    """
+    if recipients is None:
+        recipients = getattr(settings, "ORDER_NOTIFICATION_EMAILS", None)
+    recipients = [r for r in (recipients or []) if r]
     if not recipients or old_status == new_status:
         return
     try:
@@ -690,10 +698,23 @@ def _format_product(product):
         "id": str(product.id),
         "distributorId": str(product.distributor_id),
         "sku": product.sku,
+        "wbArticle": product.wb_article or None,
+        "groupName": product.group_name or None,
         "name": product.name,
         "category": product.category,
         "brand": product.brand,
+        "description": product.description or None,
+        "color": product.color or None,
+        "barcode": product.barcode or None,
+        "images": product.images or [],
+        "videoUrl": product.video_url or None,
         "volume": float(product.volume),
+        "weight": float(product.weight),
+        "packageHeight": float(product.package_height),
+        "packageLength": float(product.package_length),
+        "packageWidth": float(product.package_width),
+        "tnved": product.tnved or None,
+        "vatRate": product.vat_rate or None,
         "price": float(product.price),
         "quantity": product.quantity,
         "status": product.status,
@@ -752,7 +773,35 @@ def _format_order(order):
         "courierName": _get_courier_name(order.courier),
         "estimatedDeliveryDate": order.estimated_delivery_date.isoformat() if order.estimated_delivery_date else None,
         "createdAt": order.created_at.isoformat(),
+        "confirmedAt": order.confirmed_at.isoformat() if order.confirmed_at else None,
+        "paidAt": order.paid_at.isoformat() if order.paid_at else None,
+        "shippedAt": order.shipped_at.isoformat() if order.shipped_at else None,
+        # Клиент может нажать «Оплатить» только для этих статусов
+        "isPayable": order.status in Order.PAYABLE_STATUSES,
+        "adjustments": [_format_adjustment(a) for a in order.adjustments.all()],
+        "pendingPayment": _format_pending_payment(order),
         "items": items,
+    }
+
+
+def _format_adjustment(adj):
+    return {
+        "id": str(adj.id),
+        "originalItems": adj.original_items,
+        "adjustedItems": adj.adjusted_items,
+        "reason": adj.reason or None,
+        "createdAt": adj.created_at.isoformat(),
+    }
+
+
+def _format_pending_payment(order):
+    payment = order.payments.filter(status__in=["pending", "waiting_for_capture"]).first()
+    if not payment or not payment.confirmation_url:
+        return None
+    return {
+        "id": str(payment.id),
+        "status": payment.status,
+        "confirmationUrl": payment.confirmation_url,
     }
 
 
@@ -1413,28 +1462,425 @@ def cancel_order(request, order_id):
     order = client.orders.filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
-        
-    if order.status != "new":
-        return JsonResponse({"detail": "Нельзя отменить заказ, который уже принят в работу"}, status=400)
-        
+
+    # Клиент может отменить заказ только до оплаты (new / confirmed / adjusted)
+    if not order.can_transition_to("cancelled"):
+        return JsonResponse(
+            {"detail": "Нельзя отменить заказ на текущем этапе"}, status=400
+        )
+
+    old_status = order.status
     with transaction.atomic():
-        # Restore stock
-        for item in order.items.all():
-            product = item.product
-            product.quantity += item.quantity
-            if product.quantity > 5:
-                product.status = "inStock"
-            elif product.quantity > 0:
-                product.status = "low"
-            product.save(update_fields=["quantity", "status"])
-            
-        order.status = "rejected"
+        _restore_order_stock(order)
+        order.status = "cancelled"
         order.rejection_reason = "Отменено клиентом"
         order.save(update_fields=["status", "rejection_reason"])
 
-    _send_order_status_email(order, "new", "rejected")
+    _notify_operator_order(order, "Заказ отменён", f"{order.client.company_name} отменил заказ ORD-{order.id:05d}")
+    _send_order_status_email(order, old_status, "cancelled")
 
     return JsonResponse({"status": "success", "order": _format_order(order)})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Безопасный поток заказа: подтверждение / корректировка / оплата / отправка
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _restore_order_stock(order):
+    """Вернуть остатки на склад по всем позициям заказа."""
+    for item in order.items.select_related("product").all():
+        product = item.product
+        if product is None:
+            continue
+        product.quantity += item.quantity
+        if product.quantity > 5:
+            product.status = "inStock"
+        elif product.quantity > 0:
+            product.status = "low"
+        product.save(update_fields=["quantity", "status"])
+
+
+def _stock_shortages(items):
+    """Список позиций, где запрошенное количество превышает остаток.
+
+    ``items`` — iterable из (product, requested_qty). Возвращает список dict-ов
+    для предупреждения оператора.
+    """
+    shortages = []
+    for product, requested in items:
+        available = product.quantity if product.status != "onOrder" else requested
+        if product.status != "onOrder" and requested > product.quantity:
+            shortages.append({
+                "productId": str(product.id),
+                "name": product.name,
+                "sku": product.sku,
+                "requested": requested,
+                "available": product.quantity,
+            })
+    return shortages
+
+
+def _notify_client_order(order, title, body):
+    _notify(getattr(order.client, "user", None), title, body, "order", link=f"/orders/{order.id}")
+
+
+def _notify_operator_order(order, title, body):
+    _notify(getattr(order.distributor, "user", None), title, body, "order", link="/distributor")
+
+
+def _client_email_list(order):
+    email = getattr(getattr(order.client, "user", None), "email", "") or ""
+    return [email] if email else []
+
+
+def _items_snapshot(order):
+    """JSON-снимок текущих позиций заказа (для истории корректировок)."""
+    return [
+        {
+            "productId": str(item.product_id),
+            "sku": item.sku,
+            "name": item.name,
+            "price": float(item.price),
+            "quantity": item.quantity,
+            "total": float(item.total),
+        }
+        for item in order.items.all()
+    ]
+
+
+@csrf_exempt
+@require_POST
+def confirm_order(request, order_id):
+    """Оператор подтверждает заказ как есть: new/adjusted → confirmed."""
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    order = _scope_orders(distributor, is_admin).filter(id=order_id).first()
+    if not order:
+        return JsonResponse({"detail": "Заказ не найден"}, status=404)
+    if not order.can_transition_to("confirmed"):
+        return JsonResponse({"detail": f"Нельзя подтвердить заказ в статусе «{order.get_status_display()}»"}, status=400)
+
+    # Предупреждение о нехватке остатков (не блокирует — оператор решает сам,
+    # но по умолчанию не даём подтвердить дефицитный заказ без ?force=1)
+    shortages = _stock_shortages(
+        [(item.product, item.quantity) for item in order.items.select_related("product").all() if item.product]
+    )
+    if shortages and request.GET.get("force") != "1":
+        return JsonResponse({
+            "detail": "Недостаточно остатков по некоторым позициям. Скорректируйте заказ или подтвердите принудительно (force=1).",
+            "shortages": shortages,
+        }, status=409)
+
+    old_status = order.status
+    order.status = "confirmed"
+    order.confirmed_at = timezone.now()
+    order.save(update_fields=["status", "confirmed_at"])
+
+    _log_audit(request, f"Order confirm: {old_status} -> confirmed", order)
+    _notify_client_order(order, "Заказ подтверждён", f"Заказ ORD-{order.id:05d} подтверждён. Сумма: {order.total_amount} ₽. Можно оплатить.")
+    _send_order_status_email(order, old_status, "confirmed", recipients=_client_email_list(order))
+    return JsonResponse({"order": _format_order(order)})
+
+
+@csrf_exempt
+@require_POST
+def adjust_order(request, order_id):
+    """Оператор корректирует состав заказа: new → adjusted.
+
+    payload: {"items": [{"itemId": 12, "quantity": 3}, ...], "reason": "..."}
+    Позиции с quantity=0 удаляются. Разница по остаткам возвращается на склад.
+    """
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    order = _scope_orders(distributor, is_admin).filter(id=order_id).first()
+    if not order:
+        return JsonResponse({"detail": "Заказ не найден"}, status=404)
+    if not order.can_transition_to("adjusted"):
+        return JsonResponse({"detail": f"Нельзя корректировать заказ в статусе «{order.get_status_display()}»"}, status=400)
+
+    payload = _json(request)
+    updates = payload.get("items") or []
+    reason = (payload.get("reason") or "").strip()
+    if not updates:
+        return JsonResponse({"detail": "Передайте позиции для корректировки"}, status=400)
+
+    # Карта itemId -> новое количество
+    qty_by_item = {}
+    for row in updates:
+        try:
+            qty_by_item[int(row.get("itemId"))] = max(0, int(row.get("quantity") or 0))
+        except (TypeError, ValueError):
+            return JsonResponse({"detail": "Некорректные данные позиции"}, status=400)
+
+    original_snapshot = _items_snapshot(order)
+
+    with transaction.atomic():
+        for item in order.items.select_related("product").all():
+            if item.id not in qty_by_item:
+                continue
+            new_qty = qty_by_item[item.id]
+            delta = item.quantity - new_qty  # >0 → вернуть на склад, <0 → списать ещё
+            product = item.product
+
+            if delta < 0 and product is not None:
+                # оператор увеличил количество — проверяем остаток
+                need = -delta
+                if product.status != "onOrder" and product.quantity < need:
+                    transaction.set_rollback(True)
+                    return JsonResponse({
+                        "detail": f"Недостаточно «{product.name}» на складе. Доступно: {product.quantity}"
+                    }, status=400)
+
+            if product is not None:
+                product.quantity = max(0, product.quantity + delta)
+                if product.quantity > 5:
+                    product.status = "inStock"
+                elif product.quantity > 0:
+                    product.status = "low"
+                elif product.status != "onOrder":
+                    product.status = "outOfStock"
+                product.save(update_fields=["quantity", "status"])
+
+            if new_qty == 0:
+                item.delete()
+            elif new_qty != item.quantity:
+                item.quantity = new_qty
+                item.save(update_fields=["quantity"])
+
+        if not order.items.exists():
+            transaction.set_rollback(True)
+            return JsonResponse({"detail": "После корректировки в заказе не осталось позиций. Отклоните заказ."}, status=400)
+
+        old_status = order.status
+        order.status = "adjusted"
+        order.save(update_fields=["status"])
+
+        OrderAdjustment.objects.create(
+            order=order,
+            original_items=original_snapshot,
+            adjusted_items=_items_snapshot(order),
+            reason=reason,
+            created_by=_current_user(request),
+        )
+
+    _log_audit(request, f"Order adjust: {old_status} -> adjusted", order, {"reason": reason})
+    _notify_client_order(order, "Заказ скорректирован", f"Заказ ORD-{order.id:05d} изменён оператором. Новая сумма: {order.total_amount} ₽. Подтвердите или отмените.")
+    _send_order_status_email(order, old_status, "adjusted", recipients=_client_email_list(order))
+    return JsonResponse({"order": _format_order(order)})
+
+
+@csrf_exempt
+@require_POST
+def reject_order(request, order_id):
+    """Оператор отклоняет заказ с указанием причины."""
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    order = _scope_orders(distributor, is_admin).filter(id=order_id).first()
+    if not order:
+        return JsonResponse({"detail": "Заказ не найден"}, status=404)
+    if not order.can_transition_to("rejected"):
+        return JsonResponse({"detail": f"Нельзя отклонить заказ в статусе «{order.get_status_display()}»"}, status=400)
+
+    payload = _json(request)
+    reason = (payload.get("reason") or "").strip()
+
+    old_status = order.status
+    with transaction.atomic():
+        _restore_order_stock(order)
+        order.status = "rejected"
+        order.rejection_reason = reason or "Не указана"
+        order.save(update_fields=["status", "rejection_reason"])
+
+    _log_audit(request, f"Order reject: {old_status} -> rejected", order, {"reason": reason})
+    _notify_client_order(order, "Заказ отклонён", f"Заказ ORD-{order.id:05d} отклонён. Причина: {order.rejection_reason}")
+    _send_order_status_email(order, old_status, "rejected", recipients=_client_email_list(order))
+    return JsonResponse({"order": _format_order(order)})
+
+
+@csrf_exempt
+@require_POST
+def accept_adjustment(request, order_id):
+    """Клиент соглашается со скорректированным заказом: adjusted → confirmed."""
+    client, err = _require_client(request)
+    if err:
+        return err
+    order = client.orders.filter(id=order_id).first()
+    if not order:
+        return JsonResponse({"detail": "Заказ не найден"}, status=404)
+    if order.status != "adjusted":
+        return JsonResponse({"detail": "Заказ не в статусе корректировки"}, status=400)
+
+    old_status = order.status
+    order.status = "confirmed"
+    order.confirmed_at = timezone.now()
+    order.save(update_fields=["status", "confirmed_at"])
+
+    _notify_operator_order(order, "Клиент принял корректировку", f"{order.client.company_name} принял корректировку заказа ORD-{order.id:05d}")
+    _send_order_status_email(order, old_status, "confirmed")
+    return JsonResponse({"order": _format_order(order)})
+
+
+@csrf_exempt
+@require_POST
+def ship_order(request, order_id):
+    """Оператор отмечает отправку: paid → shipped."""
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    order = _scope_orders(distributor, is_admin).filter(id=order_id).first()
+    if not order:
+        return JsonResponse({"detail": "Заказ не найден"}, status=404)
+    if not order.can_transition_to("shipped"):
+        return JsonResponse({"detail": f"Нельзя отправить заказ в статусе «{order.get_status_display()}»"}, status=400)
+
+    old_status = order.status
+    order.status = "shipped"
+    order.shipped_at = timezone.now()
+    order.save(update_fields=["status", "shipped_at"])
+
+    _log_audit(request, f"Order ship: {old_status} -> shipped", order)
+    _notify_client_order(order, "Заказ отправлен", f"Заказ ORD-{order.id:05d} отправлен. Ожидайте доставку.")
+    _send_order_status_email(order, old_status, "shipped", recipients=_client_email_list(order))
+    return JsonResponse({"order": _format_order(order)})
+
+
+# ── Оплата через YooKassa ──────────────────────────────────────────────────────
+
+def _format_payment(payment):
+    return {
+        "id": str(payment.id),
+        "orderId": str(payment.order_id),
+        "provider": payment.provider,
+        "providerPaymentId": payment.provider_payment_id,
+        "amount": float(payment.amount),
+        "currency": payment.currency,
+        "status": payment.status,
+        "confirmationUrl": payment.confirmation_url or None,
+        "createdAt": payment.created_at.isoformat(),
+        "paidAt": payment.paid_at.isoformat() if payment.paid_at else None,
+    }
+
+
+@csrf_exempt
+@require_POST
+def pay_order(request, order_id):
+    """Клиент инициирует оплату подтверждённого заказа через YooKassa.
+
+    Оплатить можно ТОЛЬКО заказ в статусе confirmed/adjusted (гарантия наличия
+    товара). Возвращает confirmation_url, куда нужно перенаправить клиента.
+    Статус заказа станет `paid` только после webhook `payment.succeeded`.
+    """
+    from api.services import payments as pay
+
+    client, err = _require_client(request)
+    if err:
+        return err
+    order = client.orders.filter(id=order_id).first()
+    if not order:
+        return JsonResponse({"detail": "Заказ не найден"}, status=404)
+    if order.status not in Order.PAYABLE_STATUSES:
+        return JsonResponse(
+            {"detail": "Оплатить можно только подтверждённый заказ"}, status=400
+        )
+    if order.total_amount <= 0:
+        return JsonResponse({"detail": "Сумма заказа равна нулю"}, status=400)
+
+    # Переиспользуем ещё не оплаченный платёж (не создаём дубли при повторном тапе)
+    existing = order.payments.filter(status__in=["pending", "waiting_for_capture"]).first()
+    if existing and existing.confirmation_url:
+        return JsonResponse({"payment": _format_payment(existing)}, status=200)
+
+    if not pay.is_configured():
+        return JsonResponse(
+            {"detail": "Оплата временно недоступна: не настроены реквизиты YooKassa (YOOKASSA_SHOP_ID / YOOKASSA_SECRET_KEY)."},
+            status=503,
+        )
+
+    idempotence_key = pay.new_idempotence_key()
+    payment = Payment.objects.create(
+        order=order,
+        amount=order.total_amount,
+        currency="RUB",
+        status="pending",
+        idempotence_key=idempotence_key,
+    )
+    try:
+        resp = pay.create_payment(
+            order=order,
+            amount=order.total_amount,
+            idempotence_key=idempotence_key,
+            description=f"Заказ ORD-{order.id:05d} · {order.client.company_name}",
+        )
+    except pay.PaymentProviderError as exc:
+        payment.status = "canceled"
+        payment.raw_response = {"error": str(exc)}
+        payment.save(update_fields=["status", "raw_response"])
+        return JsonResponse({"detail": f"Ошибка платёжного провайдера: {exc}"}, status=502)
+
+    payment.provider_payment_id = resp.get("id", "")
+    payment.status = resp.get("status", "pending")
+    payment.confirmation_url = (resp.get("confirmation") or {}).get("confirmation_url", "")
+    payment.raw_response = resp
+    payment.save(update_fields=["provider_payment_id", "status", "confirmation_url", "raw_response"])
+
+    return JsonResponse({"payment": _format_payment(payment)}, status=201)
+
+
+@csrf_exempt
+@require_POST
+def yookassa_webhook(request):
+    """Приём уведомлений от YooKassa (payment.succeeded / payment.canceled).
+
+    Настраивается в ЛК ЮKassa: HTTP-уведомления → указать URL этого endpoint-а.
+    Мы перепроверяем статус платежа через API, чтобы не доверять телу запроса.
+    """
+    from api.services import payments as pay
+
+    payload = _json(request)
+    event = payload.get("event")
+    obj = payload.get("object") or {}
+    provider_payment_id = obj.get("id")
+    if not provider_payment_id:
+        return JsonResponse({"detail": "no payment id"}, status=400)
+
+    payment = Payment.objects.filter(provider_payment_id=provider_payment_id).select_related("order").first()
+    if not payment:
+        # Платёж не наш / уже удалён — отвечаем 200, чтобы ЮKassa не ретраила бесконечно
+        return JsonResponse({"detail": "unknown payment"}, status=200)
+
+    # Перепроверяем реальный статус у провайдера (защита от подделки webhook-а)
+    real_status = obj.get("status")
+    if pay.is_configured():
+        try:
+            fresh = pay.fetch_payment(provider_payment_id)
+            real_status = fresh.get("status", real_status)
+        except pay.PaymentProviderError:
+            logger.exception("YooKassa verify failed for %s", provider_payment_id)
+
+    order = payment.order
+
+    if event == "payment.succeeded" or real_status == "succeeded":
+        if payment.status != "succeeded":
+            payment.status = "succeeded"
+            payment.paid_at = timezone.now()
+            payment.save(update_fields=["status", "paid_at"])
+        # Двигаем заказ в paid только из оплачиваемого статуса (идемпотентно)
+        if order.status in Order.PAYABLE_STATUSES:
+            old_status = order.status
+            order.status = "paid"
+            order.paid_at = timezone.now()
+            order.save(update_fields=["status", "paid_at"])
+            _notify_operator_order(order, "Заказ оплачен", f"{order.client.company_name} оплатил заказ ORD-{order.id:05d} на {payment.amount} ₽")
+            _notify_client_order(order, "Оплата получена", f"Оплата заказа ORD-{order.id:05d} прошла успешно.")
+            _send_order_status_email(order, old_status, "paid")
+    elif event == "payment.canceled" or real_status == "canceled":
+        payment.status = "canceled"
+        payment.save(update_fields=["status"])
+
+    return JsonResponse({"status": "ok"})
 
 
 @require_GET
@@ -3049,6 +3495,47 @@ def distributor_stock_upload(request):
                 }
             )
     return JsonResponse({"status": "ok", "processed": len(items)})
+
+
+@csrf_exempt
+@require_POST
+def distributor_stock_upload_file(request):
+    """Загрузка ассортимента из Excel-файла (шаблон WB «Общие характеристики»).
+
+    Принимает multipart-файл в поле ``file``. Парсинг и апсерт выполняются на
+    сервере — единый разбор для мобильного приложения и админки.
+    Характеристики обновляются всегда; цена/остаток — только если такие колонки
+    есть в файле (иначе существующие значения сохраняются).
+    """
+    from api.services.product_import import parse_products_workbook, upsert_products
+
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+    if is_admin:
+        return JsonResponse({"detail": "Admin must specify distributorId"}, status=400)
+
+    file_obj = request.FILES.get("file")
+    if not file_obj:
+        return JsonResponse({"detail": "Файл не передан (поле 'file')"}, status=400)
+
+    products, errors = parse_products_workbook(file_obj)
+    if not products:
+        return JsonResponse(
+            {"detail": errors[0] if errors else "В файле не найдено товаров.", "errors": errors},
+            status=400,
+        )
+
+    with transaction.atomic():
+        created, updated = upsert_products(distributor, products)
+
+    return JsonResponse({
+        "status": "ok",
+        "created": created,
+        "updated": updated,
+        "processed": created + updated,
+        "errors": errors,
+    })
 
 
 @require_GET

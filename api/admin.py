@@ -26,7 +26,9 @@ from .models import (
     ManagerTask,
     Notification,
     Order,
+    OrderAdjustment,
     OrderItem,
+    Payment,
     Product,
     Purchase,
     PurchaseItem,
@@ -349,7 +351,7 @@ class ProductAdmin(admin.ModelAdmin):
         if request.method == "POST":
             form = ProductExcelImportForm(request.POST, request.FILES)
             if form.is_valid():
-                created, updated, skipped, errors = self._import_products(
+                created, updated, errors = self._import_products(
                     distributor=form.cleaned_data["distributor"],
                     file_obj=form.cleaned_data["file"],
                 )
@@ -360,7 +362,7 @@ class ProductAdmin(admin.ModelAdmin):
                         messages.warning(request, f"И ещё ошибок: {len(errors) - 10}")
                 messages.success(
                     request,
-                    f"Импорт завершён: создано {created}, обновлено {updated}, пропущено {skipped}.",
+                    f"Импорт завершён: создано {created}, обновлено {updated}.",
                 )
                 return redirect("admin:api_product_changelist")
         else:
@@ -371,59 +373,25 @@ class ProductAdmin(admin.ModelAdmin):
             "title": "Загрузка ассортимента из Excel",
             "form": form,
             "opts": self.model._meta,
-            "sample_headers_ru": ", ".join(PRODUCT_TEMPLATE_HEADERS),
-            "sample_headers_en": "Article, Product name, Category, Brand, Volume, Price, Stock, Status",
-            "statuses": "В наличии / Мало / Под заказ / Нет в наличии",
+            "sample_headers_ru": "Артикул продавца, Наименование, Категория продавца, Бренд, Описание, Фото, Баркод, Вес, Габариты, ТНВЭД (+ Цена/Остаток — по желанию)",
+            "sample_headers_en": "Поддерживается шаблон Wildberries «Общие характеристики»: колонки определяются по названию, шапка может быть не в первой строке.",
+            "statuses": "Цена и остаток берутся из файла, если такие колонки есть; иначе сохраняются текущие значения.",
         }
         return render(request, "admin/api/product/import_excel.html", context)
 
     def _import_products(self, distributor, file_obj):
-        workbook = load_workbook(file_obj, read_only=True, data_only=True)
-        sheet = workbook.active
-        rows = list(sheet.iter_rows(values_only=True))
-        if not rows:
-            return 0, 0, 0, ["Файл пустой."]
+        """Импорт товаров из Excel (шаблон WB «Общие характеристики» и совместимые).
 
-        headers = _headers(rows[0])
-        required = {"sku", "name"}
-        missing = required - set(headers)
-        if missing:
-            return 0, 0, 0, [f"Не найдены обязательные колонки: {', '.join(sorted(missing))}."]
+        Разбор вынесен в общий сервис api.services.product_import, чтобы
+        одинаково работать и здесь, и в мобильном API.
+        """
+        from .services.product_import import parse_products_workbook, upsert_products
 
-        created = updated = skipped = 0
-        errors = []
-        for number, row in enumerate(rows[1:], start=2):
-            sku = _norm(_cell(row, headers, "sku"))
-            name = _norm(_cell(row, headers, "name"))
-            if not sku and not name:
-                skipped += 1
-                continue
-            if not sku or not name:
-                skipped += 1
-                errors.append(f"Строка {number}: артикул и название обязательны.")
-                continue
-
-            defaults = {
-                "name": name,
-                "category": _norm(_cell(row, headers, "category", "Без категории")) or "Без категории",
-                "brand": _norm(_cell(row, headers, "brand", "AutoTerra")) or "AutoTerra",
-                "volume": _money(_cell(row, headers, "volume", 0)),
-                "price": _money(_cell(row, headers, "price", 0)),
-                "quantity": max(_int(_cell(row, headers, "quantity", 0)), 0),
-                "status": _status(_cell(row, headers, "status", "inStock")),
-                "is_active": True,
-            }
-            _, was_created = Product.objects.update_or_create(
-                distributor=distributor,
-                sku=sku,
-                defaults=defaults,
-            )
-            if was_created:
-                created += 1
-            else:
-                updated += 1
-
-        return created, updated, skipped, errors
+        products, errors = parse_products_workbook(file_obj)
+        if not products:
+            return 0, 0, errors
+        created, updated = upsert_products(distributor, products)
+        return created, updated, errors
 
 
 @admin.register(Order)
@@ -431,8 +399,23 @@ class OrderAdmin(admin.ModelAdmin):
     list_display = ("id", "client", "store", "distributor", "external_id", "status", "created_at")
     list_filter = ("status", "distributor", "store")
     search_fields = ("id", "external_id", "client__company_name", "client__inn", "store__name", "comment", "items__name", "items__sku")
-    readonly_fields = ("created_at",)
+    readonly_fields = ("created_at", "confirmed_at", "paid_at", "shipped_at")
     inlines = (OrderItemInline,)
+
+
+@admin.register(OrderAdjustment)
+class OrderAdjustmentAdmin(admin.ModelAdmin):
+    list_display = ("id", "order", "created_by", "created_at")
+    search_fields = ("order__id", "reason")
+    readonly_fields = ("created_at",)
+
+
+@admin.register(Payment)
+class PaymentAdmin(admin.ModelAdmin):
+    list_display = ("id", "order", "provider", "provider_payment_id", "amount", "currency", "status", "created_at", "paid_at")
+    list_filter = ("provider", "status")
+    search_fields = ("order__id", "provider_payment_id")
+    readonly_fields = ("created_at", "paid_at", "raw_response")
 
 
 @admin.register(Purchase)

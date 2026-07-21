@@ -162,3 +162,14 @@ ORDER_NOTIFICATION_EMAILS = [
     for addr in os.environ.get("ORDER_NOTIFICATION_EMAILS", "").split(",")
     if addr.strip()
 ]
+
+# ── Payments: YooKassa (ЮKassa / YooMoney для бизнеса) ─────────────────────────
+# shopId и секретный ключ берутся из личного кабинета ЮKassa.
+# https://yookassa.ru/my  → Настройки → Магазин.
+YOOKASSA_SHOP_ID = os.environ.get("YOOKASSA_SHOP_ID", "")
+YOOKASSA_SECRET_KEY = os.environ.get("YOOKASSA_SECRET_KEY", "")
+YOOKASSA_API_URL = os.environ.get("YOOKASSA_API_URL", "https://api.yookassa.ru/v3")
+# Куда вернётся пользователь после оплаты (deep-link в приложение или веб-страница)
+YOOKASSA_RETURN_URL = os.environ.get("YOOKASSA_RETURN_URL", "https://autoterra.ru/payment/return")
+# Секрет для проверки входящих webhook-ов (необязателен; см. views).
+YOOKASSA_WEBHOOK_SECRET = os.environ.get("YOOKASSA_WEBHOOK_SECRET", "")

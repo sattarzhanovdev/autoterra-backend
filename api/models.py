@@ -297,12 +297,26 @@ class Product(models.Model):
         related_name="products",
         verbose_name="Дистрибьютор",
     )
-    sku = models.CharField("Артикул", max_length=64)
+    sku = models.CharField("Артикул продавца", max_length=64)
     external_id = models.CharField("Внешний ID (1C)", max_length=128, blank=True, null=True, db_index=True)
+    wb_article = models.CharField("Артикул WB", max_length=64, blank=True, db_index=True)
+    group_name = models.CharField("Группа", max_length=128, blank=True)
     name = models.CharField("Название", max_length=255)
     category = models.CharField("Категория", max_length=128)
     brand = models.CharField("Бренд", max_length=128, default="AutoTerra")
+    description = models.TextField("Описание", blank=True)
+    color = models.CharField("Цвет", max_length=128, blank=True)
+    barcode = models.CharField("Баркод", max_length=64, blank=True, db_index=True)
+    images = models.JSONField("Фото (ссылки)", default=list, blank=True)
+    video_url = models.URLField("Видео", max_length=512, blank=True)
     volume = models.DecimalField("Объём", max_digits=8, decimal_places=2, default=0)
+    # Габариты и вес упаковки (из шаблона WB)
+    weight = models.DecimalField("Вес с упаковкой (кг)", max_digits=8, decimal_places=3, default=0)
+    package_height = models.DecimalField("Высота упаковки (см)", max_digits=8, decimal_places=2, default=0)
+    package_length = models.DecimalField("Длина упаковки (см)", max_digits=8, decimal_places=2, default=0)
+    package_width = models.DecimalField("Ширина упаковки (см)", max_digits=8, decimal_places=2, default=0)
+    tnved = models.CharField("ТНВЭД", max_length=32, blank=True)
+    vat_rate = models.CharField("Ставка НДС", max_length=16, blank=True)
     price = models.DecimalField("Цена", max_digits=12, decimal_places=2, default=0)
     quantity = models.PositiveIntegerField("Остаток", default=0)
     status = models.CharField("Статус", max_length=32, choices=STOCK_CHOICES, default="inStock")
@@ -321,11 +335,34 @@ class Product(models.Model):
 
 class Order(models.Model):
     STATUS_CHOICES = [
-        ("new", "Новый"),
-        ("accepted", "Принят"),
-        ("rejected", "Отклонён"),
-        ("fulfilled", "Выполнен"),
+        ("new", "Новый"),                # клиент оформил, ждёт проверки оператором
+        ("confirmed", "Подтверждён"),    # оператор подтвердил наличие, готов к оплате
+        ("adjusted", "Скорректирован"),  # оператор изменил состав, ждёт согласия клиента
+        ("accepted", "Принят"),          # legacy-статус (сохранён для обратной совместимости)
+        ("rejected", "Отклонён"),        # оператор отклонил заказ
+        ("paid", "Оплачен"),             # клиент оплатил подтверждённый заказ
+        ("shipped", "Отправлен"),        # товар отправлен клиенту
+        ("fulfilled", "Выполнен"),       # товар доставлен, заказ завершён
+        ("cancelled", "Отменён"),        # клиент отменил заказ (только до оплаты)
     ]
+
+    # Разрешённые переходы статусов (state machine). Ключ — текущий статус,
+    # значение — множество допустимых следующих статусов. Служит единственным
+    # источником правды для валидации во всех endpoint-ах заказа.
+    STATUS_TRANSITIONS = {
+        "new": {"confirmed", "adjusted", "rejected", "cancelled", "accepted"},
+        "confirmed": {"paid", "cancelled"},
+        "adjusted": {"confirmed", "paid", "cancelled"},  # confirmed = клиент согласился
+        "accepted": {"paid", "shipped", "rejected", "fulfilled", "cancelled"},  # legacy
+        "rejected": set(),
+        "paid": {"shipped"},
+        "shipped": {"fulfilled"},
+        "fulfilled": set(),
+        "cancelled": set(),
+    }
+
+    # Статусы, в которых клиент может инициировать оплату
+    PAYABLE_STATUSES = {"confirmed", "adjusted"}
 
     DELIVERY_CHOICES = [
         ("courier", "Курьерская доставка"),
@@ -350,13 +387,23 @@ class Order(models.Model):
         blank=True,
     )
     estimated_delivery_date = models.DateField("Ожидаемая дата доставки", null=True, blank=True)
-    
+
+    confirmed_at = models.DateTimeField("Подтверждён", null=True, blank=True)
+    paid_at = models.DateTimeField("Оплачен", null=True, blank=True)
+    shipped_at = models.DateTimeField("Отправлен", null=True, blank=True)
+
     created_at = models.DateTimeField("Создан", auto_now_add=True)
 
     class Meta:
         verbose_name = "Заказ"
         verbose_name_plural = "Заказы"
         ordering = ("-created_at",)
+
+    def can_transition_to(self, new_status):
+        """True if new_status is a valid next state from the current status."""
+        if new_status == self.status:
+            return False
+        return new_status in self.STATUS_TRANSITIONS.get(self.status, set())
 
     def __str__(self):
         return f"Заказ #{self.id} · {self.client}"
@@ -387,6 +434,69 @@ class OrderItem(models.Model):
 
     def __str__(self):
         return f"{self.name} x {self.quantity}"
+
+
+class OrderAdjustment(models.Model):
+    """История корректировок заказа оператором (для прозрачности перед клиентом)."""
+
+    order = models.ForeignKey(
+        Order, on_delete=models.CASCADE, related_name="adjustments", verbose_name="Заказ"
+    )
+    original_items = models.JSONField("Изначальные позиции", default=list)
+    adjusted_items = models.JSONField("Подтверждённые позиции", default=list)
+    reason = models.TextField("Комментарий оператора", blank=True)
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="order_adjustments",
+        verbose_name="Кто скорректировал",
+        null=True,
+        blank=True,
+    )
+    created_at = models.DateTimeField("Создано", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Корректировка заказа"
+        verbose_name_plural = "Корректировки заказов"
+        ordering = ("-created_at",)
+
+    def __str__(self):
+        return f"Корректировка заказа #{self.order_id}"
+
+
+class Payment(models.Model):
+    """Платёж по заказу через YooKassa (ЮKassa / YooMoney для бизнеса)."""
+
+    STATUS_CHOICES = [
+        ("pending", "Ожидает оплаты"),
+        ("waiting_for_capture", "Ожидает подтверждения"),
+        ("succeeded", "Оплачен"),
+        ("canceled", "Отменён"),
+    ]
+
+    order = models.ForeignKey(
+        Order, on_delete=models.CASCADE, related_name="payments", verbose_name="Заказ"
+    )
+    provider = models.CharField("Провайдер", max_length=32, default="yookassa")
+    provider_payment_id = models.CharField(
+        "ID платежа у провайдера", max_length=128, blank=True, db_index=True
+    )
+    amount = models.DecimalField("Сумма", max_digits=12, decimal_places=2, default=0)
+    currency = models.CharField("Валюта", max_length=8, default="RUB")
+    status = models.CharField("Статус", max_length=32, choices=STATUS_CHOICES, default="pending")
+    confirmation_url = models.URLField("Ссылка на оплату", max_length=512, blank=True)
+    idempotence_key = models.CharField("Ключ идемпотентности", max_length=64, blank=True)
+    raw_response = models.JSONField("Ответ провайдера", default=dict, blank=True)
+    created_at = models.DateTimeField("Создан", auto_now_add=True)
+    paid_at = models.DateTimeField("Оплачен", null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Платёж"
+        verbose_name_plural = "Платежи"
+        ordering = ("-created_at",)
+
+    def __str__(self):
+        return f"Платёж {self.provider_payment_id or self.pk} · {self.get_status_display()}"
 
 
 class Purchase(models.Model):
