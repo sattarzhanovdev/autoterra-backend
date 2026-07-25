@@ -19,6 +19,7 @@ urlpatterns = [
     path("order-config/", views.order_config),
     path("orders/", views.orders),
     path("orders/create/", views.create_order),
+    path("orders/<int:order_id>/", views.order_detail),
     path("orders/<int:order_id>/cancel/", views.cancel_order),
     # Безопасный поток заказа
     path("orders/<int:order_id>/confirm/", views.confirm_order),          # оператор

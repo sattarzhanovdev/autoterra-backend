@@ -173,3 +173,75 @@ class SafeOrderFlowTests(TestCase):
         self.assertEqual(order.status, "cancelled")
         self.product.refresh_from_db()
         self.assertEqual(self.product.quantity, 10)
+
+    # ── данные для экрана разбора заказа ────────────────────────────────────
+    def test_order_item_exposes_id_and_stock(self):
+        """Оператору нужны id позиции (для корректировки) и остаток."""
+        order = self._make_order(qty=2)
+        resp = self.http.get(f"/api/orders/{order.id}/", **self._dist())
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+        item = resp.json()["order"]["items"][0]
+        self.assertEqual(item["id"], str(order.items.first().id))
+        self.assertEqual(item["productId"], str(self.product.id))
+        self.assertEqual(item["availableQuantity"], 10)
+
+    def test_item_id_is_accepted_by_adjust(self):
+        """id из выдачи должен подходить для корректировки без преобразований."""
+        order = self._make_order(qty=5)
+        detail = self.http.get(f"/api/orders/{order.id}/", **self._dist()).json()
+        item_id = detail["order"]["items"][0]["id"]
+
+        resp = self._post(
+            f"/api/orders/{order.id}/adjust/",
+            self._dist(),
+            {"items": [{"itemId": item_id, "quantity": 3}], "reason": "нет остатка"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        order.refresh_from_db()
+        self.assertEqual(order.status, "adjusted")
+        self.assertEqual(order.items.first().quantity, 3)
+
+    def test_on_order_product_has_no_stock_limit(self):
+        """Товар под заказ остатком не ограничен — в выдаче это null."""
+        self.product.status = "onOrder"
+        self.product.quantity = 0
+        self.product.save()
+        order = self._make_order(qty=7)
+
+        resp = self.http.get(f"/api/orders/{order.id}/", **self._dist())
+        self.assertIsNone(resp.json()["order"]["items"][0]["availableQuantity"])
+
+    # ── доступ к карточке заказа ────────────────────────────────────────────
+    def test_client_can_open_own_order(self):
+        order = self._make_order()
+        resp = self.http.get(f"/api/orders/{order.id}/", **self._cli())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["order"]["id"], str(order.id))
+
+    def test_foreign_client_cannot_open_order(self):
+        other_user = User.objects.create_user(username="cli2", password="pw")
+        other_user.profile.role = "client"
+        other_user.profile.save()
+        ClientProfile.objects.create(
+            user=other_user, inn="9999999999", company_name="Чужой",
+            region=self.region, distributor=self.distributor, phone="2",
+            city="Msk", contact_name="Пётр",
+        )
+        token = AuthToken.objects.create(key="cli2-token", user=other_user)
+
+        order = self._make_order()
+        resp = self.http.get(
+            f"/api/orders/{order.id}/", HTTP_AUTHORIZATION=f"Bearer {token.key}"
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_order_detail_requires_auth(self):
+        order = self._make_order()
+        self.assertEqual(self.http.get(f"/api/orders/{order.id}/").status_code, 401)
+
+    def test_order_detail_does_not_shadow_create(self):
+        """`orders/create/` не должен перехватываться маршрутом карточки."""
+        resp = self._post("/api/orders/create/", self._cli(), {"items": []})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("товары", resp.json()["detail"].lower())

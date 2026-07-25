@@ -742,7 +742,19 @@ def _format_attachment(item):
 
 
 def _format_order_item(item):
+    # id нужен оператору, чтобы отправить корректировку (adjust_order ждёт itemId),
+    # availableQuantity — чтобы прямо в позиции было видно, хватает ли остатка.
+    product = item.product
+    if product is None:
+        available = None
+    elif product.status == "onOrder":
+        available = None  # товар под заказ — остаток не ограничивает
+    else:
+        available = product.quantity
+
     return {
+        "id": str(item.id),
+        "productId": str(item.product_id) if item.product_id else None,
         "sku": item.sku,
         "name": item.name,
         "category": item.category,
@@ -750,11 +762,12 @@ def _format_order_item(item):
         "volume": float(item.volume),
         "price": float(item.price),
         "brand": item.brand,
+        "availableQuantity": available,
     }
 
 
 def _format_order(order):
-    items = [_format_order_item(item) for item in order.items.all()]
+    items = [_format_order_item(item) for item in order.items.select_related("product")]
     def _get_courier_name(c):
         if not c:
             return None
@@ -1395,6 +1408,39 @@ def orders(request):
         return err
     qs = client.orders.select_related("store", "distributor").prefetch_related("items").order_by("-created_at")
     return JsonResponse(paginated_response(request, qs, _format_order))
+
+
+def order_detail(request, order_id):
+    """Один заказ. Нужен для перехода из письма/пуша по ссылке /orders/<id>.
+
+    Доступ у клиента-владельца и у дистрибьютора, которому заказ адресован.
+    """
+    user = _current_user(request)
+    if user is None:
+        return JsonResponse({"detail": "Unauthorized"}, status=401)
+
+    order = (
+        Order.objects.select_related("client", "store", "distributor")
+        .prefetch_related("items__product", "adjustments", "payments")
+        .filter(id=order_id)
+        .first()
+    )
+    if not order:
+        return JsonResponse({"detail": "Заказ не найден"}, status=404)
+
+    role = getattr(getattr(user, "profile", None), "role", "client")
+    if role == "client":
+        allowed = getattr(getattr(user, "client_profile", None), "id", None) == order.client_id
+    elif role in ("distributor", "operator"):
+        distributor = getattr(user, "distributor_profile", None)
+        allowed = distributor is not None and distributor.id == order.distributor_id
+    else:
+        allowed = role in ("admin", "manager")
+
+    if not allowed:
+        return JsonResponse({"detail": "Нет доступа к заказу"}, status=403)
+
+    return JsonResponse({"order": _format_order(order)})
 
 
 @csrf_exempt
