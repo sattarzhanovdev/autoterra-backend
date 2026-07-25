@@ -53,6 +53,7 @@ from .models import (
     ContactHistory,
     grown_partner_status,
 )
+from .pagination import paginate, paginated_response
 from .serializers import RegistrationSerializer, PurchaseSerializer, coerce_decimal
 
 try:
@@ -347,7 +348,13 @@ def _json(request):
         return {}
 
 
-def _paginate(request, qs, default_limit=50):
+def _limit(request, qs, default_limit=50):
+    """Ограничивает размер вложенного списка внутри составного ответа.
+
+    Применяется там, где в одном ответе отдаётся сразу несколько списков и
+    полноценная постраничная навигация невозможна. Для обычных списочных
+    эндпоинтов используйте ``paginated_response`` из ``api.pagination``.
+    """
     try:
         limit = int(request.GET.get("limit", default_limit))
         offset = int(request.GET.get("offset", 0))
@@ -355,7 +362,7 @@ def _paginate(request, qs, default_limit=50):
         limit = default_limit
         offset = 0
     limit = min(limit, 100)
-    return qs[offset:offset+limit]
+    return qs[offset:offset + limit]
 
 
 def _normalize_phone(phone):
@@ -1285,7 +1292,7 @@ def stores(request):
 
     if request.method == "GET":
         qs = client.stores.filter(is_active=True)
-        return JsonResponse({"results": [_format_store(item) for item in qs]})
+        return JsonResponse(paginated_response(request, qs, _format_store))
 
     if request.method == "POST":
         try:
@@ -1347,7 +1354,21 @@ def products(request):
         qs = qs.filter(category=category)
     if search:
         qs = qs.filter(Q(name__icontains=search) | Q(sku__icontains=search) | Q(brand__icontains=search))
-    return JsonResponse({"categories": list(Product.objects.filter(distributor=client.distributor, is_active=True).values_list("category", flat=True).distinct()), "results": [_format_product(item) for item in qs.order_by("category", "name")]})
+    # order_by() сбрасывает Meta.ordering ("category", "name"): иначе "name"
+    # попадает в SELECT ради сортировки и DISTINCT перестаёт схлопывать
+    # одинаковые категории.
+    categories = list(
+        Product.objects.filter(distributor=client.distributor, is_active=True)
+        .order_by("category")
+        .values_list("category", flat=True)
+        .distinct()
+    )
+    return JsonResponse(paginated_response(
+        request,
+        qs.order_by("category", "name"),
+        _format_product,
+        extra={"categories": categories},
+    ))
 
 
 @require_GET
@@ -1373,7 +1394,7 @@ def orders(request):
     if err:
         return err
     qs = client.orders.select_related("store", "distributor").prefetch_related("items").order_by("-created_at")
-    return JsonResponse({"results": [_format_order(item) for item in qs]})
+    return JsonResponse(paginated_response(request, qs, _format_order))
 
 
 @csrf_exempt
@@ -1889,7 +1910,18 @@ def purchases(request):
     if err:
         return err
     qs = client.purchases.prefetch_related("items").order_by("-date")
-    return JsonResponse({"results": [_format_purchase(item) for item in qs]})
+
+    # Сводка считается по всей выборке, а не по текущей странице — иначе
+    # итоги на экране менялись бы по мере подгрузки.
+    pending_statuses = ["new", "pending", "pending_verification", "under_review", "duplicate_review"]
+    stats = {
+        "totalAmount": float(
+            qs.exclude(status="rejected").aggregate(total=Sum("total_amount"))["total"] or 0
+        ),
+        "verifiedCount": qs.filter(status="verified").count(),
+        "pendingCount": qs.filter(status__in=pending_statuses).count(),
+    }
+    return JsonResponse(paginated_response(request, qs, _format_purchase, extra={"stats": stats}))
 
 
 @csrf_exempt
@@ -1975,7 +2007,9 @@ def color_requests(request):
     if err:
         return err
     qs = client.color_requests.prefetch_related("materials", "courier_tasks").all()
-    return JsonResponse({"results": [_format_color_request(item) for item in qs]})
+    if request.GET.get("active") == "true":
+        qs = qs.exclude(status__in=["delivered", "cancelled"])
+    return JsonResponse(paginated_response(request, qs, _format_color_request))
 
 
 @csrf_exempt
@@ -2096,7 +2130,9 @@ def courier_tasks(request):
     if err:
         return err
     qs = client.courier_tasks.all()
-    return JsonResponse({"results": [_format_courier_task(item) for item in qs]})
+    if request.GET.get("active") == "true":
+        qs = qs.exclude(status__in=["delivered", "returned", "cancelled"])
+    return JsonResponse(paginated_response(request, qs, _format_courier_task))
 
 
 @csrf_exempt
@@ -2199,8 +2235,12 @@ def courier_my_tasks(request):
     qs = CourierTask.objects.filter(courier=user).order_by("-created_at")
     if is_admin:
         qs = CourierTask.objects.all().order_by("-created_at")
-        
-    return JsonResponse({"results": [_format_courier_task(item) for item in qs]})
+
+    status_filter = request.GET.get("status")
+    if status_filter:
+        qs = qs.filter(status=status_filter)
+
+    return JsonResponse(paginated_response(request, qs, _format_courier_task))
 
 @csrf_exempt
 @require_http_methods(["PATCH", "POST"])
@@ -2272,7 +2312,11 @@ def distributors(request):
     if not is_global and profile and profile.role == "manager":
         qs = qs.filter(managed_regions__manager=user)
         
-    return JsonResponse({"results": [{"id": str(d.id), "name": d.name} for d in qs.distinct()]})
+    return JsonResponse(paginated_response(
+        request,
+        qs.distinct(),
+        lambda d: {"id": str(d.id), "name": d.name},
+    ))
 
 
 def _is_user_global(user, profile=None):
@@ -2832,17 +2876,16 @@ def admin_integration_tokens(request):
         Prefetch('integration_tokens', queryset=active_tokens, to_attr='active_tokens_list')
     ).distinct()
 
-    results = []
-    for d in distributors:
+    def _format_token_row(d):
         token = d.active_tokens_list[0] if d.active_tokens_list else None
-        results.append({
+        return {
             "id": str(d.id),
             "name": d.name,
             "token": token.token if token else None,
-            "createdAt": token.created_at.isoformat() if token else None
-        })
+            "createdAt": token.created_at.isoformat() if token else None,
+        }
 
-    return JsonResponse({"results": results})
+    return JsonResponse(paginated_response(request, distributors, _format_token_row))
 
 
 @csrf_exempt
@@ -2882,20 +2925,18 @@ def admin_integration_logs(request):
         
     qs = SyncLog.objects.select_related("distributor").order_by("-created_at")
     qs = _filter_by_manager_scope(user, is_global, qs, region_path="distributor__managed_regions")
-    recent_logs = _paginate(request, qs.distinct())
-    
-    return JsonResponse({
-        "results": [
-            {
-                "id": str(log.id),
-                "distributorName": log.distributor.name,
-                "type": log.sync_type,
-                "status": log.status,
-                "details": log.details,
-                "createdAt": log.created_at.isoformat()
-            } for log in recent_logs
-        ]
-    })
+    return JsonResponse(paginated_response(
+        request,
+        qs.distinct(),
+        lambda log: {
+            "id": str(log.id),
+            "distributorName": log.distributor.name,
+            "type": log.sync_type,
+            "status": log.status,
+            "details": log.details,
+            "createdAt": log.created_at.isoformat(),
+        },
+    ))
 
 
 @require_GET
@@ -3056,21 +3097,17 @@ def distributor_couriers(request):
     if err:
         return err
     # Get all users with courier role
-    qs = User.objects.filter(profile__role="courier", is_active=True)
-    
-    def _get_courier_name(c):
+    qs = User.objects.filter(profile__role="courier", is_active=True).order_by("username")
+
+    def _format_courier(c):
         full_name = f"{c.first_name} {c.last_name}".strip()
-        return full_name if full_name else f"Курьер {c.username}"
-        
-    return JsonResponse({
-        "results": [
-            {
-                "id": str(c.id),
-                "name": _get_courier_name(c),
-                "phone": c.username
-            } for c in qs
-        ]
-    })
+        return {
+            "id": str(c.id),
+            "name": full_name if full_name else f"Курьер {c.username}",
+            "phone": c.username,
+        }
+
+    return JsonResponse(paginated_response(request, qs, _format_courier))
 
 
 @require_GET
@@ -3110,9 +3147,12 @@ def distributor_color_requests(request):
     status = request.GET.get("status")
     if status:
         qs = qs.filter(status=status)
-    
-    qs = _paginate(request, qs)
-    return JsonResponse({"results": [_format_color_request(item) for item in qs]})
+    elif request.GET.get("active") == "true":
+        # Только заявки в работе. Фильтруем на сервере: иначе при пагинации
+        # страница могла бы целиком состоять из завершённых заявок.
+        qs = qs.exclude(status__in=["delivered", "cancelled"])
+
+    return JsonResponse(paginated_response(request, qs, _format_color_request))
 
 
 @csrf_exempt
@@ -3164,8 +3204,10 @@ def distributor_clients(request):
     if err:
         return err
     qs = _scope_clients(distributor, is_admin)
-    qs = _paginate(request, qs)
-    return JsonResponse({"results": [_format_client(item) for item in qs]})
+    search = (request.GET.get("search") or "").strip()
+    if search:
+        qs = qs.filter(Q(company_name__icontains=search) | Q(inn__icontains=search))
+    return JsonResponse(paginated_response(request, qs, _format_client))
 
 
 @require_GET
@@ -3187,8 +3229,8 @@ def distributor_purchases(request):
         # Show only what needs attention
         to_verify_list = ["new", "pending", "pending_verification", "under_review", "duplicate_review"]
         qs = qs.filter(status__in=to_verify_list)
-    
-    return JsonResponse({"results": [_format_purchase(item) for item in qs]})
+
+    return JsonResponse(paginated_response(request, qs, _format_purchase))
 
 
 import openpyxl
@@ -3299,12 +3341,12 @@ def distributor_orders(request):
         return err
     
     qs = _scope_orders(distributor, is_admin).order_by("-created_at")
-    
+
     status_filter = request.GET.get("status")
     if status_filter:
         qs = qs.filter(status=status_filter)
 
-    return JsonResponse({"results": [_format_order(item) for item in qs]})
+    return JsonResponse(paginated_response(request, qs, _format_order))
 
 
 @require_GET
@@ -3314,12 +3356,14 @@ def distributor_delivery_tasks(request):
         return err
     
     qs = _scope_courier_tasks(distributor, is_admin).order_by("-created_at")
-    
+
     status_filter = request.GET.get("status")
     if status_filter:
         qs = qs.filter(status=status_filter)
+    elif request.GET.get("active") == "true":
+        qs = qs.exclude(status__in=["delivered", "returned", "cancelled"])
 
-    return JsonResponse({"results": [_format_courier_task(item) for item in qs]})
+    return JsonResponse(paginated_response(request, qs, _format_courier_task))
 
 
 @csrf_exempt
@@ -3437,7 +3481,15 @@ def distributor_stock(request):
     if err:
         return err
     qs = _scope_products(distributor, is_admin)
-    return JsonResponse({"results": [_format_product(item) for item in qs]})
+    search = (request.GET.get("search") or "").strip()
+    if search:
+        qs = qs.filter(
+            Q(name__icontains=search) | Q(sku__icontains=search) | Q(brand__icontains=search)
+        )
+    category = (request.GET.get("category") or "").strip()
+    if category:
+        qs = qs.filter(category=category)
+    return JsonResponse(paginated_response(request, qs, _format_product))
 
 
 @csrf_exempt
@@ -3562,11 +3614,12 @@ def referrals(request):
         "giftCount": qs.filter(condition_met=True).count(),
         "purchaseAmount": float(sum(r.purchase_amount for r in qs)),
     }
-    qs = _paginate(request, qs.order_by("-created_at"))
-    return JsonResponse({
-        "stats": stats,
-        "results": [_format_referral(item) for item in qs]
-    })
+    return JsonResponse(paginated_response(
+        request,
+        qs.order_by("-created_at"),
+        _format_referral,
+        extra={"stats": stats},
+    ))
 
 @csrf_exempt
 @require_POST
@@ -3596,13 +3649,11 @@ def tickets(request):
             return err # Original unauthorized error
         # It's an expert, return all tickets or filtered
         qs = ExpertTicket.objects.select_related("client").order_by("-created_at")
-        qs = _paginate(request, qs)
-        return JsonResponse({"results": [_format_ticket(item) for item in qs]})
-    
+        return JsonResponse(paginated_response(request, qs, _format_ticket))
+
     # It's a client, return only their tickets
     qs = client.expert_tickets.order_by("-created_at")
-    qs = _paginate(request, qs)
-    return JsonResponse({"results": [_format_ticket(item) for item in qs]})
+    return JsonResponse(paginated_response(request, qs, _format_ticket))
 
 
 @csrf_exempt
@@ -3680,10 +3731,22 @@ def knowledge_cards(request):
     user = _current_user(request)
     # Check if user is expert to see drafts
     if _is_expert_user(user):
-        qs = KnowledgeCard.objects.all()
+        # Эксперту неодобренные карточки показываем первыми. Сортировка должна
+        # быть на сервере: отсортировать одну страницу на клиенте недостаточно.
+        qs = KnowledgeCard.objects.all().order_by(
+            models.Case(
+                models.When(status="approved", then=models.Value(1)),
+                default=models.Value(0),
+                output_field=models.IntegerField(),
+            ),
+            "-created_at",
+        )
     else:
         qs = KnowledgeCard.objects.filter(status="approved")
-    return JsonResponse({"results": [_format_knowledge_card(item) for item in qs]})
+    search = (request.GET.get("search") or "").strip()
+    if search:
+        qs = qs.filter(Q(problem__icontains=search) | Q(solution__icontains=search))
+    return JsonResponse(paginated_response(request, qs, _format_knowledge_card))
 
 
 @csrf_exempt
@@ -3871,17 +3934,16 @@ def regions(request):
         if not is_global and profile and profile.role == "manager":
             qs = qs.filter(manager=user)
         
-    return JsonResponse({
-        "results": [
-            {
-                "id": str(item.id),
-                "code": item.code,
-                "name": item.name,
-                "active": item.is_active,
-            }
-            for item in qs.distinct()
-        ]
-    })
+    return JsonResponse(paginated_response(
+        request,
+        qs.distinct(),
+        lambda item: {
+            "id": str(item.id),
+            "code": item.code,
+            "name": item.name,
+            "active": item.is_active,
+        },
+    ))
 
 
 @require_GET
@@ -3891,8 +3953,12 @@ def notifications(request):
         return JsonResponse({"detail": "Unauthorized"}, status=401)
         
     qs = user.notifications.order_by("-created_at")
-    qs = _paginate(request, qs)
-    return JsonResponse({"results": [_format_notification(item) for item in qs]})
+    return JsonResponse(paginated_response(
+        request,
+        qs,
+        _format_notification,
+        extra={"unreadCount": user.notifications.filter(is_read=False).count()},
+    ))
 
 
 @csrf_exempt
@@ -3925,7 +3991,11 @@ def manager_clients(request):
         if region_filter:
             qs = qs.filter(region_id=region_filter)
 
-        return JsonResponse({'results': [_format_manager_client(c) for c in qs]})
+        search = (request.GET.get('search') or '').strip()
+        if search:
+            qs = qs.filter(Q(company_name__icontains=search) | Q(inn__icontains=search))
+
+        return JsonResponse(paginated_response(request, qs, _format_manager_client))
 
     if request.method == 'POST':
         user, is_global, err = _require_manager_scope(request)
@@ -4038,19 +4108,19 @@ def manager_client_unified(request, client_id):
     profile_data = _format_client(client)
     
     # 2. Purchases
-    purchases = [_format_purchase(p) for p in _paginate(request, client.purchases.all().order_by("-date"))]
+    purchases = [_format_purchase(p) for p in _limit(request, client.purchases.all().order_by("-date"))]
     
     # 3. Orders
-    orders = [_format_order(o) for o in _paginate(request, client.orders.all().order_by("-created_at"))]
+    orders = [_format_order(o) for o in _limit(request, client.orders.all().order_by("-created_at"))]
     
     # 4. Color Requests
-    color_requests = [_format_color_request(c) for c in _paginate(request, client.color_requests.all().order_by("-created_at"))]
+    color_requests = [_format_color_request(c) for c in _limit(request, client.color_requests.all().order_by("-created_at"))]
     
     # 5. Expert Tickets
-    tickets = [_format_ticket(t) for t in _paginate(request, client.expert_tickets.all().order_by("-created_at"))]
+    tickets = [_format_ticket(t) for t in _limit(request, client.expert_tickets.all().order_by("-created_at"))]
     
     # 6. Referrals
-    referrals = [_format_referral(r) for r in _paginate(request, client.referrals.all().order_by("-created_at"))]
+    referrals = [_format_referral(r) for r in _limit(request, client.referrals.all().order_by("-created_at"))]
     
     return JsonResponse({
         "client": profile_data,
@@ -4107,7 +4177,7 @@ def manager_client_history(request, client_id):
 
     if request.method == 'GET':
         entries = client.contact_history.select_related('manager').order_by('-date')
-        return JsonResponse({'results': [_format_contact_history(e) for e in entries]})
+        return JsonResponse(paginated_response(request, entries, _format_contact_history))
 
     if request.method == 'POST':
         try:
@@ -4147,7 +4217,7 @@ def manager_tasks(request):
         status_filter = request.GET.get('status')
         if status_filter:
             qs = qs.filter(status=status_filter)
-        return JsonResponse({'results': [_format_manager_task(t) for t in qs]})
+        return JsonResponse(paginated_response(request, qs, _format_manager_task))
 
     if request.method == 'POST':
         try:
@@ -4348,17 +4418,22 @@ def admin_managers(request):
         return JsonResponse({'detail': 'Method not allowed'}, status=405)
 
     from .models import Profile
-    managers = User.objects.filter(profile__role='manager').select_related('profile').order_by('username')
-    results = [
-        {
+    managers = (
+        User.objects.filter(profile__role='manager')
+        .select_related('profile')
+        .prefetch_related('managed_regions')
+        .order_by('username')
+    )
+    return JsonResponse(paginated_response(
+        request,
+        managers,
+        lambda u: {
             'id': str(u.id),
             'username': u.username,
             'name': u.get_full_name() or u.username,
             'regions': [r.name for r in u.managed_regions.all()],
-        }
-        for u in managers
-    ]
-    return JsonResponse({'results': results})
+        },
+    ))
 
 
 @csrf_exempt
@@ -4376,7 +4451,7 @@ def admin_manager_tasks(request):
         status_filter = request.GET.get('status')
         if status_filter:
             qs = qs.filter(status=status_filter)
-        return JsonResponse({'results': [_format_manager_task(t) for t in qs]})
+        return JsonResponse(paginated_response(request, qs, _format_manager_task))
 
     if request.method == 'POST':
         try:
@@ -4449,8 +4524,11 @@ def admin_manager_clients(request, manager_id):
     is_global = not manager.managed_regions.exists()
     qs = ClientProfile.objects.all().select_related('region', 'distributor')
     qs = _filter_by_manager_scope(manager, is_global, qs)
-    results = [{'id': str(c.id), 'name': c.company_name} for c in qs]
-    return JsonResponse({'results': results})
+    return JsonResponse(paginated_response(
+        request,
+        qs,
+        lambda c: {'id': str(c.id), 'name': c.company_name},
+    ))
 
 
 def _auto_create_ticket(client, question, category):
