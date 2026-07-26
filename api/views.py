@@ -1363,10 +1363,16 @@ def products(request):
     qs = Product.objects.filter(distributor=client.distributor, is_active=True)
     category = (request.GET.get("category") or "").strip()
     search = (request.GET.get("search") or "").strip()
+    brand = (request.GET.get("brand") or "").strip()
     if category:
         qs = qs.filter(category=category)
+    if brand:
+        qs = qs.filter(brand=brand)
+    if request.GET.get("inStock") == "true":
+        # «Под заказ» тоже доступен к заказу, хотя остаток нулевой.
+        qs = qs.filter(Q(quantity__gt=0) | Q(status="onOrder"))
     if search:
-        qs = qs.filter(Q(name__icontains=search) | Q(sku__icontains=search) | Q(brand__icontains=search))
+        qs = _search_products(qs, search)
     # order_by() сбрасывает Meta.ordering ("category", "name"): иначе "name"
     # попадает в SELECT ради сортировки и DISTINCT перестаёт схлопывать
     # одинаковые категории.
@@ -1391,13 +1397,21 @@ def order_config(request):
         return err
     stores_qs = client.stores.filter(is_active=True)
     products_qs = Product.objects.filter(distributor=client.distributor, is_active=True)
-    categories = list(products_qs.values_list("category", flat=True).distinct())
+    # Здесь только справочники для формы заказа. Сам ассортимент отдаёт
+    # постраничный /products/ — раньше каталог целиком (сотни позиций) уезжал
+    # одним ответом на каждое открытие экрана.
+    categories = list(
+        products_qs.order_by("category").values_list("category", flat=True).distinct()
+    )
+    brands = list(
+        products_qs.order_by("brand").values_list("brand", flat=True).distinct()
+    )
     return JsonResponse({
         "client": _format_client(client),
         "distributor": _format_distributor(client.distributor),
         "stores": [_format_store(s) for s in stores_qs],
         "categories": categories,
-        "products": [_format_product(p) for p in products_qs],
+        "brands": brands,
     })
 
 
@@ -1567,6 +1581,13 @@ def _restore_order_stock(order):
         product.save(update_fields=["quantity", "status"])
 
 
+def _search_products(qs, query):
+    """Поиск по товарам: Elasticsearch, если настроен, иначе поиск в БД."""
+    from api.services.search import search_products
+
+    return search_products(qs, query)
+
+
 def _stock_shortages(items):
     """Список позиций, где запрошенное количество превышает остаток.
 
@@ -1601,7 +1622,12 @@ def _client_email_list(order):
 
 
 def _items_snapshot(order):
-    """JSON-снимок текущих позиций заказа (для истории корректировок)."""
+    """JSON-снимок текущих позиций заказа (для истории корректировок).
+
+    Читаем отдельным запросом, а не через ``order.items.all()``: заказ приходит
+    с ``prefetch_related("items")``, и после правок кэш отдал бы старый состав —
+    снимок «стало» совпал бы со снимком «было».
+    """
     return [
         {
             "productId": str(item.product_id),
@@ -1611,7 +1637,7 @@ def _items_snapshot(order):
             "quantity": item.quantity,
             "total": float(item.total),
         }
-        for item in order.items.all()
+        for item in OrderItem.objects.filter(order=order).order_by("id")
     ]
 
 
@@ -1655,8 +1681,14 @@ def confirm_order(request, order_id):
 def adjust_order(request, order_id):
     """Оператор корректирует состав заказа: new → adjusted.
 
-    payload: {"items": [{"itemId": 12, "quantity": 3}, ...], "reason": "..."}
+    payload: {
+        "items": [{"itemId": 12, "quantity": 3}, ...],   # правка существующих
+        "newItems": [{"productId": 5, "quantity": 2}],   # добавление позиций
+        "reason": "..."
+    }
     Позиции с quantity=0 удаляются. Разница по остаткам возвращается на склад.
+    Оператор может и убрать позицию, и добавить товар, которого клиент не выбрал
+    (например, замену закончившегося) — клиент затем согласует состав целиком.
     """
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
@@ -1669,8 +1701,9 @@ def adjust_order(request, order_id):
 
     payload = _json(request)
     updates = payload.get("items") or []
+    additions = payload.get("newItems") or []
     reason = (payload.get("reason") or "").strip()
-    if not updates:
+    if not updates and not additions:
         return JsonResponse({"detail": "Передайте позиции для корректировки"}, status=400)
 
     # Карта itemId -> новое количество
@@ -1680,6 +1713,17 @@ def adjust_order(request, order_id):
             qty_by_item[int(row.get("itemId"))] = max(0, int(row.get("quantity") or 0))
         except (TypeError, ValueError):
             return JsonResponse({"detail": "Некорректные данные позиции"}, status=400)
+
+    # Добавляемые товары: productId -> количество (суммируем дубли в запросе)
+    qty_by_new_product = {}
+    for row in additions:
+        try:
+            product_id = int(row.get("productId"))
+            quantity = int(row.get("quantity") or 0)
+        except (TypeError, ValueError):
+            return JsonResponse({"detail": "Некорректные данные новой позиции"}, status=400)
+        if quantity > 0:
+            qty_by_new_product[product_id] = qty_by_new_product.get(product_id, 0) + quantity
 
     original_snapshot = _items_snapshot(order)
 
@@ -1716,6 +1760,49 @@ def adjust_order(request, order_id):
                 item.quantity = new_qty
                 item.save(update_fields=["quantity"])
 
+        # Добавление товаров, которых клиент не выбирал
+        for product_id, quantity in qty_by_new_product.items():
+            product = Product.objects.filter(
+                id=product_id, distributor=order.distributor, is_active=True
+            ).first()
+            if product is None:
+                transaction.set_rollback(True)
+                return JsonResponse(
+                    {"detail": "Товар недоступен у этого дистрибьютора"}, status=400
+                )
+            if product.status != "onOrder" and product.quantity < quantity:
+                transaction.set_rollback(True)
+                return JsonResponse({
+                    "detail": f"Недостаточно «{product.name}» на складе. Доступно: {product.quantity}"
+                }, status=400)
+
+            # Тот же товар уже в заказе — наращиваем позицию, а не плодим дубль.
+            existing = order.items.filter(product=product).first()
+            if existing:
+                existing.quantity += quantity
+                existing.save(update_fields=["quantity"])
+            else:
+                OrderItem.objects.create(
+                    order=order,
+                    product=product,
+                    sku=product.sku,
+                    name=product.name,
+                    category=product.category,
+                    brand=product.brand,
+                    volume=product.volume,
+                    price=product.price,
+                    quantity=quantity,
+                )
+
+            product.quantity = max(0, product.quantity - quantity)
+            if product.quantity > 5:
+                product.status = "inStock"
+            elif product.quantity > 0:
+                product.status = "low"
+            elif product.status != "onOrder":
+                product.status = "outOfStock"
+            product.save(update_fields=["quantity", "status"])
+
         if not order.items.exists():
             transaction.set_rollback(True)
             return JsonResponse({"detail": "После корректировки в заказе не осталось позиций. Отклоните заказ."}, status=400)
@@ -1731,6 +1818,10 @@ def adjust_order(request, order_id):
             reason=reason,
             created_by=_current_user(request),
         )
+
+    # Сбрасываем кэш prefetch: сумма и состав в письме и в ответе должны быть
+    # уже новыми, а не теми, с которыми заказ загрузился в начале запроса.
+    order.refresh_from_db()
 
     _log_audit(request, f"Order adjust: {old_status} -> adjusted", order, {"reason": reason})
     _notify_client_order(order, "Заказ скорректирован", f"Заказ ORD-{order.id:05d} изменён оператором. Новая сумма: {order.total_amount} ₽. Подтвердите или отмените.")
@@ -3529,9 +3620,7 @@ def distributor_stock(request):
     qs = _scope_products(distributor, is_admin)
     search = (request.GET.get("search") or "").strip()
     if search:
-        qs = qs.filter(
-            Q(name__icontains=search) | Q(sku__icontains=search) | Q(brand__icontains=search)
-        )
+        qs = _search_products(qs, search)
     category = (request.GET.get("category") or "").strip()
     if category:
         qs = qs.filter(category=category)

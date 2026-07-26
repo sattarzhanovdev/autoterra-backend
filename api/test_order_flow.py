@@ -245,3 +245,92 @@ class SafeOrderFlowTests(TestCase):
         resp = self._post("/api/orders/create/", self._cli(), {"items": []})
         self.assertEqual(resp.status_code, 400)
         self.assertIn("товары", resp.json()["detail"].lower())
+
+    # ── редактирование состава оператором ───────────────────────────────────
+    def test_operator_can_add_product_to_order(self):
+        extra = Product.objects.create(
+            distributor=self.distributor, sku="SKU2", name="Лак", category="Лаки",
+            brand="AutoTerra", price=500, quantity=4, status="inStock",
+        )
+        order = self._make_order(qty=2)
+        item = order.items.first()
+
+        resp = self._post(
+            f"/api/orders/{order.id}/adjust/", self._dist(),
+            {
+                "items": [{"itemId": item.id, "quantity": 2}],
+                "newItems": [{"productId": extra.id, "quantity": 3}],
+                "reason": "добавил замену",
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+        data = resp.json()["order"]
+        skus = sorted(i["sku"] for i in data["items"])
+        self.assertEqual(skus, ["SKU1", "SKU2"], "новая позиция должна быть в ответе")
+        self.assertEqual(float(data["totalAmount"]), 2 * 1000 + 3 * 500)
+
+        extra.refresh_from_db()
+        self.assertEqual(extra.quantity, 1, "остаток добавленного товара должен списаться")
+
+    def test_adjustment_snapshot_reflects_new_composition(self):
+        order = self._make_order(qty=4)
+        item = order.items.first()
+        self._post(
+            f"/api/orders/{order.id}/adjust/", self._dist(),
+            {"items": [{"itemId": item.id, "quantity": 1}], "reason": "меньше"},
+        )
+        adjustment = order.adjustments.first()
+        self.assertEqual(adjustment.original_items[0]["quantity"], 4)
+        self.assertEqual(
+            adjustment.adjusted_items[0]["quantity"], 1,
+            "снимок «стало» должен быть после правок, а не из кэша prefetch",
+        )
+
+    def test_operator_can_remove_line_when_others_remain(self):
+        extra = Product.objects.create(
+            distributor=self.distributor, sku="SKU3", name="Растворитель",
+            category="Растворители", brand="AutoTerra", price=300, quantity=9,
+            status="inStock",
+        )
+        order = self._make_order(qty=2)
+        OrderItem.objects.create(
+            order=order, product=extra, sku=extra.sku, name=extra.name,
+            category=extra.category, brand=extra.brand, price=extra.price, quantity=1,
+        )
+        first = order.items.get(sku="SKU1")
+
+        resp = self._post(
+            f"/api/orders/{order.id}/adjust/", self._dist(),
+            {"items": [{"itemId": first.id, "quantity": 0}], "reason": "нет в наличии"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual([i["sku"] for i in resp.json()["order"]["items"]], ["SKU3"])
+
+    def test_adding_more_than_stock_is_rejected(self):
+        extra = Product.objects.create(
+            distributor=self.distributor, sku="SKU4", name="Отвердитель",
+            category="Отвердители", brand="AutoTerra", price=700, quantity=2,
+            status="inStock",
+        )
+        order = self._make_order(qty=1)
+        resp = self._post(
+            f"/api/orders/{order.id}/adjust/", self._dist(),
+            {"newItems": [{"productId": extra.id, "quantity": 5}], "reason": "много"},
+        )
+        self.assertEqual(resp.status_code, 400)
+        extra.refresh_from_db()
+        self.assertEqual(extra.quantity, 2, "остаток не должен измениться при откате")
+
+    def test_cannot_add_product_of_another_distributor(self):
+        other = Distributor.objects.create(name="Other", inn="5556667778", phone="9", email="o@e.co")
+        foreign = Product.objects.create(
+            distributor=other, sku="SKU9", name="Чужой", category="Краски",
+            brand="X", price=100, quantity=50, status="inStock",
+        )
+        order = self._make_order(qty=1)
+        resp = self._post(
+            f"/api/orders/{order.id}/adjust/", self._dist(),
+            {"newItems": [{"productId": foreign.id, "quantity": 1}]},
+        )
+        self.assertEqual(resp.status_code, 400)

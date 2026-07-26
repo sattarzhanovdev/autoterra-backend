@@ -110,6 +110,12 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "autoterra_backend.wsgi.application"
 
+# Поиск по товарам. Пока URL пуст, работает поиск средствами БД — отдельный
+# сервис поднимать не требуется. Задайте адрес, чтобы включить Elasticsearch.
+ELASTICSEARCH_URL = os.environ.get("ELASTICSEARCH_URL", "")
+ELASTICSEARCH_INDEX = os.environ.get("ELASTICSEARCH_INDEX", "autoterra-products")
+ELASTICSEARCH_TIMEOUT = float(os.environ.get("ELASTICSEARCH_TIMEOUT", "3"))
+
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",

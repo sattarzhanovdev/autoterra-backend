@@ -133,3 +133,48 @@ class PaginationTests(TestCase):
         self.assertEqual(body["results"], [])
         self.assertEqual(body["pagination"]["count"], 0)
         self.assertFalse(body["pagination"]["hasNext"])
+
+    def test_order_config_no_longer_ships_whole_catalog(self):
+        """Каталог уезжал целиком на каждое открытие экрана заказа."""
+        body = self._get("/api/order-config/").json()
+
+        self.assertNotIn("products", body)
+        self.assertIn("categories", body)
+        self.assertIn("brands", body)
+
+    def test_in_stock_filter_excludes_zero_quantity(self):
+        Product.objects.filter(sku="SKU-000").update(quantity=0, status="outOfStock")
+        body = self._get("/api/products/", inStock="true", page_size=100).json()
+
+        skus = [item["sku"] for item in body["results"]]
+        self.assertNotIn("SKU-000", skus)
+        self.assertEqual(body["pagination"]["count"], 24)
+
+    def test_in_stock_filter_keeps_on_order_products(self):
+        """«Под заказ» заказать можно, хотя остаток нулевой."""
+        Product.objects.filter(sku="SKU-000").update(quantity=0, status="onOrder")
+        body = self._get("/api/products/", inStock="true", page_size=100).json()
+
+        self.assertIn("SKU-000", [item["sku"] for item in body["results"]])
+
+    def test_brand_filter(self):
+        Product.objects.filter(sku="SKU-001").update(brand="Novol")
+        body = self._get("/api/products/", brand="Novol").json()
+
+        self.assertEqual(body["pagination"]["count"], 1)
+        self.assertEqual(body["results"][0]["sku"], "SKU-001")
+
+    def test_filters_combine_and_apply_before_pagination(self):
+        Product.objects.filter(sku__in=["SKU-001", "SKU-002"]).update(brand="Novol")
+        Product.objects.filter(sku="SKU-002").update(quantity=0, status="outOfStock")
+        body = self._get("/api/products/", brand="Novol", inStock="true").json()
+
+        self.assertEqual(body["pagination"]["count"], 1)
+        self.assertEqual(body["results"][0]["sku"], "SKU-001")
+
+    def test_cyrillic_search_is_case_insensitive(self):
+        Product.objects.filter(sku="SKU-003").update(name="Грунт акриловый")
+        body = self._get("/api/products/", search="грунт").json()
+
+        self.assertEqual(body["pagination"]["count"], 1)
+        self.assertEqual(body["results"][0]["sku"], "SKU-003")
