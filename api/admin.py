@@ -36,6 +36,7 @@ from .models import (
     Referral,
     Store,
     Profile,
+    MAX_PRODUCT_IMAGES,
 )
 
 admin.site.site_header = "AutoTerra Admin"
@@ -106,6 +107,7 @@ PRODUCT_TEMPLATE_HEADERS = [
     "Цена",
     "Остаток",
     "Статус",
+    "Фото",
 ]
 
 PRODUCT_TEMPLATE_EXAMPLE = [
@@ -117,6 +119,7 @@ PRODUCT_TEMPLATE_EXAMPLE = [
     3200,
     12,
     "В наличии",
+    "https://example.com/photo/1.jpg;https://example.com/photo/2.jpg",
 ]
 
 
@@ -274,10 +277,22 @@ class StoreAdmin(admin.ModelAdmin):
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
     change_list_template = "admin/api/product/change_list.html"
-    list_display = ("id", "sku", "external_id", "name", "category", "brand", "distributor", "quantity", "status", "price")
+    list_display = ("id", "sku", "external_id", "name", "category", "brand", "distributor", "quantity", "status", "price", "photo_preview")
     list_filter = ("status", "category", "brand", "distributor")
     search_fields = ("sku", "external_id", "name", "category", "brand", "distributor__name")
-    readonly_fields = ("updated_at",)
+    readonly_fields = ("updated_at", "photo_preview")
+
+    @admin.display(description="Фото")
+    def photo_preview(self, obj):
+        """Первое фото + счётчик — быстрый способ проверить импорт ссылок."""
+        urls = obj.images or []
+        if not urls:
+            return "—"
+        return format_html(
+            '<a href="{}" target="_blank"><img src="{}" style="height:36px;border-radius:4px" '
+            'onerror="this.style.display=\'none\'"></a> {}/{}',
+            urls[0], urls[0], len(urls), MAX_PRODUCT_IMAGES,
+        )
 
     def get_urls(self):
         urls = super().get_urls()
@@ -322,12 +337,13 @@ class ProductAdmin(admin.ModelAdmin):
             "F": 14,
             "G": 14,
             "H": 18,
+            "I": 60,  # «Фото» — ссылки через ';', до 15 шт.
         }
         for column, width in widths.items():
             sheet.column_dimensions[column].width = width
 
         sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = "A1:H2"
+        sheet.auto_filter.ref = "A1:I2"
         for row in sheet.iter_rows(min_row=2, max_row=2):
             for cell in row:
                 cell.alignment = Alignment(vertical="top")
@@ -374,7 +390,11 @@ class ProductAdmin(admin.ModelAdmin):
             "form": form,
             "opts": self.model._meta,
             "sample_headers_ru": "Артикул продавца, Наименование, Категория продавца, Бренд, Описание, Фото, Баркод, Вес, Габариты, ТНВЭД (+ Цена/Остаток — по желанию)",
-            "sample_headers_en": "Поддерживается шаблон Wildberries «Общие характеристики»: колонки определяются по названию, шапка может быть не в первой строке.",
+            "sample_headers_en": (
+                "Поддерживается шаблон Wildberries «Общие характеристики»: колонки определяются "
+                "по названию, шапка может быть не в первой строке. В колонке «Фото» — ссылки на "
+                f"изображения через «;» (сохраняем до {MAX_PRODUCT_IMAGES} шт. на товар, сами файлы не скачиваем)."
+            ),
             "statuses": "Цена и остаток берутся из файла, если такие колонки есть; иначе сохраняются текущие значения.",
         }
         return render(request, "admin/api/product/import_excel.html", context)

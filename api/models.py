@@ -283,7 +283,64 @@ class Store(models.Model):
         return self.name
 
 
+# Максимум фотографий на один товар. Сами файлы не храним — только ссылки
+# (в шаблоне WB они приходят одной ячейкой через ';').
+MAX_PRODUCT_IMAGES = 15
+
+# Разумный предел длины ссылки — совпадает с max_length поля video_url.
+MAX_IMAGE_URL_LENGTH = 512
+
+
+def normalize_product_images(value):
+    """Приводит значение к списку ссылок на фото: не более MAX_PRODUCT_IMAGES.
+
+    Принимает список/кортеж или строку со ссылками через ';' (',' и перенос
+    строки тоже считаем разделителями — так пишут в Excel). Пустые значения,
+    дубликаты и всё, что не http(s)-ссылка, отбрасываются; порядок ссылок
+    сохраняется, лишние сверх лимита отсекаются.
+    """
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        raw = value.replace("\n", ";").replace(",", ";").split(";")
+    elif isinstance(value, (list, tuple)):
+        raw = value
+    else:
+        return []
+
+    urls = []
+    for item in raw:
+        url = str(item or "").strip()
+        if not url or url in urls:
+            continue
+        if not url.lower().startswith(("http://", "https://")):
+            continue
+        urls.append(url[:MAX_IMAGE_URL_LENGTH])
+    return urls[:MAX_PRODUCT_IMAGES]
+
+
+def validate_product_images(value):
+    """Валидатор поля Product.images (срабатывает в формах и full_clean)."""
+    if not isinstance(value, list):
+        raise ValidationError("Фото: ожидается список ссылок.")
+    if len(value) > MAX_PRODUCT_IMAGES:
+        raise ValidationError(
+            f"Фото: не более {MAX_PRODUCT_IMAGES} шт. на товар (передано {len(value)})."
+        )
+    for url in value:
+        if not isinstance(url, str) or not url.strip():
+            raise ValidationError("Фото: пустая ссылка в списке.")
+        if len(url) > MAX_IMAGE_URL_LENGTH:
+            raise ValidationError(
+                f"Фото: ссылка длиннее {MAX_IMAGE_URL_LENGTH} символов — {url[:60]}…"
+            )
+        if not url.lower().startswith(("http://", "https://")):
+            raise ValidationError(f"Фото: ссылка должна начинаться с http:// или https:// — {url[:60]}")
+
+
 class Product(models.Model):
+    MAX_IMAGES = MAX_PRODUCT_IMAGES
+
     STOCK_CHOICES = [
         ("inStock", "В наличии"),
         ("low", "Мало"),
@@ -307,7 +364,13 @@ class Product(models.Model):
     description = models.TextField("Описание", blank=True)
     color = models.CharField("Цвет", max_length=128, blank=True)
     barcode = models.CharField("Баркод", max_length=64, blank=True, db_index=True)
-    images = models.JSONField("Фото (ссылки)", default=list, blank=True)
+    images = models.JSONField(
+        "Фото (ссылки)",
+        default=list,
+        blank=True,
+        validators=[validate_product_images],
+        help_text=f"Список http(s)-ссылок на фото, максимум {MAX_PRODUCT_IMAGES} шт. В Excel — одной ячейкой через «;».",
+    )
     video_url = models.URLField("Видео", max_length=512, blank=True)
     volume = models.DecimalField("Объём", max_digits=8, decimal_places=2, default=0)
     # Габариты и вес упаковки (из шаблона WB)
@@ -328,6 +391,12 @@ class Product(models.Model):
         verbose_name_plural = "Ассортимент"
         unique_together = ("distributor", "sku")
         ordering = ("category", "name")
+
+    def save(self, *args, **kwargs):
+        # Нормализуем фото на любом пути записи: импорт Excel, API, админка,
+        # синхронизация с 1С. В БД всегда лежит чистый список ссылок ≤ 15.
+        self.images = normalize_product_images(self.images)
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.sku} · {self.name}"

@@ -52,6 +52,7 @@ from .models import (
     ManagerTask,
     ContactHistory,
     grown_partner_status,
+    normalize_product_images,
 )
 from .pagination import paginate, paginated_response
 from .serializers import RegistrationSerializer, PurchaseSerializer, coerce_decimal
@@ -3650,6 +3651,10 @@ def distributor_add_product(request):
         name=payload.get("name", "Новый товар"),
         category=payload.get("category", "Общее"),
         brand=payload.get("brand", "AutoTerra"),
+        description=payload.get("description", ""),
+        # Фото — только ссылки, максимум Product.MAX_IMAGES (лишние отсекаются).
+        images=normalize_product_images(payload.get("images")),
+        video_url=payload.get("videoUrl") or "",
         price=_money_value(payload.get("price")),
         quantity=int(payload.get("quantity", 0)),
         status=payload.get("status", "inStock")
@@ -3669,17 +3674,22 @@ def distributor_stock_upload(request):
     items = _json(request).get("items", [])
     with transaction.atomic():
         for raw in items:
+            defaults = {
+                "name": raw.get("name"),
+                "category": raw.get("category"),
+                "brand": raw.get("brand", "AutoTerra"),
+                "price": _money_value(raw.get("price")),
+                "quantity": int(raw.get("quantity", 0)),
+                "status": raw.get("status", "inStock"),
+            }
+            # Фото передаём только если ключ есть — иначе не затираем уже
+            # загруженные из Excel ссылки.
+            if "images" in raw:
+                defaults["images"] = normalize_product_images(raw.get("images"))
             Product.objects.update_or_create(
                 distributor=distributor,
                 sku=raw.get("sku"),
-                defaults={
-                    "name": raw.get("name"),
-                    "category": raw.get("category"),
-                    "brand": raw.get("brand", "AutoTerra"),
-                    "price": _money_value(raw.get("price")),
-                    "quantity": int(raw.get("quantity", 0)),
-                    "status": raw.get("status", "inStock"),
-                }
+                defaults=defaults,
             )
     return JsonResponse({"status": "ok", "processed": len(items)})
 

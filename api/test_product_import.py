@@ -4,7 +4,16 @@ from django.test import TestCase, Client
 from django.contrib.auth.models import User
 from openpyxl import Workbook
 
-from .models import AuthToken, Distributor, Product, Region
+from django.core.exceptions import ValidationError
+
+from .models import (
+    MAX_PRODUCT_IMAGES,
+    AuthToken,
+    Distributor,
+    Product,
+    Region,
+    normalize_product_images,
+)
 from .services.product_import import parse_products_workbook, upsert_products
 
 
@@ -46,6 +55,26 @@ class ProductImportParserTests(TestCase):
         self.assertEqual(str(p["weight"]), "1.5")
         self.assertFalse(p["_has_price"])
         self.assertFalse(p["_has_quantity"])
+
+    def test_keeps_first_15_images_and_warns(self):
+        links = ";".join(f"http://a/{i}.webp" for i in range(1, 21))  # 20 ссылок
+        buf = _wb_like_template([
+            ["1", "SKU-1", "1001", "Лак", "Лаки", "HiQ", "", links, "", "1.5", "", "5"],
+        ])
+        products, errors = parse_products_workbook(buf)
+        self.assertEqual(len(products[0]["images"]), MAX_PRODUCT_IMAGES)
+        self.assertEqual(products[0]["images"][0], "http://a/1.webp")
+        self.assertEqual(products[0]["images"][-1], f"http://a/{MAX_PRODUCT_IMAGES}.webp")
+        self.assertTrue(any("сохранены первые 15" in e for e in errors), errors)
+
+    def test_drops_duplicates_and_non_links(self):
+        cell = "http://a/1.webp;http://a/1.webp; ;нет фото;https://b/2.webp"
+        buf = _wb_like_template([
+            ["1", "SKU-1", "1001", "Лак", "Лаки", "HiQ", "", cell, "", "1.5", "", "5"],
+        ])
+        products, errors = parse_products_workbook(buf)
+        self.assertEqual(products[0]["images"], ["http://a/1.webp", "https://b/2.webp"])
+        self.assertTrue(any("без http(s)-ссылки" in e for e in errors), errors)
 
     def test_rejects_file_without_required_columns(self):
         wb = Workbook()
@@ -106,9 +135,62 @@ class StockUploadFileEndpointTests(TestCase):
         self.assertEqual(int(p.price), 4200)
         self.assertEqual(p.quantity, 9)
 
+    def test_upload_stores_up_to_15_images(self):
+        links = ";".join(f"http://a/{i}.webp" for i in range(1, 19))
+        buf = _wb_like_template([
+            ["1", "SKU-IMG", "1001", "Лак", "Лаки", "HiQ", "d", links, "2039157960415", "1.5", "", "5"],
+        ])
+        buf.name = "wb.xlsx"
+        resp = self._upload(buf)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        p = Product.objects.get(distributor=self.distributor, sku="SKU-IMG")
+        self.assertEqual(len(p.images), MAX_PRODUCT_IMAGES)
+
     def test_upload_requires_file(self):
         resp = self.http.post(
             "/api/distributor/stock/upload-file/",
             HTTP_AUTHORIZATION=f"Bearer {self.token.key}",
         )
         self.assertEqual(resp.status_code, 400)
+
+
+class ProductImagesModelTests(TestCase):
+    """Лимит в 15 фото держится на уровне модели, а не только импорта."""
+
+    def setUp(self):
+        user = User.objects.create_user(username="dist2", password="pw")
+        self.distributor = Distributor.objects.create(
+            user=user, name="Dist2", inn="1112223335", phone="1", email="d2@e.co"
+        )
+
+    def _product(self, images):
+        return Product.objects.create(
+            distributor=self.distributor, sku="SKU-M", name="Товар",
+            category="Лаки", images=images,
+        )
+
+    def test_save_truncates_to_limit(self):
+        p = self._product([f"http://a/{i}.jpg" for i in range(20)])
+        p.refresh_from_db()
+        self.assertEqual(len(p.images), MAX_PRODUCT_IMAGES)
+
+    def test_save_accepts_semicolon_string(self):
+        p = self._product("http://a/1.jpg;http://a/2.jpg")
+        p.refresh_from_db()
+        self.assertEqual(p.images, ["http://a/1.jpg", "http://a/2.jpg"])
+
+    def test_full_clean_rejects_more_than_limit(self):
+        p = Product(
+            distributor=self.distributor, sku="SKU-V", name="Товар", category="Лаки",
+            images=[f"http://a/{i}.jpg" for i in range(MAX_PRODUCT_IMAGES + 1)],
+        )
+        with self.assertRaises(ValidationError):
+            p.full_clean()
+
+    def test_normalize_helper(self):
+        self.assertEqual(normalize_product_images(None), [])
+        self.assertEqual(normalize_product_images(["", "  ", "ftp://x/1.jpg"]), [])
+        self.assertEqual(
+            normalize_product_images(["http://a/1.jpg", "http://a/1.jpg"]),
+            ["http://a/1.jpg"],
+        )

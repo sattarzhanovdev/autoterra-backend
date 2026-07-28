@@ -2,7 +2,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional
 from django.db import transaction
-from ..models import Product, ClientProfile, Order, Distributor
+from ..models import Product, ClientProfile, Order, Distributor, normalize_product_images
 
 logger = logging.getLogger(__name__)
 
@@ -96,18 +96,23 @@ class IntegrationService:
         data = self.strategy.fetch_products()
         processed = 0
         for item in data:
+            defaults = {
+                "sku": item.get("sku"),
+                "name": item.get("name"),
+                "category": item.get("category"),
+                "brand": item.get("brand"),
+                "price": item.get("price"),
+                "is_active": True,
+            }
+            # Фото (ссылки) — только если 1С их прислала, иначе сохраняем то,
+            # что загружено из Excel.
+            if "images" in item:
+                defaults["images"] = normalize_product_images(item.get("images"))
             with transaction.atomic():
                 Product.objects.update_or_create(
                     distributor=distributor,
                     external_id=item.get("external_id"),
-                    defaults={
-                        "sku": item.get("sku"),
-                        "name": item.get("name"),
-                        "category": item.get("category"),
-                        "brand": item.get("brand"),
-                        "price": item.get("price"),
-                        "is_active": True,
-                    }
+                    defaults=defaults,
                 )
             processed += 1
         return processed

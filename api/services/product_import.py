@@ -10,6 +10,9 @@
   • Есть строка-подсказка сразу под шапкой — её пропускаем (нет названия).
   • Файл может не содержать колонок с ценой и остатком — тогда для
     существующих товаров цена/остаток НЕ перезаписываются.
+  • В колонке «Фото» лежат ССЫЛКИ на изображения через ';' (в шаблоне WB их
+    допускается до 30) — самих файлов в книге нет. Мы сохраняем только ссылки
+    и не более MAX_PRODUCT_IMAGES штук на товар.
 
 Модуль ничего не пишет в БД — только парсит и нормализует строки. Апсерт
 делает вызывающий код (admin-импорт и API-эндпоинт).
@@ -20,6 +23,8 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 
 from openpyxl import load_workbook
+
+from api.models import MAX_PRODUCT_IMAGES, normalize_product_images
 
 
 # Каноническое имя поля -> набор допустимых заголовков (в нижнем регистре).
@@ -120,16 +125,33 @@ def _status(value, default="inStock"):
 
 
 def _images(value):
-    """Разбивает список ссылок на фото (WB разделяет ';', допускаем , и перенос)."""
+    """Разбирает ячейку «Фото» → (ссылки, предупреждения).
+
+    WB разделяет ссылки ';' (допускаем ',' и перенос строки). Дубликаты и
+    значения без http(s) отбрасываем, сверх MAX_PRODUCT_IMAGES — обрезаем и
+    сообщаем об этом вызывающему коду, чтобы предупредить пользователя.
+    """
     raw = _norm(value)
     if not raw:
-        return []
-    parts = []
+        return [], []
+
+    valid, skipped = [], 0
     for chunk in raw.replace("\n", ";").replace(",", ";").split(";"):
         url = chunk.strip()
-        if url:
-            parts.append(url)
-    return parts
+        if not url:
+            continue
+        if not url.lower().startswith(("http://", "https://")):
+            skipped += 1
+            continue
+        if url not in valid:
+            valid.append(url)
+
+    warnings = []
+    if skipped:
+        warnings.append(f"пропущено значений в колонке «Фото» без http(s)-ссылки: {skipped}")
+    if len(valid) > MAX_PRODUCT_IMAGES:
+        warnings.append(f"фото {len(valid)} шт. — сохранены первые {MAX_PRODUCT_IMAGES}")
+    return normalize_product_images(valid), warnings
 
 
 def parse_products_workbook(file_obj):
@@ -178,6 +200,10 @@ def parse_products_workbook(file_obj):
             errors.append(f"Строка {number}: указано название, но нет артикула — пропущено.")
             continue
 
+        images, image_warnings = _images(_cell(row, mapping, "images"))
+        for warning in image_warnings:
+            errors.append(f"Строка {number} ({sku}): {warning}.")
+
         product = {
             "sku": sku,
             "name": name,
@@ -188,7 +214,7 @@ def parse_products_workbook(file_obj):
             "description": _norm(_cell(row, mapping, "description")),
             "color": _norm(_cell(row, mapping, "color")),
             "barcode": _norm(_cell(row, mapping, "barcode")),
-            "images": _images(_cell(row, mapping, "images")),
+            "images": images,
             "video_url": _norm(_cell(row, mapping, "video_url")),
             "volume": _money(_cell(row, mapping, "volume", 0)),
             "weight": _money(_cell(row, mapping, "weight", 0)),
