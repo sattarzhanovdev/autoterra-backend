@@ -13,7 +13,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from .forms import ProductExcelImportForm
-from .services.exports import EXPORTERS as EXPORT_FORMATS, export_clients
+from .services.exports import EXPORTERS as EXPORT_FORMATS, ExportUnavailable, export_clients
 from .models import (
     Attachment,
     AuthToken,
@@ -297,7 +297,11 @@ class ClientProfileAdmin(admin.ModelAdmin):
             return redirect("admin:api_clientprofile_changelist")
 
         changelist = self.get_changelist_instance(request)
-        return export_clients(changelist.get_queryset(request), fmt)
+        try:
+            return export_clients(changelist.get_queryset(request), fmt)
+        except ExportUnavailable as error:
+            messages.error(request, str(error))
+            return redirect("admin:api_clientprofile_changelist")
 
     @admin.display(description="Рекомендовал")
     def referral_count(self, obj):

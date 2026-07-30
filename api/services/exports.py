@@ -11,12 +11,20 @@ import csv
 import io
 import logging
 import os
-from datetime import datetime
+import zipfile
 
 from django.http import HttpResponse
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
+
+
+class ExportUnavailable(Exception):
+    """Формат не собрать: на сервере нет нужной библиотеки.
+
+    Наружу отдаём понятное сообщение и команду для установки, иначе клиент
+    видит только «500» и не знает, что делать.
+    """
 
 FONT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static", "fonts")
 PDF_FONT = "DejaVuSans"
@@ -124,49 +132,106 @@ def clients_to_csv(clients) -> HttpResponse:
 
 # ── Word ──────────────────────────────────────────────────────────────────────
 
-def clients_to_docx(clients) -> HttpResponse:
-    from docx import Document
-    from docx.enum.section import WD_ORIENT
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.shared import Pt
-
-    document = Document()
-
-    # Колонок много — разворачиваем страницу горизонтально.
-    section = document.sections[0]
-    section.orientation = WD_ORIENT.LANDSCAPE
-    section.page_width, section.page_height = section.page_height, section.page_width
-
-    heading = document.add_heading("Список клиентов AutoTerra", level=1)
-    heading.alignment = WD_ALIGN_PARAGRAPH.LEFT
-
-    subtitle = document.add_paragraph(
-        f"Выгружено {timezone.localtime():%d.%m.%Y %H:%M} · всего: {len(clients)}"
+def _xml_escape(value) -> str:
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
     )
-    subtitle.runs[0].font.size = Pt(9)
 
+
+def _docx_cell(text, *, bold=False, width=1200, shaded=False) -> str:
+    """Ячейка таблицы. Тёмная заливка с белым текстом — для шапки."""
+    shading = '<w:shd w:val="clear" w:fill="1F1F1F"/>' if shaded else ""
+    run_props = "".join([
+        "<w:b/>" if bold else "",
+        '<w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/>',
+        '<w:sz w:val="16"/>',
+        '<w:color w:val="FFFFFF"/>' if shaded else "",
+    ])
+    return (
+        f'<w:tc><w:tcPr><w:tcW w:w="{width}" w:type="dxa"/>{shading}</w:tcPr>'
+        f'<w:p><w:pPr><w:spacing w:after="0"/></w:pPr>'
+        f"<w:r><w:rPr>{run_props}</w:rPr>"
+        f'<w:t xml:space="preserve">{_xml_escape(text)}</w:t>'
+        f"</w:r></w:p></w:tc>"
+    )
+
+
+def clients_to_docx(clients) -> HttpResponse:
+    """Собирает .docx средствами стандартной библиотеки.
+
+    docx — это zip с OOXML внутри, а нам нужен ровно один заголовок и одна
+    таблица. Собственная сборка избавляет от зависимости python-docx: сервер
+    не должен ничего доустанавливать, чтобы выгрузка в Word заработала.
+    """
     headers = [title for title, _, _ in CLIENT_COLUMNS]
-    table = document.add_table(rows=1, cols=len(headers))
-    table.style = "Light Grid Accent 1"
+    # Ширины из описания колонок, переведённые в twentieths of a point.
+    widths = [max(700, width * 90) for _, _, width in CLIENT_COLUMNS]
 
-    for index, title in enumerate(headers):
-        cell = table.rows[0].cells[index]
-        cell.text = title
-        for paragraph in cell.paragraphs:
-            for run in paragraph.runs:
-                run.font.bold = True
-                run.font.size = Pt(8)
+    header_row = "".join(
+        _docx_cell(title, bold=True, width=widths[index], shaded=True)
+        for index, title in enumerate(headers)
+    )
+    body_rows = "".join(
+        "<w:tr>"
+        + "".join(
+            _docx_cell(value, width=widths[index]) for index, value in enumerate(row)
+        )
+        + "</w:tr>"
+        for row in _rows(clients)
+    )
 
-    for row in _rows(clients):
-        cells = table.add_row().cells
-        for index, value in enumerate(row):
-            cells[index].text = str(value)
-            for paragraph in cells[index].paragraphs:
-                for run in paragraph.runs:
-                    run.font.size = Pt(8)
+    borders = "".join(
+        f'<w:{side} w:val="single" w:sz="4" w:space="0" w:color="CCCCCC"/>'
+        for side in ("top", "left", "bottom", "right", "insideH", "insideV")
+    )
+    # tblGrid обязателен по схеме OOXML: без него Word считает файл повреждённым.
+    grid = "".join(f'<w:gridCol w:w="{width}"/>' for width in widths)
+    subtitle = f"Выгружено {timezone.localtime():%d.%m.%Y %H:%M} · всего: {len(clients)}"
+
+    document_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:spacing w:after="60"/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val="32"/></w:rPr>
+      <w:t>Список клиентов AutoTerra</w:t></w:r></w:p>
+    <w:p><w:pPr><w:spacing w:after="200"/></w:pPr><w:r><w:rPr><w:sz w:val="18"/>
+      <w:color w:val="808080"/></w:rPr><w:t xml:space="preserve">{_xml_escape(subtitle)}</w:t></w:r></w:p>
+    <w:tbl>
+      <w:tblPr><w:tblW w:w="0" w:type="auto"/><w:tblBorders>{borders}</w:tblBorders></w:tblPr>
+      <w:tblGrid>{grid}</w:tblGrid>
+      <w:tr><w:trPr><w:tblHeader/></w:trPr>{header_row}</w:tr>
+      {body_rows}
+    </w:tbl>
+    <w:sectPr>
+      <w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/>
+      <w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720"/>
+    </w:sectPr>
+  </w:body>
+</w:document>"""
+
+    content_types = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml"
+    ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>"""
+
+    root_rels = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Target="word/document.xml"
+    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"/>
+</Relationships>"""
 
     buffer = io.BytesIO()
-    document.save(buffer)
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types)
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("word/document.xml", document_xml)
+
     return _attachment(buffer.getvalue(), DOCX_MIME, "docx")
 
 
@@ -189,12 +254,19 @@ def _register_pdf_fonts():
 
 
 def clients_to_pdf(clients) -> HttpResponse:
-    from reportlab.lib import colors
-    from reportlab.lib.enums import TA_LEFT
-    from reportlab.lib.pagesizes import A4, landscape
-    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-    from reportlab.lib.units import mm
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Table, TableStyle
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_LEFT
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import mm
+        from reportlab.platypus import Paragraph, SimpleDocTemplate, Table, TableStyle
+    except ImportError as error:
+        raise ExportUnavailable(
+            "PDF на сервере не собирается: не установлена библиотека reportlab. "
+            "Выполните на сервере: pip install reportlab==4.0.4 "
+            "(или pip install -r requirements.txt). Excel, Word и CSV работают."
+        ) from error
 
     has_cyrillic_font = _register_pdf_fonts()
     body_font = PDF_FONT if has_cyrillic_font else "Helvetica"

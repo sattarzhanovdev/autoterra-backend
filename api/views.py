@@ -19,6 +19,7 @@ from django.db.utils import IntegrityError
 from django.db.models import Q, Sum, F
 from django.http import JsonResponse, HttpResponse
 from django.shortcuts import get_object_or_404
+from django.utils.html import escape
 from django.utils import timezone
 from django.utils.crypto import get_random_string
 from django.views.decorators.csrf import csrf_exempt
@@ -56,7 +57,7 @@ from .models import (
 )
 from .pagination import paginate, paginated_response
 from .serializers import RegistrationSerializer, PurchaseSerializer, coerce_decimal
-from .services.exports import EXPORTERS as EXPORT_FORMATS, export_clients
+from .services.exports import EXPORTERS as EXPORT_FORMATS, ExportUnavailable, export_clients
 from .services.pricing import price_details, price_for_client
 from .services.tiers import sync_client_tier
 
@@ -232,6 +233,100 @@ def _send_order_email(order):
         msg.send(fail_silently=False)
     except Exception:
         logger.exception("Failed to send order email for order %s", getattr(order, "id", None))
+
+
+def _send_registration_email(client):
+    """Письмо о новой регистрации. Не бросает исключений.
+
+    Вызывается ПОСЛЕ коммита транзакции: SMTP держит соединение до
+    EMAIL_TIMEOUT секунд, и письмо о клиенте, чья транзакция откатилась,
+    никому не нужно.
+    """
+    recipients = getattr(settings, "REGISTRATION_NOTIFICATION_EMAILS", None) or [
+        "zavtoterra@yandex.ru"
+    ]
+
+    try:
+        from django.core.mail import EmailMultiAlternatives
+
+        status_display = (
+            client.get_status_display()
+            if hasattr(client, "get_status_display")
+            else client.status
+        )
+        region_name = client.region.name if client.region_id else "—"
+
+        # Plain-text fallback
+        lines = [
+            f"Новая регистрация: {client.company_name}",
+            "",
+            f"ИНН: {client.inn}",
+            f"Регион: {region_name}",
+            f"Город: {client.city}",
+            f"Телефон: {client.phone}",
+            f"Контактное лицо: {client.contact_name}",
+            f"Источник: {client.get_registration_source_display()}",
+            f"Статус: {status_display}",
+        ]
+        text_body = "\n".join(lines)
+
+        # Данные вводит сам клиент, поэтому в HTML они идут только
+        # экранированными: иначе кавычка в названии компании ломает вёрстку,
+        # а <img onerror=...> превращает уведомление в вектор атаки.
+        def info_row(label, value):
+            return f"""
+            <tr>
+              <td style="padding:6px 0;font-size:16px;color:#888;width:190px;">{escape(label)}</td>
+              <td style="padding:6px 0;font-size:16px;color:#222;"><strong>{escape(value)}</strong></td>
+            </tr>"""
+
+        html_body = f"""\
+<!DOCTYPE html>
+<html lang="ru">
+<body style="margin:0;padding:0;background:#f4f5f7;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f5f7;padding:24px 0;">
+    <tr><td align="center">
+      <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 4px 16px rgba(240,29,44,0.12);border:1px solid #f0e0e1;">
+        <tr>
+          <td style="background:#f01d2c;padding:30px 32px;border-bottom:4px solid #111111;">
+            <div style="font-size:14px;color:#ffd9dc;letter-spacing:2px;text-transform:uppercase;font-weight:700;">AutoTerra</div>
+            <div style="font-size:27px;color:#ffffff;font-weight:800;margin-top:8px;">Новая регистрация</div>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:28px 32px 28px 32px;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+              {info_row("Компания", client.company_name)}
+              {info_row("ИНН", client.inn)}
+              {info_row("Регион", region_name)}
+              {info_row("Город", client.city)}
+              {info_row("Телефон", client.phone)}
+              {info_row("Контактное лицо", client.contact_name)}
+              {info_row("Статус", status_display)}
+            </table>
+          </td>
+        </tr>
+        <tr>
+          <td style="background:#111111;padding:18px 32px;text-align:center;font-size:13px;color:#bbbbbb;">
+            Это письмо сформировано автоматически платформой <span style="color:#f01d2c;font-weight:700;">AutoTerra</span>.
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+        msg = EmailMultiAlternatives(
+            subject=f"Новая регистрация: {client.company_name} ({client.inn})",
+            body=text_body,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=recipients,
+        )
+        msg.attach_alternative(html_body, "text/html")
+        msg.send(fail_silently=False)
+    except Exception:
+        logger.exception("Failed to send registration email for client %s", getattr(client, "id", None))
 
 
 def _send_order_status_email(order, old_status, new_status, recipients=None):
@@ -1063,10 +1158,15 @@ def health(_request):
 @require_POST
 def register(request):
     payload = _json(request)
-    print(f"DEBUG: Register payload: {payload}")
+    # Пароль в лог не пишем: payload логировался целиком, и пароли клиентов
+    # оказывались в открытом виде в логах сервера.
+    logger.info(
+        "Регистрация: телефон=%s, ИНН=%s, регион=%s",
+        payload.get("username"), payload.get("inn"), payload.get("region_id"),
+    )
     serializer = RegistrationSerializer(payload)
     if not serializer.is_valid():
-        print(f"DEBUG: Serializer errors: {serializer.errors}")
+        logger.info("Регистрация отклонена валидацией: %s", serializer.errors)
         # Возвращаем detail для фронтенда, чтобы он мог показать ошибку
         first_err_msg = "Ошибка валидации"
         if serializer.errors:
@@ -1137,6 +1237,7 @@ def register(request):
             
             token = secrets.token_hex(24)
             AuthToken.objects.create(key=token, user=user)
+
     except IntegrityError as e:
         # Резервный обработчик на случай гонки условий
         return JsonResponse({
@@ -1148,6 +1249,10 @@ def register(request):
             "detail": f"Внутренняя ошибка сервера при регистрации: {str(e)}",
             "code": "server_error"
         }, status=500)
+
+    # Письмо — уже после коммита: SMTP не должен держать транзакцию открытой,
+    # и уведомление не должно уйти по клиенту, чья запись откатилась.
+    _send_registration_email(client)
 
     return JsonResponse({
         "status": "success",
@@ -2591,7 +2696,13 @@ def export_clients_file(request):
     if category:
         qs = qs.filter(category=category.lower())
 
-    return export_clients(qs.order_by("company_name"), fmt)
+    try:
+        return export_clients(qs.order_by("company_name"), fmt)
+    except ExportUnavailable as error:
+        # Формат не собрать — на сервере нет библиотеки. Отдаём понятный текст
+        # с командой установки: 500 без объяснений тут бесполезен.
+        logger.warning("Экспорт %s недоступен: %s", fmt, error)
+        return JsonResponse({"detail": str(error)}, status=503)
 
 
 def _clients_for_export(request, user):

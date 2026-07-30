@@ -169,6 +169,16 @@ ORDER_NOTIFICATION_EMAILS = [
     if addr.strip()
 ]
 
+# Куда уходит письмо о регистрации нового клиента. Через запятую — несколько
+# адресов. Пусто — используется ящик по умолчанию, зашитый в код.
+REGISTRATION_NOTIFICATION_EMAILS = [
+    addr.strip()
+    for addr in os.environ.get(
+        "REGISTRATION_NOTIFICATION_EMAILS", "zavtoterra@yandex.ru"
+    ).split(",")
+    if addr.strip()
+]
+
 # ── Payments: YooKassa (ЮKassa / YooMoney для бизнеса) ─────────────────────────
 # shopId и секретный ключ берутся из личного кабинета ЮKassa.
 # https://yookassa.ru/my  → Настройки → Магазин.
