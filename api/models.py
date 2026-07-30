@@ -1,9 +1,12 @@
+from datetime import datetime, time
+from decimal import Decimal
+
 from django.contrib.auth.models import User
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.db import models
 from django.core.exceptions import ValidationError
-from django.core.validators import RegexValidator
+from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator
 
 
 class Profile(models.Model):
@@ -143,31 +146,113 @@ class SyncLog(models.Model):
         return f"{self.created_at:%d.%m.%Y %H:%M} · {self.get_sync_type_display()} · {self.get_status_display()}"
 
 
-# Партнёрский статус растёт по накопленной сумме подтверждённых закупок.
-# Порядок — от младшего к старшему; каждый порог в рублях.
-PARTNER_TIERS = ["Silver", "Gold", "Platinum", "Certified Partner"]
-PARTNER_THRESHOLDS = {
-    "Silver": 0,
-    "Gold": 500_000,
-    "Platinum": 2_000_000,
-    "Certified Partner": 5_000_000,
-}
+class PartnerTier(models.Model):
+    """Ранг клиента и порог оборота, с которого он начинается.
+
+    Ранги настраиваются в админке: и названия, и пороги. Клиент растёт по
+    обороту — сумме подтверждённых закупок и оплаченных заказов, — а от ранга
+    зависит цена (модель RankDiscount).
+
+    Ступени сравниваются по ``threshold``: у кого порог выше, тот старше.
+    """
+
+    name = models.CharField("Название", max_length=32, unique=True)
+    threshold = models.DecimalField(
+        "Порог оборота, ₽",
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+        help_text="Начиная с этой суммы клиент получает ранг. У базового ранга — 0.",
+    )
+    description = models.CharField("Описание", max_length=255, blank=True)
+    is_active = models.BooleanField("Активен", default=True)
+
+    class Meta:
+        verbose_name = "Ранг клиента"
+        verbose_name_plural = "Ранги клиентов"
+        ordering = ("threshold",)
+
+    def __str__(self):
+        return self.name
+
+
+# Пороги на случай пустой таблицы: первый запуск, тесты, миграция с нуля.
+DEFAULT_PARTNER_TIERS = [
+    ("Базовый", 0, "Стартовый ранг при регистрации"),
+    ("Silver", 500_000, "Оборот от 500 тыс. ₽"),
+    ("Gold", 2_000_000, "Оборот от 2 млн ₽"),
+    ("Platinum", 5_000_000, "Оборот от 5 млн ₽"),
+]
+
+BASE_PARTNER_TIER = DEFAULT_PARTNER_TIERS[0][0]
+
+# Статусы заказа, при которых деньги уже получены. Такой заказ идёт в оборот
+# клиента и создаёт задачу курьеру. 'accepted' — legacy-статус старых заказов.
+ORDER_STATUSES_PAID = ("paid", "shipped", "fulfilled", "accepted")
+
+
+def partner_tier_ladder():
+    """Активные ранги от младшего к старшему. Пустая таблица — дефолтные."""
+    tiers = list(PartnerTier.objects.filter(is_active=True).order_by("threshold"))
+    if tiers:
+        return [(tier.name, Decimal(tier.threshold)) for tier in tiers]
+    return [(name, Decimal(threshold)) for name, threshold, _ in DEFAULT_PARTNER_TIERS]
 
 
 def partner_tier_for_total(total):
-    """Возвращает заслуженный статус по сумме закупок."""
-    earned = "Silver"
-    for tier in PARTNER_TIERS:
-        if (total or 0) >= PARTNER_THRESHOLDS[tier]:
-            earned = tier
+    """Заслуженный ранг по обороту."""
+    ladder = partner_tier_ladder()
+    amount = Decimal(str(total or 0))
+    earned = ladder[0][0]
+    for name, threshold in ladder:
+        if amount >= threshold:
+            earned = name
     return earned
 
 
 def grown_partner_status(current, total):
-    """Повышает статус до заслуженного по сумме закупок, но не понижает."""
+    """Повышает ранг до заслуженного, но не понижает.
+
+    Понижение — отдельное решение менеджера: сезонный провал не должен молча
+    обвалить клиенту цену. Массовый пересчёт с понижением умеет команда
+    ``recalc_partner_tiers --allow-downgrade``.
+    """
+    ladder = partner_tier_ladder()
+    order = {name: index for index, (name, _) in enumerate(ladder)}
+
     earned = partner_tier_for_total(total)
-    current = current if current in PARTNER_TIERS else "Silver"
-    return earned if PARTNER_TIERS.index(earned) > PARTNER_TIERS.index(current) else current
+    if current not in order:
+        return earned
+    return earned if order[earned] > order[current] else current
+
+
+def client_turnover(client):
+    """Оборот клиента: подтверждённые закупки плюс оплаченные заказы.
+
+    Закупка — документ, который клиент загрузил и дистрибьютор подтвердил.
+    Заказ через приложение — те же деньги, поэтому тоже растит ранг: иначе
+    активный в приложении клиент навсегда оставался бы в базовом ранге.
+    """
+    purchases = (
+        Purchase.objects
+        .filter(client=client, status="verified")
+        .aggregate(total=models.Sum("total_amount"))["total"]
+        or 0
+    )
+    # Order.total_amount — вычисляемое свойство, поэтому сумму собираем по
+    # позициям прямо в SQL: перебирать заказы в Python было бы N+1.
+    orders = (
+        OrderItem.objects
+        .filter(order__client=client, order__status__in=ORDER_STATUSES_PAID)
+        .aggregate(
+            total=models.Sum(
+                models.F("price") * models.F("quantity"),
+                output_field=models.DecimalField(max_digits=14, decimal_places=2),
+            )
+        )["total"]
+        or 0
+    )
+    return Decimal(str(purchases)) + Decimal(str(orders))
 
 
 class ClientProfile(models.Model):
@@ -176,7 +261,13 @@ class ClientProfile(models.Model):
         message="ИНН должен состоять из 10 или 12 цифр.",
     )
 
-    CATEGORY_CHOICES = [("a", "A"), ("b", "B"), ("c", "C")]
+    # Тип бизнеса клиента. На цену не влияет — цену определяет ранг
+    # (partner_status), см. PartnerTier и RankDiscount.
+    CATEGORY_CHOICES = [
+        ("a", "A · Дилерский салон"),
+        ("b", "B · Автосервис с кузовным цехом"),
+        ("c", "C · Гаражный сервис"),
+    ]
     STATUS_CHOICES = [
         ("new", "Новый"),
         ("under_review", "На проверке"),
@@ -226,7 +317,14 @@ class ClientProfile(models.Model):
         default="app",
     )
     status = models.CharField("Статус", max_length=32, choices=STATUS_CHOICES, default="new")
-    partner_status = models.CharField("Партнёрский статус", max_length=32, default="Silver")
+    # Ранг клиента: определяет его цену. Растёт по обороту, пороги задаются
+    # в админке (PartnerTier), скидки — в RankDiscount.
+    partner_status = models.CharField(
+        "Ранг",
+        max_length=32,
+        default=BASE_PARTNER_TIER,
+        help_text="Присваивается автоматически по обороту. Менеджер может выставить вручную.",
+    )
     total_purchases = models.DecimalField("Сумма закупок", max_digits=12, decimal_places=2, default=0)
     comments = models.TextField("Комментарии", blank=True)
     created_at = models.DateTimeField("Создан", auto_now_add=True)
@@ -400,6 +498,65 @@ class Product(models.Model):
 
     def __str__(self):
         return f"{self.sku} · {self.name}"
+
+
+class RankDiscount(models.Model):
+    """Скидка на категорию товаров для ранга клиента.
+
+    Ранг растёт по обороту: чем больше клиент закупает, тем ниже его цена.
+    Правило задаётся в админке и применяется к прайсу автоматически.
+
+    Правила ищутся от частного к общему, побеждает первое совпавшее:
+
+        1. этот дистрибьютор + эта категория товаров
+        2. этот дистрибьютор + все категории
+        3. все дистрибьюторы + эта категория товаров
+        4. все дистрибьюторы + все категории
+
+    Пустой «Дистрибьютор» или «Категория товаров» = «любой/любая».
+    """
+
+    distributor = models.ForeignKey(
+        "Distributor",
+        on_delete=models.CASCADE,
+        related_name="rank_discounts",
+        verbose_name="Дистрибьютор",
+        blank=True,
+        null=True,
+        help_text="Пусто — правило действует у всех дистрибьюторов",
+    )
+    tier = models.ForeignKey(
+        PartnerTier,
+        on_delete=models.CASCADE,
+        related_name="discounts",
+        verbose_name="Ранг клиента",
+    )
+    product_category = models.CharField(
+        "Категория товаров",
+        max_length=128,
+        blank=True,
+        help_text="Пусто — скидка на весь ассортимент",
+    )
+    percent = models.DecimalField(
+        "Скидка, %",
+        max_digits=5,
+        decimal_places=2,
+        default=0,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+    )
+    is_active = models.BooleanField("Активно", default=True)
+    comment = models.CharField("Комментарий", max_length=255, blank=True)
+    updated_at = models.DateTimeField("Обновлено", auto_now=True)
+
+    class Meta:
+        verbose_name = "Скидка по рангу"
+        verbose_name_plural = "Скидки по рангам"
+        unique_together = ("distributor", "tier", "product_category")
+        ordering = ("tier__threshold", "product_category")
+
+    def __str__(self):
+        scope = self.product_category or "весь ассортимент"
+        return f"{self.tier} · {scope} · −{self.percent}%"
 
 
 class Order(models.Model):
@@ -676,6 +833,9 @@ class ColorRequest(models.Model):
     transfer_method = models.CharField("Способ передачи", max_length=32, choices=TRANSFER_CHOICES, default="courier")
     pickup_address = models.CharField("Адрес забора лючка", max_length=255, blank=True)
     pickup_time = models.DateTimeField("Дата/время забора", blank=True, null=True)
+    # Крайнее время, до которого маляр может принять курьера: колорист и курьер
+    # планируют выезд по этому дедлайну.
+    courier_arrive_until = models.TimeField("Курьер может приехать до", blank=True, null=True)
     contact_person = models.CharField("Контактное лицо", max_length=255, blank=True)
     contact_phone = models.CharField("Телефон", max_length=32, blank=True)
     
@@ -735,10 +895,12 @@ class RecipeMaterial(models.Model):
 
 
 class CourierTask(models.Model):
+    # «Возврат лючка» (return) убран: готовую краску и образец маляр забирает
+    # сам, чтобы сверить оттенок на месте. Старые записи чистит команда
+    # cleanup_return_tasks.
     TYPE_CHOICES = [
         ("delivery", "Доставка"),
         ("pickup", "Забор лючка"),
-        ("return", "Возврат лючка"),
         ("color_lab_pickup", "Забор для Color Lab"),
     ]
     STATUS_CHOICES = [
@@ -811,31 +973,73 @@ class CourierTask(models.Model):
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 
+def _task_history_entry(status, comment=""):
+    """Отметка в истории заявки. Формат совпадает с _append_task_history в views."""
+    from django.utils import timezone
+
+    return {"status": status, "at": timezone.now().isoformat(), "by": None, "comment": comment}
+
+
+# Доставка создаётся ровно тогда, когда деньги получены.
+ORDER_STATUSES_WITH_DELIVERY = ORDER_STATUSES_PAID
+
+
 @receiver(post_save, sender=Order)
 def manage_order_courier_task(sender, instance, created, **kwargs):
+    """Создаёт задачу курьеру для оплаченного заказа с курьерской доставкой.
+
+    Раньше триггером был только 'accepted' — legacy-статус: заказы, идущие
+    современным путём (new → confirmed → paid → shipped), доставку не получали
+    вовсе, и у клиента раздел «Доставка» оставался пустым.
+
+    Адрес берём у точки, которую клиент выбрал в заказе: у профиля клиента
+    улицы нет, только город.
     """
-    Авто-создание задачи курьеру при переводе заказа в 'accepted' с методом 'courier',
-    или при назначении курьера на уже принятый заказ.
-    """
-    if instance.status == "accepted" and instance.delivery_method == "courier":
-        task, created_task = CourierTask.objects.get_or_create(
-            order=instance,
-            defaults={
-                "client": instance.client,
-                "task_type": "delivery",
-                "address": instance.client.city, # Default
-                "time_slot": "10:00 - 18:00",
-                "status": "assigned" if instance.courier else "created",
-                "courier": instance.courier,
-                "comment": f"Доставка заказа ORD-{instance.id:05d}",
-            }
+    if instance.delivery_method != "courier":
+        return
+    if instance.status not in ORDER_STATUSES_WITH_DELIVERY:
+        return
+
+    address = instance.store.address if instance.store_id else instance.client.city
+    scheduled = None
+    if instance.estimated_delivery_date:
+        from django.utils import timezone
+
+        scheduled = timezone.make_aware(
+            datetime.combine(instance.estimated_delivery_date, time(10, 0)),
+            timezone.get_current_timezone(),
         )
-        if not created_task:
-            # Sync courier if updated
-            if task.courier != instance.courier:
-                task.courier = instance.courier
-                task.status = "assigned" if instance.courier else "created"
-                task.save(update_fields=["courier", "status"])
+
+    history = [_task_history_entry("created", f"Заказ ORD-{instance.id:05d} оплачен")]
+    if instance.courier_id:
+        history.append(_task_history_entry("assigned", "Курьер назначен на заказ"))
+
+    task, created_task = CourierTask.objects.get_or_create(
+        order=instance,
+        defaults={
+            "client": instance.client,
+            "task_type": "delivery",
+            "address": address,
+            "time_slot": "10:00 - 18:00",
+            "scheduled_time": scheduled,
+            "status": "assigned" if instance.courier_id else "created",
+            "courier": instance.courier,
+            "comment": f"Доставка заказа ORD-{instance.id:05d}",
+            "contact_name": instance.client.contact_name,
+            "contact_phone": instance.client.phone,
+            "status_history": history,
+        },
+    )
+    if not created_task and task.courier_id != instance.courier_id:
+        # Курьера назначили (или сменили) уже после создания задачи.
+        task.courier = instance.courier
+        if instance.courier_id and task.status == "created":
+            task.status = "assigned"
+            task.status_history = [
+                *(task.status_history or []),
+                _task_history_entry("assigned", "Курьер назначен на заказ"),
+            ]
+        task.save(update_fields=["courier", "status", "status_history"])
 
 
 @receiver(post_save, sender=ColorRequest)

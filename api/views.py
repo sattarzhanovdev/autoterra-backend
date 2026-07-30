@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 import csv
 import io
-from datetime import datetime
+from datetime import date, datetime, time as dt_time
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 
@@ -56,6 +56,9 @@ from .models import (
 )
 from .pagination import paginate, paginated_response
 from .serializers import RegistrationSerializer, PurchaseSerializer, coerce_decimal
+from .services.exports import EXPORTERS as EXPORT_FORMATS, export_clients
+from .services.pricing import price_details, price_for_client
+from .services.tiers import sync_client_tier
 
 try:
     import certifi
@@ -409,6 +412,22 @@ def _dt(value):
         return None
 
 
+def _time(value):
+    """Парсит время «до скольки» из «HH:MM», «HH:MM:SS» или ISO-даты."""
+    if not value or str(value).lower() in ["null", "none", ""]:
+        return None
+    if isinstance(value, dt_time):
+        return value
+    raw = str(value).strip()
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            return datetime.strptime(raw, fmt).time()
+        except ValueError:
+            continue
+    parsed = _dt(raw)
+    return timezone.localtime(parsed).time() if parsed else None
+
+
 def _date(value):
     if not value or str(value).lower() in ["null", "none", ""]:
         return None
@@ -701,8 +720,9 @@ def _format_store(store):
     }
 
 
-def _format_product(product):
-    return {
+def _format_product(product, client=None):
+    """Товар для API. С ``client`` цена пересчитывается под его ранг."""
+    payload = {
         "id": str(product.id),
         "distributorId": str(product.distributor_id),
         "sku": product.sku,
@@ -728,6 +748,15 @@ def _format_product(product):
         "status": product.status,
         "updatedAt": product.updated_at.isoformat(),
     }
+    if client is not None:
+        # Клиент видит цену своего ранга; базовую отдаём рядом, чтобы в
+        # каталоге можно было показать зачёркнутую цену и размер скидки.
+        details = price_details(client, product)
+        payload["price"] = float(details["price"])
+        payload["basePrice"] = float(details["base_price"])
+        payload["discountPercent"] = float(details["discount_percent"])
+        payload["hasDiscount"] = details["has_discount"]
+    return payload
 
 
 def _format_attachment(item):
@@ -889,6 +918,8 @@ def _format_color_request(item):
         "transferMethod": item.transfer_method,
         "pickupAddress": item.pickup_address or None,
         "pickupTime": item.pickup_time.isoformat() if item.pickup_time else None,
+        # «Курьер может приехать до» — дедлайн для выезда, формат HH:MM.
+        "courierArriveUntil": item.courier_arrive_until.strftime("%H:%M") if item.courier_arrive_until else None,
         "contactPerson": item.contact_person or None,
         "contactPhone": item.contact_phone or None,
         "slaDeadline": item.sla_deadline.isoformat() if item.sla_deadline else None,
@@ -905,6 +936,20 @@ def _format_color_request(item):
     }
 
 
+def _courier_phone(courier):
+    """Телефон курьера, чтобы клиент мог позвонить.
+
+    Курьеры регистрируются по номеру телефона — он же username (так же это
+    поле отдаётся в distributor_couriers). Служебные логины без цифр наружу
+    не отдаём: звонить по ним всё равно некуда.
+    """
+    if not courier:
+        return None
+    username = (courier.username or "").strip()
+    digits = sum(character.isdigit() for character in username)
+    return username if digits >= 6 else None
+
+
 def _format_courier_task(item):
     if not item:
         return None
@@ -917,10 +962,17 @@ def _format_courier_task(item):
         "colorRequestId": str(item.color_request_id) if item.color_request_id else None,
         "courierId": str(item.courier_id) if item.courier_id else None,
         "courierName": item.courier.get_full_name() or item.courier.username if item.courier else None,
+        "courierPhone": _courier_phone(item.courier),
         "taskType": item.task_type,
         "typeDisplay": item.get_task_type_display(),
         "address": item.address,
         "timeSlot": item.time_slot,
+        # Контакты и время клиент присылает при создании заявки — без них
+        # в карточке доставки нечего показать, кроме адреса.
+        "contactName": item.contact_name or None,
+        "contactPhone": item.contact_phone or None,
+        "scheduledTime": item.scheduled_time.isoformat() if item.scheduled_time else None,
+        "carDescription": item.car_description or None,
         "status": item.status,
         "statusDisplay": item.get_status_display(),
         "assignedCourierId": str(item.courier_id) if item.courier_id else None,
@@ -1386,7 +1438,7 @@ def products(request):
     return JsonResponse(paginated_response(
         request,
         qs.order_by("category", "name"),
-        _format_product,
+        lambda product: _format_product(product, client),
         extra={"categories": categories},
     ))
 
@@ -1505,8 +1557,8 @@ def create_order(request):
                     name=product.name, 
                     category=product.category, 
                     brand=product.brand, 
-                    volume=product.volume, 
-                    price=product.price, 
+                    volume=product.volume,
+                    price=price_for_client(client, product),
                     quantity=qty
                 )
                 
@@ -1791,7 +1843,9 @@ def adjust_order(request, order_id):
                     category=product.category,
                     brand=product.brand,
                     volume=product.volume,
-                    price=product.price,
+                    # Оператор добавляет позицию в чужой заказ — цена всё равно
+                    # по рангу клиента, а не базовая из прайса.
+                    price=price_for_client(order.client, product),
                     quantity=quantity,
                 )
 
@@ -2035,6 +2089,9 @@ def yookassa_webhook(request):
             _notify_operator_order(order, "Заказ оплачен", f"{order.client.company_name} оплатил заказ ORD-{order.id:05d} на {payment.amount} ₽")
             _notify_client_order(order, "Оплата получена", f"Оплата заказа ORD-{order.id:05d} прошла успешно.")
             _send_order_status_email(order, old_status, "paid")
+            # Оплаченный заказ — часть оборота: клиент мог дорасти до ранга
+            # с большей скидкой.
+            sync_client_tier(order.client)
     elif event == "payment.canceled" or real_status == "canceled":
         payment.status = "canceled"
         payment.save(update_fields=["status"])
@@ -2200,6 +2257,8 @@ def update_color_request(request, request_id):
         color_request.urgent = _bool(payload.get("urgent"))
     if "pickupTime" in payload:
         color_request.pickup_time = _dt(payload.get("pickupTime"))
+    if "courierArriveUntil" in payload:
+        color_request.courier_arrive_until = _time(payload.get("courierArriveUntil"))
 
     color_request.save()
     return JsonResponse({"request": _format_color_request(color_request)})
@@ -2239,6 +2298,7 @@ def create_color_request(request):
                 transfer_method=(payload.get("transferMethod") or "courier").strip(),
                 pickup_address=(payload.get("pickupAddress") or payload.get("address") or client.city).strip(),
                 pickup_time=_dt(payload.get("pickupTime") or payload.get("pickupDate") or payload.get("scheduledTime")),
+                courier_arrive_until=_time(payload.get("courierArriveUntil")),
                 contact_person=(payload.get("contactPerson") or payload.get("contactName") or client.contact_name).strip(),
                 contact_phone=(payload.get("contactPhone") or client.phone).strip(),
                 assigned_distributor=client.distributor,
@@ -2267,7 +2327,8 @@ def courier_tasks(request):
     client, err = _require_client(request)
     if err:
         return err
-    qs = client.courier_tasks.all()
+    # Карточка доставки показывает курьера и заказ — тянем их одним запросом.
+    qs = client.courier_tasks.select_related("courier", "order", "client")
     if request.GET.get("active") == "true":
         qs = qs.exclude(status__in=["delivered", "returned", "cancelled"])
     return JsonResponse(paginated_response(request, qs, _format_courier_task))
@@ -2490,6 +2551,68 @@ def _filter_by_manager_scope(user, is_global, qs, region_path="region"):
     if regions is None:
         return qs
     return qs.filter(**{f"{region_path}__in": regions})
+
+
+@require_GET
+def export_clients_file(request):
+    """Выгрузка списка клиентов из приложения: Excel, Word, PDF или CSV.
+
+    Кто что видит:
+      • дистрибьютор — клиентов своих регионов;
+      • менеджер региона — клиентов закреплённых за ним регионов;
+      • главный менеджер и админ — всех.
+
+    Фильтры и поиск те же, что в списках, поэтому выгрузить можно ровно то,
+    что человек видит на экране.
+    """
+    user = _current_user(request)
+    if user is None:
+        return JsonResponse({"detail": "Unauthorized"}, status=401)
+
+    fmt = (request.GET.get("format") or "xlsx").strip().lower()
+    if fmt not in EXPORT_FORMATS:
+        return JsonResponse(
+            {"detail": f"Неизвестный формат: {fmt}. Доступны: {', '.join(EXPORT_FORMATS)}"},
+            status=400,
+        )
+
+    qs, err = _clients_for_export(request, user)
+    if err:
+        return err
+
+    search = (request.GET.get("search") or "").strip()
+    if search:
+        qs = qs.filter(Q(company_name__icontains=search) | Q(inn__icontains=search))
+    for param, field in (("status", "status"), ("region", "region_id"), ("partnerStatus", "partner_status")):
+        value = (request.GET.get(param) or "").strip()
+        if value:
+            qs = qs.filter(**{field: value})
+    category = (request.GET.get("category") or "").strip()
+    if category:
+        qs = qs.filter(category=category.lower())
+
+    return export_clients(qs.order_by("company_name"), fmt)
+
+
+def _clients_for_export(request, user):
+    """Выборка клиентов по роли. Возвращает (queryset, error_response)."""
+    profile = getattr(user, "profile", None)
+    role = getattr(profile, "role", None)
+
+    if role == "distributor":
+        distributor, is_admin, err = _require_distributor_scope(request)
+        if err:
+            return None, err
+        return _scope_clients(distributor, is_admin), None
+
+    if role in ("manager", "admin") or user.is_staff or user.is_superuser:
+        manager, is_global, err = _require_manager_scope(request)
+        if err:
+            return None, err
+        qs = ClientProfile.objects.select_related("user", "region", "distributor", "manager")
+        return _filter_by_manager_scope(manager, is_global, qs), None
+
+    return None, JsonResponse({"detail": "Нет доступа к выгрузке клиентов"}, status=403)
 
 
 def _format_manager_client(client):
@@ -3312,23 +3435,13 @@ def distributor_update_color_request(request, request_id):
     recipe = payload.get("recipe")
     
     if new_status:
-        old_status = item.status
         item.status = new_status
         _append_color_history(item, new_status, _current_user(request), payload.get("comment", "Статус обновлен дистрибьютором"))
-        
-        # If becoming ready and it was a courier pickup, create return task
-        if new_status == "ready" and old_status != "ready" and item.transfer_method == "courier":
-            CourierTask.objects.create(
-                client=item.client,
-                color_request=item,
-                task_type="return",
-                address=item.pickup_address,
-                contact_name=item.contact_person,
-                contact_phone=item.contact_phone,
-                comment=f"Возврат лючка для заявки {item.color_code}",
-                status="created"
-            )
-        
+        # Готовую краску и лючок маляр забирает сам: оттенок проверяют на месте,
+        # и часть заявок сразу уходит в переделку с пояснениями колористу.
+        # Поэтому обратной курьерской задачи (task_type="return") больше нет —
+        # курьер участвует только в заборе лючка.
+
     if recipe is not None:
         item.recipe = recipe
         
@@ -3453,19 +3566,8 @@ def distributor_verify_purchase(request, purchase_id):
 
     purchase.save()
 
-    # Keep the cached total_purchases field in sync and grow the partner status.
-    client = purchase.client
-    verified_total = (
-        Purchase.objects
-        .filter(client=client, status="verified")
-        .aggregate(total=Sum("total_amount"))["total"]
-        or 0
-    )
-    new_partner_status = grown_partner_status(client.partner_status, verified_total)
-    ClientProfile.objects.filter(pk=client.pk).update(
-        total_purchases=verified_total,
-        partner_status=new_partner_status,
-    )
+    # Оборот вырос — возможно, вырос и ранг, а вместе с ним скидка клиента.
+    sync_client_tier(purchase.client)
 
     _log_audit(request, f"Purchase status change: {old_status} -> {status}", purchase, {"reason": reason})
 
@@ -3536,15 +3638,10 @@ def distributor_update_delivery_status(request, task_id):
     _append_task_history(task, task.status, _current_user(request), f"Обновлено дистрибьютором. Статус: {task.status}, Курьер: {courier_id}")
     task.save()
 
-    # Keep the Color Lab view in sync. The post-matching delivery (return лючка) task and
-    # the Color Lab "Назначить курьера" button refer to the same hand-off: assigning a
-    # courier here means the request leaves the active Color Lab list, so the button can't
-    # linger there. (And vice-versa — Color Lab now assigns this same task.)
-    if courier_id and task.color_request_id and task.color_request.status == "ready":
-        color_request = task.color_request
-        color_request.status = "delivered"
-        _append_color_history(color_request, "delivered", _current_user(request), "Курьер назначен на доставку")
-        color_request.save()
+    # Раньше назначение курьера на задачу возврата закрывало заявку Color Lab
+    # («Выдана»). Возврат курьером отменён — готовое маляр забирает сам, и
+    # закрыть заявку может только выдача на месте. Синхронизация снята, чтобы
+    # назначенный на ЗАБОР лючка курьер не помечал заявку выданной.
 
     return JsonResponse({"task": _format_courier_task(task)})
 

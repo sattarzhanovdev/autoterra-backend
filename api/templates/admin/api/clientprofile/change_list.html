@@ -1,0 +1,25 @@
+{% extends "admin/change_list.html" %}
+
+{# Кнопки выгрузки над списком: скачивают всю текущую выборку с учётом    #}
+{# фильтров и поиска. Через «Действия» можно выгрузить отмеченных.        #}
+{% block object-tools %}
+  <div style="margin-bottom: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+    <span style="font-size: 12px; color: #666;">Скачать список{% if cl.get_queryset %}{% endif %}:</span>
+    <a class="button"
+       href="{% url 'admin:api_clientprofile_export' 'xlsx' %}?{{ request.GET.urlencode }}"
+       style="background:#1D6F42;color:#fff;">Excel</a>
+    <a class="button"
+       href="{% url 'admin:api_clientprofile_export' 'docx' %}?{{ request.GET.urlencode }}"
+       style="background:#2B579A;color:#fff;">Word</a>
+    <a class="button"
+       href="{% url 'admin:api_clientprofile_export' 'pdf' %}?{{ request.GET.urlencode }}"
+       style="background:#B30B00;color:#fff;">PDF</a>
+    <a class="button"
+       href="{% url 'admin:api_clientprofile_export' 'csv' %}?{{ request.GET.urlencode }}"
+       style="background:#555;color:#fff;">CSV</a>
+    <span style="font-size: 11px; color: #888;">
+      — выгружается то, что сейчас отфильтровано ({{ cl.result_count }} шт.)
+    </span>
+  </div>
+  {{ block.super }}
+{% endblock %}

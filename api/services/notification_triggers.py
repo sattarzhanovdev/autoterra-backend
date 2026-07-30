@@ -45,6 +45,19 @@ _COURIER_TYPE_LABELS: dict[str, str] = {
     "color_lab_pickup": "забора для Color Lab",
 }
 
+# Что происходит с точки зрения клиента, когда курьер меняет статус.
+# Финальный статус называется по-разному: заказ доставляют, а лючок забирают.
+_COURIER_PROGRESS_COPY: dict[str, dict[str, tuple[str, str]]] = {
+    "in_progress": {
+        "delivery": ("Курьер в пути", "Курьер выехал к вам с заказом."),
+        "_default": ("Курьер в пути", "Курьер выехал к вам."),
+    },
+    "delivered": {
+        "delivery": ("Заказ доставлен", "Курьер отметил доставку выполненной."),
+        "_default": ("Курьер забрал лючок", "Курьер отметил задачу выполненной."),
+    },
+}
+
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -152,6 +165,112 @@ def on_courier_assigned(courier_task) -> None:
         body=f"Курьер {courier_name} назначен для {task_label}. Ожидайте звонка.",
         n_type="delivery",
         related_link="/delivery",
+    )
+
+    # Курьеру — тот же факт, но с адресом и окном: до этого он узнавал о
+    # задаче, только если сам открывал приложение и обновлял список.
+    where = courier_task.address or "адрес уточняется"
+    when = f" · {courier_task.time_slot}" if courier_task.time_slot else ""
+    company = getattr(courier_task.client, "company_name", "") or "клиент"
+    _create_and_push(
+        user=courier,
+        title=f"Новая задача: {courier_task.get_task_type_display()}",
+        body=f"{company} · {where}{when}",
+        n_type="delivery",
+        related_link="/home",
+    )
+
+
+def on_courier_task_progress(courier_task, new_status: str) -> None:
+    """Уведомить клиента, когда курьер двинулся по задаче.
+
+    Курьер жмёт «Взяться за работу» и «Завершить доставку» — оба перехода для
+    клиента событие, а он до сих пор узнавал о них, только открыв приложение.
+    """
+    by_type = _COURIER_PROGRESS_COPY.get(new_status)
+    if by_type is None:
+        return
+
+    user = getattr(courier_task.client, "user", None)
+    if user is None:
+        logger.warning("CourierTask pk=%s has no user", courier_task.pk)
+        return
+
+    title, body = by_type.get(courier_task.task_type, by_type["_default"])
+    if new_status == "in_progress" and courier_task.time_slot:
+        body = f"{body} Ожидайте по адресу, {courier_task.time_slot}."
+
+    logger.info(
+        "Notification trigger: CourierTask pk=%s progress→%s user=%s",
+        courier_task.pk, new_status, user.pk,
+    )
+    _create_and_push(
+        user=user,
+        title=title,
+        body=body,
+        n_type="delivery",
+        related_link="/delivery",
+    )
+
+
+# ── Экспертная поддержка ──────────────────────────────────────────────────────
+
+def _expert_users():
+    """Пользователи, которые разбирают вопросы клиентов.
+
+    Роль ищем по обоим написаниям: в Profile.Role она объявлена как
+    ``ai_expert``, но в базе встречается ``expert`` (так её пишет seed_db).
+    Пока это расхождение не устранено, уведомления должны доходить в любом
+    случае — иначе тикеты копятся молча.
+    """
+    from django.contrib.auth.models import User
+
+    return User.objects.filter(profile__role__in=("ai_expert", "expert"))
+
+
+def on_expert_ticket_created(ticket) -> None:
+    """Уведомить экспертов о новом вопросе — и из формы, и из эскалации AI-чата."""
+    experts = list(_expert_users())
+    if not experts:
+        logger.warning("ExpertTicket pk=%s: нет пользователей с ролью эксперта", ticket.pk)
+        return
+
+    company = getattr(ticket.client, "company_name", "") or "Клиент"
+    question = (ticket.question or "").strip()
+    preview = question if len(question) <= 120 else f"{question[:117]}…"
+    urgent = " ⚡" if ticket.risk == "high" else ""
+
+    logger.info(
+        "Notification trigger: ExpertTicket pk=%s created, experts=%d",
+        ticket.pk, len(experts),
+    )
+    for expert in experts:
+        _create_and_push(
+            user=expert,
+            title=f"Новый вопрос: {ticket.category}{urgent}",
+            body=f"{company}: {preview}",
+            n_type="action_required",
+            related_link="/home",
+        )
+
+
+def on_expert_ticket_answered(ticket) -> None:
+    """Уведомить клиента, что эксперт ответил на его вопрос."""
+    user = getattr(ticket.client, "user", None)
+    if user is None:
+        logger.warning("ExpertTicket pk=%s has no user", ticket.pk)
+        return
+
+    answer = (ticket.expert_answer or "").strip()
+    preview = answer if len(answer) <= 120 else f"{answer[:117]}…"
+
+    logger.info("Notification trigger: ExpertTicket pk=%s answered user=%s", ticket.pk, user.pk)
+    _create_and_push(
+        user=user,
+        title="Эксперт ответил на ваш вопрос",
+        body=preview or f"Получен ответ по теме «{ticket.category}».",
+        n_type="ai",
+        related_link="/qa",
     )
 
 

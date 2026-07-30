@@ -13,6 +13,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from .forms import ProductExcelImportForm
+from .services.exports import EXPORTERS as EXPORT_FORMATS, export_clients
 from .models import (
     Attachment,
     AuthToken,
@@ -32,6 +33,8 @@ from .models import (
     Product,
     Purchase,
     PurchaseItem,
+    PartnerTier,
+    RankDiscount,
     Region,
     Referral,
     Store,
@@ -247,6 +250,54 @@ class ClientProfileAdmin(admin.ModelAdmin):
     search_fields = ("company_name", "inn", "external_id", "contact_name", "phone", "user__username", "user__email")
     readonly_fields = ("created_at",)
     inlines = (StoreInline,)
+    actions = ("export_xlsx", "export_docx", "export_pdf", "export_csv")
+    change_list_template = "admin/api/clientprofile/change_list.html"
+
+    def get_queryset(self, request):
+        # Выгрузка читает регион, дистрибьютора и менеджера у каждого клиента —
+        # без select_related это N+1 на весь список.
+        return (
+            super().get_queryset(request)
+            .select_related("user", "region", "distributor", "manager")
+        )
+
+    # ── Выгрузка ─────────────────────────────────────────────────────────────
+
+    @admin.action(description="Скачать в Excel (.xlsx)")
+    def export_xlsx(self, request, queryset):
+        return export_clients(queryset, "xlsx")
+
+    @admin.action(description="Скачать в Word (.docx)")
+    def export_docx(self, request, queryset):
+        return export_clients(queryset, "docx")
+
+    @admin.action(description="Скачать в PDF")
+    def export_pdf(self, request, queryset):
+        return export_clients(queryset, "pdf")
+
+    @admin.action(description="Скачать в CSV")
+    def export_csv(self, request, queryset):
+        return export_clients(queryset, "csv")
+
+    def get_urls(self):
+        # Кнопка «Скачать всё» над списком: выгружает текущую выборку целиком,
+        # с учётом фильтров и поиска, без ручного выделения галочками.
+        custom = [
+            path(
+                "export/<str:fmt>/",
+                self.admin_site.admin_view(self.export_filtered),
+                name="api_clientprofile_export",
+            ),
+        ]
+        return custom + super().get_urls()
+
+    def export_filtered(self, request, fmt):
+        if fmt not in EXPORT_FORMATS:
+            messages.error(request, f"Неизвестный формат: {fmt}")
+            return redirect("admin:api_clientprofile_changelist")
+
+        changelist = self.get_changelist_instance(request)
+        return export_clients(changelist.get_queryset(request), fmt)
 
     @admin.display(description="Рекомендовал")
     def referral_count(self, obj):
@@ -611,6 +662,116 @@ class AttachmentAdmin(admin.ModelAdmin):
     list_filter = ("file_type", "content_type", "uploaded_at")
     search_fields = ("file", "description", "uploaded_by__username", "uploaded_by__email")
     readonly_fields = ("uploaded_at",)
+
+
+@admin.register(PartnerTier)
+class PartnerTierAdmin(admin.ModelAdmin):
+    """Ранги и пороги: с какого оборота клиент получает какой ранг."""
+
+    list_display = ("name", "threshold_display", "clients_count", "discounts_count", "is_active")
+    list_editable = ("is_active",)
+    search_fields = ("name", "description")
+    ordering = ("threshold",)
+    actions = ("recalculate_tiers",)
+    fieldsets = (
+        (None, {
+            "fields": ("name", "threshold", "description", "is_active"),
+            "description": (
+                "Порог — оборот клиента: подтверждённые закупки плюс оплаченные заказы. "
+                "Ранг присваивается автоматически при подтверждении закупки и при оплате "
+                "заказа. Понижения не происходит — для этого есть действие «Пересчитать "
+                "ранги» внизу списка клиентов."
+            ),
+        }),
+    )
+
+    @admin.display(description="Порог оборота", ordering="threshold")
+    def threshold_display(self, obj):
+        return format_html("<b>от {} ₽</b>", f"{obj.threshold:,.0f}".replace(",", " "))
+
+    @admin.display(description="Клиентов")
+    def clients_count(self, obj):
+        return ClientProfile.objects.filter(partner_status=obj.name).count()
+
+    @admin.display(description="Правил скидок")
+    def discounts_count(self, obj):
+        return obj.discounts.count()
+
+    @admin.action(description="Пересчитать ранги клиентов по обороту (без понижения)")
+    def recalculate_tiers(self, request, queryset):
+        from .services.tiers import recalculate_all
+
+        stats = recalculate_all(allow_downgrade=False)
+        self.message_user(
+            request,
+            f"Проверено клиентов: {stats['checked']}, повышено: {stats['upgraded']}.",
+            messages.SUCCESS,
+        )
+
+
+@admin.register(RankDiscount)
+class RankDiscountAdmin(admin.ModelAdmin):
+    """Прайс по рангам: дилерский салон платит меньше гаражного сервиса."""
+
+    list_display = (
+        "tier",
+        "scope_display",
+        "percent_display",
+        "distributor",
+        "is_active",
+        "example",
+        "updated_at",
+    )
+    list_filter = ("tier", "is_active", "distributor")
+    search_fields = ("product_category", "comment")
+    list_editable = ("is_active",)
+    readonly_fields = ("updated_at",)
+    fieldsets = (
+        ("Кому", {
+            "fields": ("tier", "distributor"),
+            "description": (
+                "Ранг клиент получает автоматически по обороту — пороги "
+                "настраиваются в разделе «Ранги клиентов». "
+                "Дистрибьютор пустой — правило работает у всех."
+            ),
+        }),
+        ("На что", {
+            "fields": ("product_category",),
+            "description": (
+                "Категория товаров как в ассортименте. Пусто — скидка на весь прайс. "
+                "Правило на конкретную категорию перебивает правило на весь прайс."
+            ),
+        }),
+        ("Сколько", {"fields": ("percent", "is_active", "comment", "updated_at")}),
+    )
+
+    @admin.display(description="На что")
+    def scope_display(self, obj):
+        return obj.product_category or "весь ассортимент"
+
+    @admin.display(description="Скидка", ordering="percent")
+    def percent_display(self, obj):
+        return format_html("<b>−{}%</b>", obj.percent)
+
+    @admin.display(description="Пример: 10 000 ₽ →")
+    def example(self, obj):
+        from .services.pricing import apply_discount
+
+        return f"{apply_discount(10000, obj.percent):,.0f} ₽".replace(",", " ")
+
+    def formfield_for_dbfield(self, db_field, request, **kwargs):
+        # Подсказываем реальные категории из ассортимента, чтобы правило не
+        # завели на категорию с опечаткой — такое правило молча не сработает.
+        if db_field.name == "product_category":
+            categories = (
+                Product.objects.exclude(category="")
+                .order_by("category")
+                .values_list("category", flat=True)
+                .distinct()
+            )
+            listed = ", ".join(list(categories)[:12]) or "— ассортимент пуст"
+            kwargs["help_text"] = f"Пусто — весь ассортимент. Категории в базе: {listed}"
+        return super().formfield_for_dbfield(db_field, request, **kwargs)
 
 
 admin.site.register(ManagerTask)
