@@ -176,6 +176,26 @@ class PartnerTier(models.Model):
         return self.name
 
 
+# Алфавит без похожих символов: 0/O, 1/I/l — код диктуют по телефону и
+# переписывают с экрана, путаница тут стоит потерянного реферала.
+REFERRAL_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+REFERRAL_CODE_PREFIX = "AT-"
+REFERRAL_CODE_LENGTH = 6
+
+
+def generate_referral_code():
+    """Личный код приглашения. Уникальность проверяется по базе."""
+    import secrets
+
+    for _ in range(20):
+        body = "".join(secrets.choice(REFERRAL_CODE_ALPHABET) for _ in range(REFERRAL_CODE_LENGTH))
+        code = f"{REFERRAL_CODE_PREFIX}{body}"
+        if not ClientProfile.objects.filter(referral_code=code).exists():
+            return code
+    # Практически недостижимо: 31^6 ≈ 887 млн вариантов.
+    raise RuntimeError("Не удалось подобрать свободный реферальный код")
+
+
 # Пороги на случай пустой таблицы: первый запуск, тесты, миграция с нуля.
 DEFAULT_PARTNER_TIERS = [
     ("Базовый", 0, "Стартовый ранг при регистрации"),
@@ -325,6 +345,16 @@ class ClientProfile(models.Model):
         default=BASE_PARTNER_TIER,
         help_text="Присваивается автоматически по обороту. Менеджер может выставить вручную.",
     )
+    # Личный код для приглашений. По нему новый сервис при регистрации
+    # связывается с пригласившим — см. Referral и эндпоинт /register.
+    referral_code = models.CharField(
+        "Реферальный код",
+        max_length=16,
+        unique=True,
+        blank=True,
+        null=True,
+        db_index=True,
+    )
     total_purchases = models.DecimalField("Сумма закупок", max_digits=12, decimal_places=2, default=0)
     comments = models.TextField("Комментарии", blank=True)
     created_at = models.DateTimeField("Создан", auto_now_add=True)
@@ -349,6 +379,10 @@ class ClientProfile(models.Model):
                 raise ValidationError(f"Клиент с ИНН {self.inn} уже существует в регионе {self.region.name}.")
 
     def save(self, *args, **kwargs):
+        # Личный код нужен до валидации: full_clean проверит уникальность.
+        if not self.referral_code:
+            self.referral_code = generate_referral_code()
+
         # Trigger clean for validation
         self.full_clean()
 
@@ -1123,11 +1157,15 @@ class Referral(models.Model):
             self.purchase_amount = amount
             updates.append("purchase_amount")
             
-        # Threshold for bonus/gift (e.g. 30,000)
-        BONUS_THRESHOLD = 30000
-        if amount >= BONUS_THRESHOLD and not self.condition_met:
+        # Подарок — только за реальную покупку выше порога (п. 7 ТЗ).
+        # Порог и сам подарок настраиваются, а не зашиты в код.
+        from django.conf import settings
+
+        threshold = getattr(settings, "REFERRAL_BONUS_THRESHOLD", 30000)
+        gift = getattr(settings, "REFERRAL_BONUS_GIFT", "Сертификат на 5000 ₽")
+        if amount >= float(threshold) and not self.condition_met:
             self.condition_met = True
-            self.gift = "Сертификат на 5000 ₽"
+            self.gift = gift
             updates.append("condition_met")
             updates.append("gift")
             # Notification + FCM push are sent via api.signals._referral_post_save

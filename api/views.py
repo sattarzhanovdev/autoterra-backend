@@ -235,6 +235,44 @@ def _send_order_email(order):
         logger.exception("Failed to send order email for order %s", getattr(order, "id", None))
 
 
+def _link_referral(client, code):
+    """Связывает нового клиента с пригласившим по реферальному коду.
+
+    Раньше запись о реферале мог создать только сам пригласивший, вручную вписав
+    ИНН будущего клиента заранее. По ТЗ (п. 7) наоборот: клиент раздаёт ссылку
+    или код, а система связывает пришедшего по нему при регистрации.
+
+    Ничего не бросает: неверный код не должен ломать регистрацию.
+    """
+    code = (code or "").strip().upper()
+    if not code:
+        return None
+
+    inviter = ClientProfile.objects.filter(referral_code=code).first()
+    if inviter is None:
+        logger.info("Регистрация с неизвестным реферальным кодом %s", code)
+        return None
+    if inviter.pk == client.pk:
+        return None  # сам себя пригласить нельзя
+
+    referral, created = Referral.objects.get_or_create(
+        inviter=inviter,
+        invitee_inn=client.inn,
+        defaults={
+            "invitee_name": client.company_name,
+            "region": client.region.name if client.region_id else "",
+        },
+    )
+    if not created and not referral.invitee_name:
+        referral.invitee_name = client.company_name
+        referral.save(update_fields=["invitee_name"])
+
+    # Регистрация — это ещё не покупка: подарок появится только после
+    # подтверждённого заказа выше порога, это делает sync_from_invitee.
+    referral.sync_from_invitee()
+    return referral
+
+
 def _send_registration_email(client):
     """Письмо о новой регистрации. Не бросает исключений.
 
@@ -782,6 +820,7 @@ def _format_client(client):
         "registrationSource": client.registration_source,
         "status": client.status,
         "partnerStatus": client.partner_status,
+        "referralCode": client.referral_code,
         "totalPurchases": float(
             Purchase.objects
             .filter(client=client, status="verified")
@@ -1238,6 +1277,9 @@ def register(request):
             token = secrets.token_hex(24)
             AuthToken.objects.create(key=token, user=user)
 
+            # Пришёл по приглашению — связываем с пригласившим (п. 7 ТЗ, шаг 2).
+            _link_referral(client, payload.get("referralCode") or payload.get("ref"))
+
     except IntegrityError as e:
         # Резервный обработчик на случай гонки условий
         return JsonResponse({
@@ -1446,12 +1488,20 @@ def dashboard(request):
         return err
     purchases = client.purchases.prefetch_related("items").order_by("-date")[:2]
     color_requests = client.color_requests.exclude(status="delivered").order_by("-created_at")[:2]
+    referrals = client.referrals.all()
     return JsonResponse({
         "client": _format_client(client),
         "distributor": _format_distributor(client.distributor),
         "unreadCount": client.user.notifications.filter(is_read=False).count(),
         "recentPurchases": [_format_purchase(item) for item in purchases],
-        "activeColorRequests": [_format_color_request(item) for item in color_requests]
+        "activeColorRequests": [_format_color_request(item) for item in color_requests],
+        # Счётчики для профиля: там показывается, скольких клиент уже привёл.
+        # Полный список и код — на отдельном экране (/api/referrals/).
+        "referralSummary": {
+            "invitedCount": referrals.count(),
+            "buyersCount": referrals.filter(has_purchase=True).count(),
+            "giftCount": referrals.filter(condition_met=True).count(),
+        },
     })
 
 
@@ -3959,6 +4009,11 @@ def referrals(request):
     if err:
         return err
         
+    # Данные приглашённых подтягиваем из их профилей: покупка могла случиться
+    # уже после создания записи.
+    for referral in client.referrals.all():
+        referral.sync_from_invitee()
+
     qs = client.referrals.all()
     stats = {
         "invitedCount": qs.count(),
@@ -3967,11 +4022,19 @@ def referrals(request):
         "giftCount": qs.filter(condition_met=True).count(),
         "purchaseAmount": float(sum(r.purchase_amount for r in qs)),
     }
+    base_url = getattr(settings, "REFERRAL_INVITE_BASE_URL", "https://autoterra.shop/register")
     return JsonResponse(paginated_response(
         request,
         qs.order_by("-created_at"),
         _format_referral,
-        extra={"stats": stats},
+        extra={
+            "stats": stats,
+            # Личный код и готовая ссылка — их клиент и отправляет коллегам.
+            "referralCode": client.referral_code,
+            "inviteLink": f"{base_url}?ref={client.referral_code}",
+            "bonusThreshold": float(getattr(settings, "REFERRAL_BONUS_THRESHOLD", 30000)),
+            "bonusGift": getattr(settings, "REFERRAL_BONUS_GIFT", ""),
+        },
     ))
 
 @csrf_exempt

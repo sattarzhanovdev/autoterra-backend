@@ -169,6 +169,16 @@ ORDER_NOTIFICATION_EMAILS = [
     if addr.strip()
 ]
 
+# Реферальная программа: подарок начисляется не за регистрацию, а только за
+# реальную покупку приглашённого сервиса выше порога (п. 7 ТЗ).
+REFERRAL_BONUS_THRESHOLD = int(os.environ.get("REFERRAL_BONUS_THRESHOLD", "30000"))
+REFERRAL_BONUS_GIFT = os.environ.get("REFERRAL_BONUS_GIFT", "Сертификат на 5000 ₽")
+
+# Базовый адрес для ссылки-приглашения: <база>/register?ref=<код>.
+REFERRAL_INVITE_BASE_URL = os.environ.get(
+    "REFERRAL_INVITE_BASE_URL", "https://autoterra.shop/register"
+)
+
 # Куда уходит письмо о регистрации нового клиента. Через запятую — несколько
 # адресов. Пусто — используется ящик по умолчанию, зашитый в код.
 REGISTRATION_NOTIFICATION_EMAILS = [
