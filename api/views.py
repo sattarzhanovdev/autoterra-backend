@@ -1047,6 +1047,9 @@ def _format_color_request(item):
         "vin": item.vin,
         "colorCode": item.color_code,
         "colorName": item.color_name,
+        # Тип покрытия: от него зависят рецепт и цена добора.
+        "paintType": item.paint_type,
+        "paintTypeLabel": item.get_paint_type_display(),
         "urgent": item.urgent,
         "comment": item.comment or None,
         "transferMethod": item.transfer_method,
@@ -2403,6 +2406,11 @@ def update_color_request(request, request_id):
     color_request.vin = payload.get("vin", color_request.vin)
     color_request.color_code = payload.get("colorCode", color_request.color_code)
     color_request.color_name = payload.get("colorName", color_request.color_name)
+    if "paintType" in payload:
+        paint_type, err = _paint_type(payload.get("paintType"))
+        if err:
+            return err
+        color_request.paint_type = paint_type
     color_request.pickup_address = payload.get("pickupAddress", color_request.pickup_address)
     color_request.contact_person = payload.get("contactPerson", color_request.contact_person)
     color_request.contact_phone = payload.get("contactPhone", color_request.contact_phone)
@@ -2417,6 +2425,18 @@ def update_color_request(request, request_id):
 
     color_request.save()
     return JsonResponse({"request": _format_color_request(color_request)})
+
+
+def _paint_type(raw):
+    """Тип покрытия из запроса. Пустой или незнакомый — ошибка: от типа зависит
+    цена, молча подставлять умолчание нельзя."""
+    value = (raw or "").strip()
+    allowed = [choice for choice, _ in ColorRequest.PAINT_TYPE_CHOICES]
+    if value not in allowed:
+        return None, JsonResponse(
+            {"detail": "Укажите тип покрытия: " + ", ".join(allowed)}, status=400
+        )
+    return value, None
 
 
 def _append_color_history(item, status, user=None, comment=""):
@@ -2437,6 +2457,9 @@ def create_color_request(request):
         return err
     payload = request.POST if (request.content_type or "").startswith("multipart/form-data") else _json(request)
     files = _attachment_files(request)
+    paint_type, err = _paint_type(payload.get("paintType"))
+    if err:
+        return err
     try:
         with transaction.atomic():
             urgent = _bool(payload.get("urgent"))
@@ -2448,6 +2471,7 @@ def create_color_request(request):
                 vin=(payload.get("vin") or "").strip(),
                 color_code=(payload.get("colorCode") or "").strip(),
                 color_name=(payload.get("colorName") or "").strip(),
+                paint_type=paint_type,
                 urgent=urgent,
                 comment=(payload.get("comment") or "").strip(),
                 transfer_method=(payload.get("transferMethod") or "courier").strip(),

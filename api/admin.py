@@ -504,8 +504,8 @@ class PurchaseAdmin(admin.ModelAdmin):
 
 @admin.register(ColorRequest)
 class ColorRequestAdmin(admin.ModelAdmin):
-    list_display = ("id", "client", "car_brand", "car_model", "color_code", "urgent", "transfer_method", "status", "created_at")
-    list_filter = ("status", "urgent", "transfer_method", "client__distributor")
+    list_display = ("id", "client", "car_brand", "car_model", "color_code", "paint_type", "urgent", "transfer_method", "status", "created_at")
+    list_filter = ("status", "paint_type", "urgent", "transfer_method", "client__distributor")
     search_fields = ("client__company_name", "vin", "car_brand", "car_model", "color_code", "color_name")
     readonly_fields = ("created_at",)
 

@@ -37,6 +37,7 @@ class ColorLabPickupTests(TestCase):
         payload = {
             "carBrand": "Toyota", "carModel": "Camry", "vin": "XW8",
             "colorCode": "1F7", "transferMethod": "courier",
+            "paintType": "baseClear",
             "pickupAddress": "Москва, пр. Мира 22",
         }
         payload.update(extra)

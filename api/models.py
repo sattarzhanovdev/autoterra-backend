@@ -853,6 +853,13 @@ class ColorRequest(models.Model):
         ("courier", "Курьер"),
         ("self_delivery", "Сам привезу"),
     ]
+    # Тип покрытия задаёт состав рецепта и цену: по нему клиент добирает краску
+    # в тот же цвет, и добор считается по цене своего типа.
+    PAINT_TYPE_CHOICES = [
+        ("acrylic", "Акрил"),
+        ("baseClear", "База + лак"),
+        ("threeStage", "Трёхстадийная"),
+    ]
 
     client = models.ForeignKey(ClientProfile, on_delete=models.CASCADE, related_name="color_requests", verbose_name="Клиент")
     car_brand = models.CharField("Марка", max_length=128)
@@ -861,6 +868,9 @@ class ColorRequest(models.Model):
     vin = models.CharField("VIN", max_length=32)
     color_code = models.CharField("Код цвета", max_length=64)
     color_name = models.CharField("Название цвета", max_length=128, blank=True)
+    paint_type = models.CharField(
+        "Тип покрытия", max_length=32, choices=PAINT_TYPE_CHOICES, default="baseClear"
+    )
     urgent = models.BooleanField("Срочно", default=False)
     comment = models.TextField("Комментарий", blank=True)
     
@@ -895,7 +905,7 @@ class ColorRequest(models.Model):
         ordering = ("-created_at",)
 
     def __str__(self):
-        return f"{self.car_brand} {self.car_model} · {self.color_code}"
+        return f"{self.car_brand} {self.car_model} · {self.color_code} · {self.get_paint_type_display()}"
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None
