@@ -174,9 +174,11 @@ ORDER_NOTIFICATION_EMAILS = [
 REFERRAL_BONUS_THRESHOLD = int(os.environ.get("REFERRAL_BONUS_THRESHOLD", "30000"))
 REFERRAL_BONUS_GIFT = os.environ.get("REFERRAL_BONUS_GIFT", "Сертификат на 5000 ₽")
 
-# Базовый адрес для ссылки-приглашения: <база>/register?ref=<код>.
+# Базовый адрес для ссылки-приглашения: <база>?ref=<код>. Веб-сборка приложения
+# работает на хеш-маршрутах, поэтому /register стоит после #: иначе сервер
+# отдаст свой 404, а приложение откроется на экране входа без кода.
 REFERRAL_INVITE_BASE_URL = os.environ.get(
-    "REFERRAL_INVITE_BASE_URL", "https://autoterra.shop/register"
+    "REFERRAL_INVITE_BASE_URL", "https://autoterra.shop/#/register"
 )
 
 # Куда уходит письмо о регистрации нового клиента. Через запятую — несколько

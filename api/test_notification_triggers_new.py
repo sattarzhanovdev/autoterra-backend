@@ -290,3 +290,43 @@ class ColorRequestNotificationRegressionTests(TestCase):
         notes = Notification.objects.filter(user=self.user, type="color")
         self.assertEqual(notes.count(), 1)
         self.assertEqual(notes.first().title, "Подбор цвета завершён")
+
+
+class PushUnavailableTests(TestCase):
+    """FCM может быть недоступен: нет пакета, нет ключей, нет сети.
+
+    Раньше импорт push-сервиса стоял до создания записи, и такой сбой уносил с
+    собой само уведомление — а вместе с ним и всю рассылку рекомендаций,
+    которая падала на первой же подсказке.
+    """
+
+    def setUp(self):
+        self.user = User.objects.create_user(username="+79001110000", password="pw")
+
+    def test_notification_is_saved_when_push_service_cannot_be_imported(self):
+        from api.services.notification_triggers import _create_and_push
+
+        with patch.dict("sys.modules", {"api.services.push_notifications": None}):
+            _create_and_push(
+                user=self.user,
+                title="Давно не было заказа",
+                body="Последний заказ был 60 дн. назад.",
+                n_type="recommendation",
+                related_link="/order",
+            )
+
+        note = Notification.objects.get(user=self.user)
+        self.assertEqual(note.title, "Давно не было заказа")
+        self.assertEqual(note.related_link, "/order")
+
+    def test_send_recommendations_survives_broken_push(self):
+        from api.services.notification_triggers import _create_and_push
+
+        with patch.dict("sys.modules", {"api.services.push_notifications": None}):
+            for i in range(3):
+                _create_and_push(
+                    user=self.user, title=f"Подсказка {i}", body="текст",
+                    n_type="recommendation",
+                )
+
+        self.assertEqual(Notification.objects.filter(user=self.user).count(), 3)

@@ -67,7 +67,6 @@ def _create_and_push(*, user, title: str, body: str, n_type: str, related_link: 
     Importing inside functions avoids circular-import issues at module load time.
     """
     from api.models import Notification  # local import — avoids circular deps
-    from api.services.push_notifications import PushNotificationService
 
     notification = Notification.objects.create(
         user=user,
@@ -76,7 +75,23 @@ def _create_and_push(*, user, title: str, body: str, n_type: str, related_link: 
         type=n_type,
         related_link=related_link,
     )
-    _dispatch_push(PushNotificationService(), notification)
+
+    # Push — доставка, а не само уведомление: если FCM недоступен (не стоит
+    # firebase-admin, нет ключей), лента в приложении всё равно наполняется.
+    # Раньше импорт стоял выше и падение уносило с собой и запись, и всю
+    # рассылку рекомендаций целиком.
+    try:
+        from api.services.push_notifications import PushNotificationService
+
+        service = PushNotificationService()
+    except Exception:
+        logger.exception(
+            "FCM недоступен, push не отправлен | notification_id=%s user_id=%s",
+            notification.pk, notification.user_id,
+        )
+        return
+
+    _dispatch_push(service, notification)
 
 
 def _dispatch_push(service, notification) -> None:
