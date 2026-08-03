@@ -1,4 +1,6 @@
+import re
 from decimal import Decimal, InvalidOperation
+from django import forms
 from django.contrib import admin, messages
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.models import User
@@ -17,6 +19,7 @@ from .services.exports import EXPORTERS as EXPORT_FORMATS, ExportUnavailable, ex
 from .models import (
     Attachment,
     AuthToken,
+    BonusTransaction,
     ClientProfile,
     ColorRequest,
     ContactHistory,
@@ -536,6 +539,42 @@ class ReferralAdmin(admin.ModelAdmin):
     list_filter = ("region", "is_registered", "has_purchase", "condition_met", "gift_status")
     search_fields = ("inviter__company_name", "invitee_name", "invitee_inn")
     readonly_fields = ("created_at", "gift_decided_at")
+    actions = ("approve_gift", "decline_gift")
+
+    def _decide(self, request, queryset, approved):
+        """Решение по подарку. Уведомление клиенту отправит сигнал."""
+        pending = queryset.filter(gift_status="pending")
+        decided = 0
+        for referral in pending:
+            referral.gift_status = "approved" if approved else "declined"
+            referral.gift_decided_by = request.user
+            referral.gift_decided_at = timezone.now()
+            # save() целиком, а не update(): у .update() не срабатывают сигналы,
+            # и клиент не получил бы уведомления.
+            referral.save(update_fields=["gift_status", "gift_decided_by", "gift_decided_at"])
+            decided += 1
+
+        skipped = queryset.count() - decided
+        if decided:
+            self.message_user(
+                request,
+                f"Обработано: {decided}. Клиентам отправлено уведомление.",
+                messages.SUCCESS,
+            )
+        if skipped:
+            self.message_user(
+                request,
+                f"Пропущено: {skipped} — решение по ним уже принято.",
+                messages.WARNING,
+            )
+
+    @admin.action(description="Согласовать подарок")
+    def approve_gift(self, request, queryset):
+        self._decide(request, queryset, True)
+
+    @admin.action(description="Отклонить подарок")
+    def decline_gift(self, request, queryset):
+        self._decide(request, queryset, False)
 
 
 @admin.register(ExpertTicket)
@@ -562,10 +601,76 @@ class KnowledgeCardAdmin(admin.ModelAdmin):
     readonly_fields = ("created_at", "updated_at")
 
 
+IFRAME_SRC_RE = re.compile(r"""src\s*=\s*["']([^"']+)["']""", re.I)
+
+
+def extract_url(value):
+    """Достаёт адрес из того, что реально вставляют в поле.
+
+    YouTube по кнопке «Поделиться → Встроить» отдаёт целый <iframe>, и вставить
+    его в поле ссылки — самая частая ошибка. Вытаскиваем оттуда src вместо того,
+    чтобы отбивать форму ошибкой валидации.
+    """
+    text = (value or "").strip()
+    if not text:
+        return text
+
+    match = IFRAME_SRC_RE.search(text)
+    if match:
+        text = match.group(1).strip()
+
+    # Протокол-относительные ссылки (//youtube.com/...) сами по себе валидны
+    # в HTML, но URLField их не примет.
+    if text.startswith("//"):
+        text = f"https:{text}"
+    return text
+
+
+class NormalizingURLField(forms.URLField):
+    """URL-поле, которое сначала чистит ввод, а потом уже проверяет."""
+
+    def to_python(self, value):
+        return super().to_python(extract_url(value))
+
+
+class LearningMaterialForm(forms.ModelForm):
+    class Meta:
+        model = LearningMaterial
+        fields = "__all__"
+        field_classes = {
+            "video_url": NormalizingURLField,
+            "file_url": NormalizingURLField,
+        }
+        help_texts = {
+            "video_url": (
+                "Обычная ссылка на видео, например "
+                "https://www.youtube.com/watch?v=XXXXXXXXXXX. "
+                "Код <iframe> тоже можно вставить — ссылка из него возьмётся сама."
+            ),
+            "file_url": "Прямая ссылка на файл: PDF, документ, изображение.",
+        }
+
+
+@admin.register(BonusTransaction)
+class BonusTransactionAdmin(admin.ModelAdmin):
+    """Реестр бонусов. Это деньги — записи только читаются, не правятся."""
+
+    list_display = ("id", "client", "amount", "kind", "order", "comment", "created_at")
+    list_filter = ("kind", "created_at")
+    search_fields = ("client__company_name", "client__inn", "comment")
+    readonly_fields = ("created_at",)
+
+    def has_change_permission(self, request, obj=None):
+        # Задним числом баланс не переписывают: ошибку исправляют новой
+        # операцией с типом «Ручная корректировка».
+        return False
+
+
 @admin.register(LearningMaterial)
 class LearningMaterialAdmin(admin.ModelAdmin):
     """Материалы ведутся отсюда: по п. 10 ТЗ клиент их только читает."""
 
+    form = LearningMaterialForm
     list_display = ("id", "title", "kind", "category", "status", "created_at")
     list_filter = ("status", "kind", "category")
     search_fields = ("title", "summary", "body", "category")

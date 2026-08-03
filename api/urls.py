@@ -93,6 +93,8 @@ urlpatterns = [
     path("referrals/<int:referral_id>/decide-gift/", views.decide_referral_gift),
     # Обучающие материалы (п. 10 ТЗ).
     path("learning-materials/", views.learning_materials),
+    # Бонусный счёт: баланс и история операций.
+    path("bonus-account/", views.bonus_account),
     path("tickets/", views.tickets),
     path("tickets/create/", views.create_ticket),
     path("tickets/<int:ticket_id>/expert-answer/", views.expert_answer_ticket),

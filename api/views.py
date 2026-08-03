@@ -35,6 +35,7 @@ from .models import (
     Distributor,
     ExpertTicket,
     KnowledgeCard,
+    BonusTransaction,
     LearningMaterial,
     Notification,
     Order,
@@ -58,6 +59,7 @@ from .models import (
 )
 from .pagination import paginate, paginated_response
 from .serializers import RegistrationSerializer, PurchaseSerializer, coerce_decimal
+from .services.bonuses import balance as bonus_balance
 from .services.exports import EXPORTERS as EXPORT_FORMATS, ExportUnavailable, export_clients
 from .services.pricing import price_details, price_for_client
 from .services.tiers import sync_client_tier
@@ -963,10 +965,22 @@ def _format_order(order):
         "shippedAt": order.shipped_at.isoformat() if order.shipped_at else None,
         # Клиент может нажать «Оплатить» только для этих статусов
         "isPayable": order.status in Order.PAYABLE_STATUSES,
+        # Сколько бонусов можно бросить в этот заказ — экран оплаты показывает
+        # это до нажатия «Оплатить».
+        "bonusAvailable": float(bonus_balance(order.client)),
+        "bonusApplied": float(_bonus_applied(order)),
         "adjustments": [_format_adjustment(a) for a in order.adjustments.all()],
         "pendingPayment": _format_pending_payment(order),
         "items": items,
     }
+
+
+def _bonus_applied(order):
+    """Сколько бонусов уже списано в этот заказ (за вычетом возвратов)."""
+    total = order.bonus_transactions.filter(kind__in=["order", "refund"]).aggregate(
+        total=Sum("amount")
+    )["total"]
+    return abs(Decimal(total or 0))
 
 
 def _format_adjustment(adj):
@@ -1508,8 +1522,12 @@ def dashboard(request):
         "referralSummary": {
             "invitedCount": referrals.count(),
             "buyersCount": referrals.filter(has_purchase=True).count(),
-            "giftCount": referrals.filter(condition_met=True).count(),
+            # Как и на экране рефералов: выданным считается только согласованный.
+            "giftCount": referrals.filter(condition_met=True, gift_status="approved").count(),
         },
+        # Бонусы уменьшают сумму к оплате в ЮKassa, поэтому баланс нужен и на
+        # главной, и в профиле.
+        "bonusBalance": float(bonus_balance(client)),
     })
 
 
@@ -2140,6 +2158,34 @@ def _format_payment(payment):
     }
 
 
+def _mark_order_paid(order, payment):
+    """Перевести заказ в «оплачен» и разослать всё, что с этим связано.
+
+    Путей оплаты теперь два — ЮKassa и полное покрытие бонусами, — а следствия
+    у них одинаковые, поэтому они живут здесь, а не в каждом обработчике.
+    """
+    if order.status not in Order.PAYABLE_STATUSES:
+        return  # уже оплачен: повторно ничего не делаем
+
+    old_status = order.status
+    order.status = "paid"
+    order.paid_at = timezone.now()
+    order.save(update_fields=["status", "paid_at"])
+
+    _notify_operator_order(
+        order,
+        "Заказ оплачен",
+        f"{order.client.company_name} оплатил заказ ORD-{order.id:05d} на {payment.amount} ₽",
+    )
+    _notify_client_order(
+        order, "Оплата получена", f"Оплата заказа ORD-{order.id:05d} прошла успешно."
+    )
+    _send_order_status_email(order, old_status, "paid")
+    # Оплаченный заказ — часть оборота: клиент мог дорасти до ранга с большей
+    # скидкой.
+    sync_client_tier(order.client)
+
+
 @csrf_exempt
 @require_POST
 def pay_order(request, order_id):
@@ -2169,7 +2215,45 @@ def pay_order(request, order_id):
     if existing and existing.confirmation_url:
         return JsonResponse({"payment": _format_payment(existing)}, status=200)
 
+    # Бонусы уменьшают сумму, которая уходит в ЮKassa. Списываем до обращения
+    # к провайдеру: платить нужно уже остаток.
+    from api.services import bonuses
+
+    payload = _json(request)
+    raw_bonus = payload.get("useBonus")
+    if raw_bonus is True:
+        # true — «списать сколько можно», чтобы приложению не считать самому.
+        requested_bonus = bonuses.spendable_for_order(client, order.total_amount)
+    else:
+        try:
+            requested_bonus = Decimal(str(raw_bonus or 0))
+        except (InvalidOperation, ValueError):
+            return JsonResponse({"detail": "Некорректная сумма бонусов"}, status=400)
+    if requested_bonus < 0:
+        return JsonResponse({"detail": "Сумма бонусов не может быть отрицательной"}, status=400)
+
+    applied_bonus = bonuses.debit_for_order(client, order, requested_bonus)
+    payable = (Decimal(order.total_amount) - applied_bonus).quantize(Decimal("0.01"))
+
+    # Бонус покрыл заказ целиком — платить нечего, в ЮKassa идти незачем.
+    if payable <= 0:
+        payment = Payment.objects.create(
+            order=order,
+            amount=Decimal("0.00"),
+            currency="RUB",
+            status="succeeded",
+            provider="bonus",
+            paid_at=timezone.now(),
+        )
+        _mark_order_paid(order, payment)
+        return JsonResponse(
+            {"payment": _format_payment(payment), "bonusApplied": float(applied_bonus)},
+            status=201,
+        )
+
     if not pay.is_configured():
+        # Бонус списан, а заплатить остаток нечем — возвращаем на счёт.
+        bonuses.refund_for_order(order)
         return JsonResponse(
             {"detail": "Оплата временно недоступна: не настроены реквизиты YooKassa (YOOKASSA_SHOP_ID / YOOKASSA_SECRET_KEY)."},
             status=503,
@@ -2178,7 +2262,7 @@ def pay_order(request, order_id):
     idempotence_key = pay.new_idempotence_key()
     payment = Payment.objects.create(
         order=order,
-        amount=order.total_amount,
+        amount=payable,
         currency="RUB",
         status="pending",
         idempotence_key=idempotence_key,
@@ -2186,7 +2270,7 @@ def pay_order(request, order_id):
     try:
         resp = pay.create_payment(
             order=order,
-            amount=order.total_amount,
+            amount=payable,
             idempotence_key=idempotence_key,
             description=f"Заказ ORD-{order.id:05d} · {order.client.company_name}",
         )
@@ -2194,6 +2278,8 @@ def pay_order(request, order_id):
         payment.status = "canceled"
         payment.raw_response = {"error": str(exc)}
         payment.save(update_fields=["status", "raw_response"])
+        # Платёж не создан — бонус не должен сгореть.
+        bonuses.refund_for_order(order)
         return JsonResponse({"detail": f"Ошибка платёжного провайдера: {exc}"}, status=502)
 
     payment.provider_payment_id = resp.get("id", "")
@@ -2202,7 +2288,10 @@ def pay_order(request, order_id):
     payment.raw_response = resp
     payment.save(update_fields=["provider_payment_id", "status", "confirmation_url", "raw_response"])
 
-    return JsonResponse({"payment": _format_payment(payment)}, status=201)
+    return JsonResponse(
+        {"payment": _format_payment(payment), "bonusApplied": float(applied_bonus)},
+        status=201,
+    )
 
 
 @csrf_exempt
@@ -2244,20 +2333,14 @@ def yookassa_webhook(request):
             payment.paid_at = timezone.now()
             payment.save(update_fields=["status", "paid_at"])
         # Двигаем заказ в paid только из оплачиваемого статуса (идемпотентно)
-        if order.status in Order.PAYABLE_STATUSES:
-            old_status = order.status
-            order.status = "paid"
-            order.paid_at = timezone.now()
-            order.save(update_fields=["status", "paid_at"])
-            _notify_operator_order(order, "Заказ оплачен", f"{order.client.company_name} оплатил заказ ORD-{order.id:05d} на {payment.amount} ₽")
-            _notify_client_order(order, "Оплата получена", f"Оплата заказа ORD-{order.id:05d} прошла успешно.")
-            _send_order_status_email(order, old_status, "paid")
-            # Оплаченный заказ — часть оборота: клиент мог дорасти до ранга
-            # с большей скидкой.
-            sync_client_tier(order.client)
+        _mark_order_paid(order, payment)
     elif event == "payment.canceled" or real_status == "canceled":
         payment.status = "canceled"
         payment.save(update_fields=["status"])
+        # Оплата не состоялась — списанные бонусы возвращаем на счёт.
+        from api.services import bonuses
+
+        bonuses.refund_for_order(order)
 
     return JsonResponse({"status": "ok"})
 
@@ -4131,12 +4214,34 @@ def decide_referral_gift(request, referral_id):
     referral.gift_comment = (payload.get("comment") or "").strip()[:255]
     referral.gift_decided_by = _current_user(request)
     referral.gift_decided_at = timezone.now()
+    # Уведомление отправит сигнал _referral_post_save — так оно уходит и при
+    # согласовании из админки, а не только отсюда.
     referral.save(update_fields=["gift_status", "gift_comment", "gift_decided_by", "gift_decided_at"])
-
-    from api.services.notification_triggers import on_referral_gift_decided
-
-    on_referral_gift_decided(referral)
     return JsonResponse({"referral": _format_referral(referral)})
+
+
+@require_GET
+def bonus_account(request):
+    """Баланс бонусов и история операций по нему."""
+    client, err = _require_client(request)
+    if err:
+        return err
+
+    def _format(item):
+        return {
+            "id": str(item.id),
+            "amount": float(item.amount),
+            "kind": item.kind,
+            "kindLabel": item.get_kind_display(),
+            "comment": item.comment,
+            "orderId": str(item.order_id) if item.order_id else None,
+            "createdAt": item.created_at.isoformat(),
+        }
+
+    qs = BonusTransaction.objects.filter(client=client).order_by("-created_at")
+    return JsonResponse(paginated_response(
+        request, qs, _format, extra={"balance": float(bonus_balance(client))}
+    ))
 
 
 # Learning Materials (п. 10 ТЗ)

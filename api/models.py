@@ -1133,6 +1133,11 @@ class Referral(models.Model):
     purchase_amount = models.DecimalField("Сумма покупки", max_digits=12, decimal_places=2, default=0)
     condition_met = models.BooleanField("Условие выполнено", default=False)
     gift = models.CharField("Подарок", max_length=255, blank=True)
+    # Номинал подарка. Ноль — подарок не деньгами (статус, отсрочка): такой на
+    # бонусный счёт не попадает, его отрабатывает дистрибьютор вне приложения.
+    gift_amount = models.DecimalField(
+        "Номинал подарка", max_digits=12, decimal_places=2, default=0
+    )
 
     # Подарок может быть скидкой или отсрочкой, а это деньги дистрибьютора —
     # по п. 7 ТЗ выдавать его без согласования нельзя. Поэтому выполненное
@@ -1204,13 +1209,16 @@ class Referral(models.Model):
 
         threshold = getattr(settings, "REFERRAL_BONUS_THRESHOLD", 30000)
         gift = getattr(settings, "REFERRAL_BONUS_GIFT", "Сертификат на 5000 ₽")
+        gift_amount = getattr(settings, "REFERRAL_BONUS_AMOUNT", 5000)
         if amount >= float(threshold) and not self.condition_met:
             self.condition_met = True
             self.gift = gift
+            self.gift_amount = gift_amount
             # Не «выдан», а «ждёт согласования»: решение за дистрибьютором.
             self.gift_status = "pending"
             updates.append("condition_met")
             updates.append("gift")
+            updates.append("gift_amount")
             updates.append("gift_status")
             # Notification + FCM push are sent via api.signals._referral_post_save
 
@@ -1393,6 +1401,66 @@ class KnowledgeCard(models.Model):
 
     def __str__(self):
         return self.problem or self.title
+
+
+class BonusTransaction(models.Model):
+    """Движение по бонусному счёту клиента.
+
+    Баланс намеренно не хранится отдельным полем, а считается суммой операций:
+    это деньги, и по каждому рублю должно быть видно, откуда он взялся и куда
+    ушёл. Начисление — плюс, списание в счёт заказа — минус.
+    """
+
+    KIND_CHOICES = [
+        ("referral", "Начислен по реферальной программе"),
+        ("order", "Списан в счёт заказа"),
+        ("refund", "Возвращён после отмены оплаты"),
+        ("manual", "Ручная корректировка"),
+    ]
+
+    client = models.ForeignKey(
+        ClientProfile,
+        on_delete=models.CASCADE,
+        related_name="bonus_transactions",
+        verbose_name="Клиент",
+    )
+    amount = models.DecimalField("Сумма", max_digits=12, decimal_places=2)
+    kind = models.CharField("Тип", max_length=16, choices=KIND_CHOICES)
+    referral = models.ForeignKey(
+        "Referral",
+        on_delete=models.SET_NULL,
+        related_name="bonus_transactions",
+        verbose_name="Реферал",
+        blank=True,
+        null=True,
+    )
+    order = models.ForeignKey(
+        Order,
+        on_delete=models.SET_NULL,
+        related_name="bonus_transactions",
+        verbose_name="Заказ",
+        blank=True,
+        null=True,
+    )
+    comment = models.CharField("Комментарий", max_length=255, blank=True)
+    created_at = models.DateTimeField("Создана", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Операция по бонусам"
+        verbose_name_plural = "Операции по бонусам"
+        ordering = ("-created_at",)
+        constraints = [
+            # Один реферал приносит бонус ровно один раз — даже если запись
+            # пересохранят или согласование повторят.
+            models.UniqueConstraint(
+                fields=("referral",),
+                condition=models.Q(kind="referral"),
+                name="unique_referral_bonus_credit",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.client_id}: {self.amount} ({self.get_kind_display()})"
 
 
 class LearningMaterial(models.Model):

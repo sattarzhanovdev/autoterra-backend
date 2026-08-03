@@ -1,4 +1,5 @@
 import os
+from decimal import Decimal
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -173,6 +174,10 @@ ORDER_NOTIFICATION_EMAILS = [
 # реальную покупку приглашённого сервиса выше порога (п. 7 ТЗ).
 REFERRAL_BONUS_THRESHOLD = int(os.environ.get("REFERRAL_BONUS_THRESHOLD", "30000"))
 REFERRAL_BONUS_GIFT = os.environ.get("REFERRAL_BONUS_GIFT", "Сертификат на 5000 ₽")
+
+# Номинал подарка в рублях: попадает на бонусный счёт после согласования и
+# уменьшает сумму к оплате в ЮKassa. Ноль — подарок не деньгами.
+REFERRAL_BONUS_AMOUNT = Decimal(os.environ.get("REFERRAL_BONUS_AMOUNT", "5000"))
 
 # Базовый адрес для ссылки-приглашения: <база>?ref=<код>. Веб-сборка приложения
 # работает на хеш-маршрутах, поэтому /register стоит после #: иначе сервер

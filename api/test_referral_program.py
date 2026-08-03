@@ -312,14 +312,19 @@ class ReferralGiftTests(TestCase):
         self.assertEqual(data["referralSummary"]["buyersCount"], 0)
         self.assertEqual(data["referralSummary"]["giftCount"], 0)
 
-    def test_dashboard_counts_gift_after_purchase(self):
+    def test_dashboard_counts_gift_only_after_approval(self):
+        """В профиле показываем выданные подарки, а не ждущие согласования."""
         self._purchase(35_000)
         self.referral.sync_from_invitee()
 
         data = self._dashboard()
-
         self.assertEqual(data["referralSummary"]["buyersCount"], 1)
-        self.assertEqual(data["referralSummary"]["giftCount"], 1)
+        self.assertEqual(data["referralSummary"]["giftCount"], 0)
+
+        self.referral.gift_status = "approved"
+        self.referral.save(update_fields=["gift_status"])
+
+        self.assertEqual(self._dashboard()["referralSummary"]["giftCount"], 1)
 
     def test_dashboard_of_client_without_invites_shows_zero(self):
         """У приглашённого своих рефералов нет — цифры не должны «протекать»."""

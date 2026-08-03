@@ -315,3 +315,56 @@ class AutoDraftKnowledgeCardTests(_Base):
         self._answer(ticket)
 
         self.assertFalse(KnowledgeCard.objects.filter(source_ticket=ticket).exists())
+
+
+class GiftNotificationFromAnywhereTests(_Base):
+    """Уведомление о решении не должно зависеть от способа согласования.
+
+    Дистрибьютор может нажать кнопку в приложении, а может отметить запись в
+    админке. Клиенту в обоих случаях нужно сообщить.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.inviter = self._client_profile("+79001110000", "5556667778", "Пригласивший")
+        self.referral = Referral.objects.create(
+            inviter=self.inviter, invitee_inn="7778889990",
+            invitee_name="Приглашённый", region=self.region.name,
+            condition_met=True, gift="Сертификат на 5000 ₽", gift_status="pending",
+        )
+
+    def _notifications(self, title):
+        return Notification.objects.filter(user=self.inviter.user, title=title)
+
+    def test_approving_by_plain_save_notifies_client(self):
+        """Так подарок согласуют из админки — без обращения к API."""
+        self.referral.gift_status = "approved"
+        self.referral.save(update_fields=["gift_status"])
+
+        self.assertEqual(self._notifications("Подарок согласован").count(), 1)
+
+    def test_declining_by_plain_save_notifies_client(self):
+        self.referral.gift_status = "declined"
+        self.referral.save(update_fields=["gift_status"])
+
+        self.assertEqual(self._notifications("Подарок не согласован").count(), 1)
+
+    def test_repeated_save_does_not_duplicate_notification(self):
+        self.referral.gift_status = "approved"
+        self.referral.save(update_fields=["gift_status"])
+        self.referral.gift_comment = "уточнение"
+        self.referral.save(update_fields=["gift_comment"])
+
+        self.assertEqual(self._notifications("Подарок согласован").count(), 1)
+
+    def test_pending_alone_sends_no_decision_notice(self):
+        # Условие выполнено — это ещё не решение по подарку.
+        referral = Referral.objects.create(
+            inviter=self.inviter, invitee_inn="1231231231",
+            invitee_name="Второй", region=self.region.name,
+        )
+        referral.gift_status = "pending"
+        referral.save(update_fields=["gift_status"])
+
+        self.assertFalse(self._notifications("Подарок согласован").exists())
+        self.assertFalse(self._notifications("Подарок не согласован").exists())
