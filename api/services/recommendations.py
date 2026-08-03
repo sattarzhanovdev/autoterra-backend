@@ -31,8 +31,8 @@ FREQUENT_DEFECT_MIN = 2
 NEW_MATERIAL_DAYS = 14
 # Сколько дней тишины в регионе — повод для задачи менеджеру.
 REGION_SILENCE_DAYS = 30
-# Одна и та же подсказка не повторяется чаще, чем раз в столько дней.
-DEFAULT_COOLDOWN_DAYS = 14
+# Одна и та же подсказка не повторяется чаще, чем раз в столько дней. (0 = повторы разрешены всегда)
+DEFAULT_COOLDOWN_DAYS = 0
 
 
 @dataclass
@@ -227,17 +227,35 @@ def new_materials(days=NEW_MATERIAL_DAYS):
     """«Новый обучающий материал» → порекомендовать по темам клиента.
 
     Тема берётся из истории обращений: материал по чужой теме — это спам.
+    Считаем и опубликованные обучающие материалы (уроки, видео, вебинары), и
+    утверждённые карточки базы знаний — по ТЗ клиенту полезно и то, и другое.
     """
-    from api.models import ExpertTicket, KnowledgeCard
+    from api.models import ExpertTicket, KnowledgeCard, LearningMaterial
 
     since = timezone.now() - timedelta(days=days)
-    fresh = list(KnowledgeCard.objects.filter(status="approved", created_at__gte=since))
+
+    # (категория, что показать, куда вести, чем пометить)
+    fresh = []
+    for material in LearningMaterial.objects.filter(status="published", created_at__gte=since):
+        fresh.append((
+            (material.category or "").lower(),
+            f"{material.get_kind_display().lower()} «{material.title}»",
+            "/learning",
+            {"materialId": material.pk},
+        ))
+    for card in KnowledgeCard.objects.filter(status="approved", created_at__gte=since):
+        fresh.append((
+            (card.category or "").lower(),
+            f"разбор «{card.title or card.problem}»",
+            "/qa",
+            {"cardId": card.pk},
+        ))
     if not fresh:
         return []
 
     by_category = {}
-    for card in fresh:
-        by_category.setdefault((card.category or "").lower(), []).append(card)
+    for category, label, link, meta in fresh:
+        by_category.setdefault(category, []).append((label, link, meta))
 
     out = []
     for client in _active_clients():
@@ -250,21 +268,18 @@ def new_materials(days=NEW_MATERIAL_DAYS):
             for value in ExpertTicket.objects
             .filter(client=client).values_list("category", flat=True)
         )
-        matched = [card for key, cards in by_category.items() if key in categories for card in cards]
+        matched = [item for key, items in by_category.items() if key in categories for item in items]
         if not matched:
             continue
 
-        card = matched[0]
+        label, link, meta = matched[0]
         out.append(Recommendation(
             user=user,
             title="Новый материал по вашей теме",
-            body=(
-                f"В базе знаний появился разбор: {card.title or card.problem} "
-                f"({card.category})."
-            ),
-            related_link="/qa",
+            body=f"По вашей теме появился {label}.",
+            related_link=link,
             rule="new_material",
-            meta={"cardId": card.pk},
+            meta=meta,
         ))
     return out
 

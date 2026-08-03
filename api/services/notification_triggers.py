@@ -299,20 +299,51 @@ def on_referral_condition_met(referral) -> None:
         logger.warning("Referral pk=%s inviter has no user", referral.pk)
         return
 
-    gift_desc = referral.gift or "подарок"
     amount_fmt = f"{int(referral.purchase_amount):,}".replace(",", " ")
 
     logger.info(
         "Notification trigger: Referral pk=%s condition_met user=%s",
         referral.pk, user.pk,
     )
+    # Подарок ещё не выдан: по п. 7 ТЗ его согласует дистрибьютор. Обещать
+    # клиенту конкретную скидку до решения нельзя.
     _create_and_push(
         user=user,
         title="Реферал совершил покупку!",
         body=(
             f"{referral.invitee_name} совершил покупки на сумму {amount_fmt} ₽. "
-            f"Вам доступен {gift_desc}."
+            "Условие выполнено — подарок отправлен на согласование дистрибьютору."
         ),
+        n_type="referral",
+        related_link="/referral",
+    )
+
+
+def on_referral_gift_decided(referral) -> None:
+    """Дистрибьютор согласовал или отклонил подарок — сообщить пригласившему."""
+    user = getattr(referral.inviter, "user", None)
+    if user is None:
+        logger.warning("Referral pk=%s inviter has no user", referral.pk)
+        return
+
+    approved = referral.gift_status == "approved"
+    if approved:
+        title = "Подарок согласован"
+        body = f"Дистрибьютор подтвердил: {referral.gift}."
+    else:
+        title = "Подарок не согласован"
+        body = "Дистрибьютор отклонил подарок по этому приглашению."
+    if referral.gift_comment:
+        body += f" Комментарий: {referral.gift_comment}"
+
+    logger.info(
+        "Notification trigger: Referral pk=%s gift %s user=%s",
+        referral.pk, referral.gift_status, user.pk,
+    )
+    _create_and_push(
+        user=user,
+        title=title,
+        body=body,
         n_type="referral",
         related_link="/referral",
     )

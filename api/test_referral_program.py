@@ -278,7 +278,11 @@ class ReferralGiftTests(TestCase):
         self.assertTrue(item["conditionMet"])
         self.assertEqual(item["purchaseAmount"], 35_000.0)
         self.assertEqual(data["stats"]["buyersCount"], 1)
-        self.assertEqual(data["stats"]["giftCount"], 1)
+        # Условие выполнено, но подарок ещё ждёт дистрибьютора (п. 7 шаг 6),
+        # поэтому в выданных он не числится. Согласование — в test_tz_gaps.
+        self.assertEqual(item["giftStatus"], "pending")
+        self.assertEqual(data["stats"]["giftCount"], 0)
+        self.assertEqual(data["stats"]["pendingGiftCount"], 1)
 
     def test_client_profile_exposes_referral_code(self):
         response = self.http.get(

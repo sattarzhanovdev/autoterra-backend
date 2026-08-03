@@ -24,6 +24,7 @@ from .models import (
     Distributor,
     ExpertTicket,
     KnowledgeCard,
+    LearningMaterial,
     ManagerTask,
     Notification,
     Order,
@@ -530,10 +531,11 @@ class ReferralAdmin(admin.ModelAdmin):
         "has_purchase",
         "purchase_amount",
         "condition_met",
+        "gift_status",
     )
-    list_filter = ("region", "is_registered", "has_purchase", "condition_met")
+    list_filter = ("region", "is_registered", "has_purchase", "condition_met", "gift_status")
     search_fields = ("inviter__company_name", "invitee_name", "invitee_inn")
-    readonly_fields = ("created_at",)
+    readonly_fields = ("created_at", "gift_decided_at")
 
 
 @admin.register(ExpertTicket)
@@ -557,6 +559,16 @@ class KnowledgeCardAdmin(admin.ModelAdmin):
     list_display = ("id", "title", "problem", "category", "status", "created_at")
     list_filter = ("status", "category")
     search_fields = ("title", "problem", "causes", "solution", "skus")
+    readonly_fields = ("created_at", "updated_at")
+
+
+@admin.register(LearningMaterial)
+class LearningMaterialAdmin(admin.ModelAdmin):
+    """Материалы ведутся отсюда: по п. 10 ТЗ клиент их только читает."""
+
+    list_display = ("id", "title", "kind", "category", "status", "created_at")
+    list_filter = ("status", "kind", "category")
+    search_fields = ("title", "summary", "body", "category")
     readonly_fields = ("created_at", "updated_at")
 
 

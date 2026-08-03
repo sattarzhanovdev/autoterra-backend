@@ -88,6 +88,11 @@ urlpatterns = [
     path("courier/tasks/<int:task_id>/assign/", views.assign_courier_task),
     path("referrals/", views.referrals),
     path("referrals/create/", views.create_referral),
+    # Согласование подарка дистрибьютором (п. 7 ТЗ).
+    path("referrals/pending-gifts/", views.distributor_referral_gifts),
+    path("referrals/<int:referral_id>/decide-gift/", views.decide_referral_gift),
+    # Обучающие материалы (п. 10 ТЗ).
+    path("learning-materials/", views.learning_materials),
     path("tickets/", views.tickets),
     path("tickets/create/", views.create_ticket),
     path("tickets/<int:ticket_id>/expert-answer/", views.expert_answer_ticket),

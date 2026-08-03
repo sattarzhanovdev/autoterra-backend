@@ -293,6 +293,9 @@ class ClientProfile(models.Model):
         ("under_review", "На проверке"),
         ("active", "Активный"),
         ("blocked", "Заблокирован"),
+        # Архив — не то же самое, что блокировка: клиент не нарушал правил,
+        # он просто перестал работать. Блокировкой такое помечать нельзя.
+        ("archived", "Архивный"),
     ]
     SOURCE_CHOICES = [
         ("app", "Мобильное приложение"),
@@ -1130,12 +1133,40 @@ class Referral(models.Model):
     purchase_amount = models.DecimalField("Сумма покупки", max_digits=12, decimal_places=2, default=0)
     condition_met = models.BooleanField("Условие выполнено", default=False)
     gift = models.CharField("Подарок", max_length=255, blank=True)
+
+    # Подарок может быть скидкой или отсрочкой, а это деньги дистрибьютора —
+    # по п. 7 ТЗ выдавать его без согласования нельзя. Поэтому выполненное
+    # условие и выданный подарок — разные состояния.
+    GIFT_STATUS_CHOICES = [
+        ("none", "Условие не выполнено"),
+        ("pending", "Ждёт согласования"),
+        ("approved", "Согласован"),
+        ("declined", "Отклонён"),
+    ]
+    gift_status = models.CharField(
+        "Согласование подарка", max_length=16, choices=GIFT_STATUS_CHOICES, default="none"
+    )
+    gift_decided_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="referral_gift_decisions",
+        verbose_name="Кто решил",
+        blank=True,
+        null=True,
+    )
+    gift_decided_at = models.DateTimeField("Когда решено", blank=True, null=True)
+    gift_comment = models.CharField("Комментарий к решению", max_length=255, blank=True)
     created_at = models.DateTimeField("Создан", auto_now_add=True)
 
     class Meta:
         verbose_name = "Реферал"
         verbose_name_plural = "Рефералы"
         ordering = ("-created_at",)
+
+    @property
+    def gift_is_issued(self) -> bool:
+        """Подарок можно показывать клиенту как полученный."""
+        return self.condition_met and self.gift_status == "approved"
 
     def sync_from_invitee(self):
         invitee = ClientProfile.objects.filter(inn=self.invitee_inn).first()
@@ -1176,8 +1207,11 @@ class Referral(models.Model):
         if amount >= float(threshold) and not self.condition_met:
             self.condition_met = True
             self.gift = gift
+            # Не «выдан», а «ждёт согласования»: решение за дистрибьютором.
+            self.gift_status = "pending"
             updates.append("condition_met")
             updates.append("gift")
+            updates.append("gift_status")
             # Notification + FCM push are sent via api.signals._referral_post_save
 
         if updates:
@@ -1359,6 +1393,58 @@ class KnowledgeCard(models.Model):
 
     def __str__(self):
         return self.problem or self.title
+
+
+class LearningMaterial(models.Model):
+    """Обучающий материал: урок, чек-лист, видео, инструкция, вебинар (п. 10 ТЗ).
+
+    От KnowledgeCard отличается назначением: карточка — это разбор конкретной
+    проблемы для ответов AI, а материал клиент изучает целиком. Поэтому у него
+    есть ссылка на видео и файл, которых у карточки нет.
+
+    Управляется из админки: клиент материалы только читает.
+    """
+
+    KIND_CHOICES = [
+        ("lesson", "Урок"),
+        ("checklist", "Чек-лист"),
+        ("video", "Видео"),
+        ("manual", "Инструкция"),
+        ("webinar", "Запись вебинара"),
+    ]
+    STATUS_CHOICES = [
+        ("draft", "Черновик"),
+        ("published", "Опубликован"),
+        ("archived", "Архив"),
+    ]
+
+    title = models.CharField("Заголовок", max_length=255)
+    kind = models.CharField("Тип", max_length=16, choices=KIND_CHOICES, default="lesson")
+    category = models.CharField("Категория", max_length=128, blank=True)
+    summary = models.CharField("Краткое описание", max_length=512, blank=True)
+    body = models.TextField("Содержание", blank=True)
+    video_url = models.URLField("Ссылка на видео", max_length=512, blank=True)
+    file_url = models.URLField("Ссылка на файл", max_length=512, blank=True)
+    duration_minutes = models.PositiveIntegerField("Длительность, мин", blank=True, null=True)
+    status = models.CharField("Статус", max_length=16, choices=STATUS_CHOICES, default="draft")
+    author = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="learning_materials",
+        verbose_name="Автор",
+        blank=True,
+        null=True,
+    )
+    created_at = models.DateTimeField("Создан", auto_now_add=True)
+    updated_at = models.DateTimeField("Обновлён", auto_now=True)
+
+    class Meta:
+        verbose_name = "Обучающий материал"
+        verbose_name_plural = "Обучающие материалы"
+        ordering = ("-created_at",)
+
+    def __str__(self):
+        return self.title
 
 
 class ManagerTask(models.Model):

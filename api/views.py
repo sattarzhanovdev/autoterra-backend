@@ -35,6 +35,7 @@ from .models import (
     Distributor,
     ExpertTicket,
     KnowledgeCard,
+    LearningMaterial,
     Notification,
     Order,
     OrderAdjustment,
@@ -1184,7 +1185,11 @@ def _format_referral(item):
         "hasPurchase": item.has_purchase,
         "purchaseAmount": float(item.purchase_amount),
         "conditionMet": item.condition_met,
-        "gift": item.gift or None,
+        # Подарок показываем только после согласования: до него клиенту нельзя
+        # обещать скидку или отсрочку, это деньги дистрибьютора.
+        "gift": item.gift if item.gift_is_issued else None,
+        "giftStatus": item.gift_status,
+        "giftComment": item.gift_comment or None,
         "createdAt": item.created_at.isoformat(),
     }
 
@@ -4043,7 +4048,10 @@ def referrals(request):
         "invitedCount": qs.count(),
         "registeredCount": qs.filter(is_registered=True).count(),
         "buyersCount": qs.filter(has_purchase=True).count(),
-        "giftCount": qs.filter(condition_met=True).count(),
+        # Выданным считается только согласованный подарок: до решения
+        # дистрибьютора обещать клиенту нечего (п. 7 ТЗ).
+        "giftCount": qs.filter(condition_met=True, gift_status="approved").count(),
+        "pendingGiftCount": qs.filter(gift_status="pending").count(),
         "purchaseAmount": float(sum(r.purchase_amount for r in qs)),
     }
     base_url = getattr(settings, "REFERRAL_INVITE_BASE_URL", "https://autoterra.shop/register")
@@ -4075,6 +4083,102 @@ def create_referral(request):
         region=payload.get("region", client.region),
     )
     return JsonResponse({"referral": _format_referral(item)}, status=201)
+
+
+@require_GET
+def distributor_referral_gifts(request):
+    """Подарки, ждущие согласования, — по клиентам своего региона (п. 7 ТЗ)."""
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+
+    qs = Referral.objects.filter(gift_status="pending").select_related("inviter")
+    if not is_admin:
+        qs = qs.filter(inviter__distributor=distributor)
+
+    def _format(item):
+        data = _format_referral(item)
+        data["inviterName"] = item.inviter.company_name
+        data["inviterInn"] = item.inviter.inn
+        # Согласующему нужен сам подарок, даже пока он не выдан.
+        data["proposedGift"] = item.gift or None
+        return data
+
+    return JsonResponse(paginated_response(request, qs.order_by("-created_at"), _format))
+
+
+@csrf_exempt
+@require_POST
+def decide_referral_gift(request, referral_id):
+    """Дистрибьютор согласовывает или отклоняет подарок пригласившему."""
+    distributor, is_admin, err = _require_distributor_scope(request)
+    if err:
+        return err
+
+    referral = Referral.objects.filter(id=referral_id).select_related("inviter").first()
+    if referral is None:
+        return JsonResponse({"detail": "Реферал не найден"}, status=404)
+    if not is_admin and referral.inviter.distributor_id != getattr(distributor, "id", None):
+        return JsonResponse({"detail": "Клиент не из вашего региона"}, status=403)
+    if referral.gift_status != "pending":
+        return JsonResponse(
+            {"detail": "Решение уже принято", "giftStatus": referral.gift_status}, status=409
+        )
+
+    payload = _json(request)
+    approved = bool(payload.get("approved"))
+    referral.gift_status = "approved" if approved else "declined"
+    referral.gift_comment = (payload.get("comment") or "").strip()[:255]
+    referral.gift_decided_by = _current_user(request)
+    referral.gift_decided_at = timezone.now()
+    referral.save(update_fields=["gift_status", "gift_comment", "gift_decided_by", "gift_decided_at"])
+
+    from api.services.notification_triggers import on_referral_gift_decided
+
+    on_referral_gift_decided(referral)
+    return JsonResponse({"referral": _format_referral(referral)})
+
+
+# Learning Materials (п. 10 ТЗ)
+
+def _format_learning_material(item):
+    return {
+        "id": str(item.id),
+        "title": item.title,
+        "kind": item.kind,
+        "kindLabel": item.get_kind_display(),
+        "category": item.category,
+        "summary": item.summary,
+        "body": item.body,
+        "videoUrl": item.video_url or None,
+        "fileUrl": item.file_url or None,
+        "durationMinutes": item.duration_minutes,
+        "status": item.status,
+        "createdAt": item.created_at.isoformat(),
+    }
+
+
+@require_GET
+def learning_materials(request):
+    """Материалы для клиента. Черновики и архив видят только эксперты."""
+    user = _current_user(request)
+    if user is None:
+        return JsonResponse({"detail": "Unauthorized"}, status=401)
+
+    qs = LearningMaterial.objects.all()
+    if not _is_expert_user(user):
+        qs = qs.filter(status="published")
+
+    kind = (request.GET.get("kind") or "").strip()
+    if kind:
+        qs = qs.filter(kind=kind)
+    category = (request.GET.get("category") or "").strip()
+    if category:
+        qs = qs.filter(category__iexact=category)
+
+    return JsonResponse(paginated_response(
+        request, qs.order_by("-created_at"), _format_learning_material
+    ))
 
 
 # Support & Expert Views
@@ -4148,8 +4252,21 @@ def expert_answer_ticket(request, ticket_id):
         ticket.status = status
         ticket.save(update_fields=["expert_answer", "expert_author", "status"])
         
-        # If expert wants to create a knowledge card from this
-        if payload.get("createKnowledgeCard"):
+        # По п. 9 ТЗ черновик карточки формируется сам, а эксперт его потом
+        # утверждает, редактирует или отклоняет. Публикации без утверждения не
+        # происходит: карточка создаётся в статусе draft, а AI отвечает только
+        # по approved. Явный createKnowledgeCard=false позволяет отказаться —
+        # например, когда вопрос разовый и знанием не станет.
+        wants_card = payload.get("createKnowledgeCard")
+        auto_draft = (
+            answer
+            and ticket.category
+            and ticket.linked_knowledge_card_id is None
+        )
+        if wants_card is None:
+            wants_card = bool(auto_draft)
+
+        if wants_card:
             card = KnowledgeCard.objects.create(
                 title=f"Кейс: {ticket.category}",
                 category=ticket.category,
