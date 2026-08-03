@@ -181,6 +181,17 @@ REFERRAL_INVITE_BASE_URL = os.environ.get(
     "REFERRAL_INVITE_BASE_URL", "https://autoterra.shop/#/register"
 )
 
+# Android App Links: чтобы ссылка-приглашение открывала приложение, а не
+# браузер, система при установке скачивает /.well-known/assetlinks.json и
+# сверяет отпечаток подписи APK с тем, что здесь. Не совпало — ссылка уходит
+# в браузер. Отпечаток берётся из keytool по релизному хранилищу ключей.
+ANDROID_APP_PACKAGE = os.environ.get("ANDROID_APP_PACKAGE", "com.example.autoterra")
+ANDROID_APP_FINGERPRINTS = [
+    value.strip().upper()
+    for value in os.environ.get("ANDROID_APP_FINGERPRINTS", "").split(",")
+    if value.strip()
+]
+
 # Куда уходит письмо о регистрации нового клиента. Через запятую — несколько
 # адресов. Пусто — используется ящик по умолчанию, зашитый в код.
 REGISTRATION_NOTIFICATION_EMAILS = [
