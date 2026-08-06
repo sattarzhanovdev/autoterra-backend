@@ -2,29 +2,15 @@
 
 Форма «Пригласить СТО» создаёт запись, которая сама по себе даёт право на
 подарок. Проверок в create_referral не было вообще: можно было заявиться на
-свой же ИНН, на выдуманный, дважды на один и тот же и поверх чужой заявки.
+свой же ИНН, дважды на один и тот же и поверх чужой заявки.
 """
 
 import json
 
 from django.contrib.auth.models import User
-from django.test import Client, TestCase, override_settings
+from django.test import Client, TestCase
 
 from .models import AuthToken, ClientProfile, Distributor, Referral, Region
-from .services.inn import is_valid_inn
-
-
-class InnChecksumTests(TestCase):
-    def test_real_inns_pass(self):
-        # Настоящие ИНН: Сбербанк, Газпром и 12-значный ИНН ИП.
-        for inn in ("7707083893", "7736050003", "500100732259"):
-            self.assertTrue(is_valid_inn(inn), inn)
-
-    def test_made_up_inns_fail(self):
-        # 2331343433 — то, что вбили в форму на скриншоте: длина верная,
-        # контрольная сумма нет.
-        for inn in ("2331343433", "1234567890", "7700000000", "", "abcdefghij", "770708389"):
-            self.assertFalse(is_valid_inn(inn), inn)
 
 
 class ReferralClaimGuardTests(TestCase):
@@ -63,12 +49,17 @@ class ReferralClaimGuardTests(TestCase):
         # region — строка из справочника, а не сам объект Region.
         self.assertEqual(referral.region, "Пермь - Урал")
 
-    def test_made_up_inn_is_rejected(self):
-        response = self._create("2331343433")
-
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("ИНН", response.json()["detail"])
+    def test_wrong_length_inn_is_rejected(self):
+        """Проверяем только длину: контрольную сумму намеренно не считаем —
+        в базе полно СТО с номерами, которые её не проходят."""
+        for inn in ("666", "12345678901", "абвгдеёжзи"):
+            response = self._create(inn)
+            self.assertEqual(response.status_code, 400, inn)
         self.assertFalse(Referral.objects.exists())
+
+    def test_inn_without_valid_checksum_is_accepted(self):
+        # 6666666666 — контрольную сумму не проходит, но это нормальный ввод.
+        self.assertEqual(self._create("6666666666").status_code, 201)
 
     def test_empty_name_is_rejected(self):
         response = self._create("7736050003", name="   ")
@@ -321,52 +312,3 @@ class ClaimNeedsInviteeConfirmationTests(TestCase):
 
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 409)
-
-
-class StrictInnSettingTests(TestCase):
-    """На стенде клиенты заведены с выдуманными ИНН — проверку надо уметь снять."""
-
-    def setUp(self):
-        self.http = Client()
-        self.distributor = Distributor.objects.create(
-            name="Дист", inn="1112223334", phone="1", email="d@e.co"
-        )
-        self.region = Region.objects.create(
-            code="59", name="Пермь - Урал", distributor=self.distributor
-        )
-        user = User.objects.create_user(username="+79001110001", password="pw")
-        self.inviter = ClientProfile.objects.create(
-            user=user, inn="7707083893", company_name="Пригласивший", contact_name="Иван",
-            phone="+79001110001", region=self.region, city="Пермь", distributor=self.distributor,
-        )
-        self.token = AuthToken.objects.create(key="inviter-token", user=self.inviter.user)
-
-    def _create(self, inn):
-        return self.http.post(
-            "/api/referrals/create/",
-            data=json.dumps({"inviteeInn": inn, "inviteeName": "СТО"}),
-            content_type="application/json",
-            HTTP_AUTHORIZATION=f"Bearer {self.token.key}",
-        )
-
-    @override_settings(REFERRAL_STRICT_INN=False)
-    def test_checksum_can_be_switched_off(self):
-        # 6666666666 — из формы на скриншоте: длина верная, сумма нет.
-        self.assertEqual(self._create("6666666666").status_code, 201)
-
-    @override_settings(REFERRAL_STRICT_INN=False)
-    def test_length_is_always_checked(self):
-        """Даже с выключенной суммой ИНН должен быть 10 или 12 цифр."""
-        self.assertEqual(self._create("666").status_code, 400)
-        self.assertEqual(self._create("абвгдеёжзи").status_code, 400)
-
-    @override_settings(REFERRAL_STRICT_INN=True)
-    def test_checksum_blocks_by_default(self):
-        self.assertEqual(self._create("6666666666").status_code, 400)
-
-    def test_setting_is_reported_to_the_app(self):
-        """Форма берёт правило с сервера, иначе реализации разъедутся."""
-        response = self.http.get(
-            "/api/referrals/", HTTP_AUTHORIZATION=f"Bearer {self.token.key}"
-        )
-        self.assertIn("strictInn", response.json())

@@ -61,7 +61,6 @@ from .pagination import paginate, paginated_response
 from .serializers import RegistrationSerializer, PurchaseSerializer, coerce_decimal
 from .services.bonuses import balance as bonus_balance
 from .services.exports import EXPORTERS as EXPORT_FORMATS, ExportUnavailable, export_clients
-from .services.inn import is_valid_inn
 from .services.pricing import price_details, price_for_client
 from .services.tiers import sync_client_tier
 
@@ -1251,17 +1250,6 @@ def _format_pending_claim(referral):
         "inviterName": referral.inviter.company_name,
         "inviterCity": referral.inviter.city or "",
     }
-
-
-def _strict_inn_enabled() -> bool:
-    """Проверять ли ИНН по контрольной сумме при заявке на приглашение.
-
-    По умолчанию да: настоящие ИНН её всегда проходят, а опечатка иначе
-    оборачивается заявкой, которая молча висит вечно. Выключается через
-    REFERRAL_STRICT_INN = False — это нужно на стенде, где клиенты заведены
-    с выдуманными номерами вроде 7701234567.
-    """
-    return bool(getattr(settings, "REFERRAL_STRICT_INN", True))
 
 
 def _pending_claim_for(client):
@@ -4229,10 +4217,6 @@ def referrals(request):
             "inviteLink": f"{base_url}?ref={client.referral_code}",
             "bonusThreshold": float(getattr(settings, "REFERRAL_BONUS_THRESHOLD", 30000)),
             "bonusGift": getattr(settings, "REFERRAL_BONUS_GIFT", ""),
-            # Правило проверки ИНН держим на сервере и отдаём приложению:
-            # две независимые реализации разъезжаются, и форма начинает
-            # отклонять то, что сервер принял бы.
-            "strictInn": _strict_inn_enabled(),
         },
     ))
 
@@ -4260,15 +4244,6 @@ def create_referral(request):
     if not inn.isdigit() or len(inn) not in (10, 12):
         return JsonResponse(
             {"detail": "ИНН — 10 цифр для организации, 12 для ИП"}, status=400
-        )
-    # Контрольная сумма, а не только длина: по выдуманному ИНН запись никогда
-    # ни с кем не совпадёт и клиент будет впустую ждать бонус.
-    #
-    # Отключается настройкой: в базе с демо-данными (ООО Ромашка и подобные)
-    # реальных ИНН нет, и строгая проверка не даёт ничего протестировать.
-    if _strict_inn_enabled() and not is_valid_inn(inn):
-        return JsonResponse(
-            {"detail": "ИНН указан неверно — проверьте цифры"}, status=400
         )
     if inn == (client.inn or "").strip():
         return JsonResponse(
