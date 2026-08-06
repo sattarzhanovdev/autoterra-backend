@@ -61,6 +61,7 @@ from .pagination import paginate, paginated_response
 from .serializers import RegistrationSerializer, PurchaseSerializer, coerce_decimal
 from .services.bonuses import balance as bonus_balance
 from .services.exports import EXPORTERS as EXPORT_FORMATS, ExportUnavailable, export_clients
+from .services.inn import is_valid_inn
 from .services.pricing import price_details, price_for_client
 from .services.tiers import sync_client_tier
 
@@ -264,11 +265,38 @@ def _link_referral(client, code):
         defaults={
             "invitee_name": client.company_name,
             "region": client.region.name if client.region_id else "",
+            # Код — уже доказательство: клиент сам перешёл по этой ссылке.
+            "confirmation": "auto",
         },
     )
     if not created and not referral.invitee_name:
         referral.invitee_name = client.company_name
         referral.save(update_fields=["invitee_name"])
+    # Заявка была подана вручную заранее, а клиент пришёл по коду того же
+    # человека — код подтверждает её задним числом.
+    if referral.confirmation == "pending":
+        referral.confirmation = "auto"
+        referral.confirmed_at = timezone.now()
+        referral.save(update_fields=["confirmation", "confirmed_at"])
+
+    # Регистрация по коду — доказательство сильнее ручной заявки: клиент пришёл
+    # именно по этой ссылке. Чужие заявки на тот же ИНН снимаем, иначе за одного
+    # клиента подарок ушёл бы двоим. Трогаем только те, по которым ещё ничего не
+    # решено, — согласованный подарок не отбираем.
+    stale = (
+        Referral.objects.filter(invitee_inn=client.inn)
+        .exclude(pk=referral.pk)
+        .filter(gift_status="none")
+    )
+    removed = stale.count()
+    if removed:
+        logger.info(
+            "Сняты заявки на ИНН %s (%s шт.): клиент пришёл по коду %s",
+            client.inn,
+            removed,
+            code,
+        )
+        stale.delete()
 
     # Регистрация — это ещё не покупка: подарок появится только после
     # подтверждённого заказа выше порога, это делает sync_from_invitee.
@@ -1205,8 +1233,45 @@ def _format_referral(item):
         "gift": item.gift if item.gift_is_issued else None,
         "giftStatus": item.gift_status,
         "giftComment": item.gift_comment or None,
+        # auto · pending · confirmed · declined. Пригласивший должен видеть,
+        # что его заявка ещё не подтверждена приглашённым и подарка не будет.
+        "confirmation": item.confirmation,
         "createdAt": item.created_at.isoformat(),
     }
+
+
+def _format_pending_claim(referral):
+    """Заявка, которую приглашённому предлагают подтвердить.
+
+    Отдаём только название пригласившего: приглашённому этого хватит, чтобы
+    узнать коллегу, а лишние данные чужой компании тут ни к чему.
+    """
+    return {
+        "id": str(referral.id),
+        "inviterName": referral.inviter.company_name,
+        "inviterCity": referral.inviter.city or "",
+    }
+
+
+def _strict_inn_enabled() -> bool:
+    """Проверять ли ИНН по контрольной сумме при заявке на приглашение.
+
+    По умолчанию да: настоящие ИНН её всегда проходят, а опечатка иначе
+    оборачивается заявкой, которая молча висит вечно. Выключается через
+    REFERRAL_STRICT_INN = False — это нужно на стенде, где клиенты заведены
+    с выдуманными номерами вроде 7701234567.
+    """
+    return bool(getattr(settings, "REFERRAL_STRICT_INN", True))
+
+
+def _pending_claim_for(client):
+    """Неподтверждённая заявка на этого клиента, если она есть."""
+    return (
+        Referral.objects.filter(invitee_inn=client.inn, confirmation="pending")
+        .select_related("inviter")
+        .order_by("created_at")
+        .first()
+    )
 
 
 # Autoservice Views
@@ -1319,11 +1384,17 @@ def register(request):
     # и уведомление не должно уйти по клиенту, чья запись откатилась.
     _send_registration_email(client)
 
+    # Кто-то мог заявить это СТО вручную ещё до регистрации. Такая заявка не
+    # даёт права на подарок, пока клиент сам её не подтвердит, — показываем её
+    # сразу, пока человек ещё в потоке регистрации.
+    pending_claim = _pending_claim_for(client)
+
     return JsonResponse({
         "status": "success",
         "token": token,
         "client": _format_client(client),
-        "requires_approval": status == "under_review"
+        "requires_approval": status == "under_review",
+        "pendingReferral": _format_pending_claim(pending_claim) if pending_claim else None,
     }, status=201)
 
 
@@ -1529,6 +1600,11 @@ def dashboard(request):
         # Бонусы уменьшают сумму к оплате в ЮKassa, поэтому баланс нужен и на
         # главной, и в профиле.
         "bonusBalance": float(bonus_balance(client)),
+        # Если при регистрации подтверждение пропустили, спросим ещё раз с
+        # главной: иначе заявка так и повиснет неподтверждённой.
+        "pendingReferral": (
+            _format_pending_claim(claim) if (claim := _pending_claim_for(client)) else None
+        ),
     })
 
 
@@ -4153,23 +4229,121 @@ def referrals(request):
             "inviteLink": f"{base_url}?ref={client.referral_code}",
             "bonusThreshold": float(getattr(settings, "REFERRAL_BONUS_THRESHOLD", 30000)),
             "bonusGift": getattr(settings, "REFERRAL_BONUS_GIFT", ""),
+            # Правило проверки ИНН держим на сервере и отдаём приложению:
+            # две независимые реализации разъезжаются, и форма начинает
+            # отклонять то, что сервер принял бы.
+            "strictInn": _strict_inn_enabled(),
         },
     ))
 
 @csrf_exempt
 @require_POST
 def create_referral(request):
+    """Ручная заявка на приглашённое СТО.
+
+    Заявка закрепляет за клиентом ещё не зарегистрированное СТО по ИНН —
+    бонус зачтётся, даже если оно придёт без реферального кода. Раз запись
+    сама по себе даёт право на подарок, тут нужны все проверки: раньше их не
+    было вообще, и по одному ИНН можно было заявиться самому себе, дважды и
+    поверх чужой заявки.
+    """
     client, err = _require_client(request)
     if err:
         return err
     payload = _json(request)
+
+    inn = str(payload.get("inviteeInn") or "").strip()
+    name = str(payload.get("inviteeName") or "").strip()
+
+    if not name:
+        return JsonResponse({"detail": "Укажите название СТО"}, status=400)
+    if not inn.isdigit() or len(inn) not in (10, 12):
+        return JsonResponse(
+            {"detail": "ИНН — 10 цифр для организации, 12 для ИП"}, status=400
+        )
+    # Контрольная сумма, а не только длина: по выдуманному ИНН запись никогда
+    # ни с кем не совпадёт и клиент будет впустую ждать бонус.
+    #
+    # Отключается настройкой: в базе с демо-данными (ООО Ромашка и подобные)
+    # реальных ИНН нет, и строгая проверка не даёт ничего протестировать.
+    if _strict_inn_enabled() and not is_valid_inn(inn):
+        return JsonResponse(
+            {"detail": "ИНН указан неверно — проверьте цифры"}, status=400
+        )
+    if inn == (client.inn or "").strip():
+        return JsonResponse(
+            {"detail": "Нельзя пригласить самого себя"}, status=400
+        )
+
+    if Referral.objects.filter(inviter=client, invitee_inn=inn).exists():
+        return JsonResponse(
+            {"detail": "Это СТО уже есть в вашем списке приглашений"}, status=409
+        )
+    # Одно СТО — один пригласивший, иначе подарок уйдёт дважды за одного клиента.
+    if Referral.objects.filter(invitee_inn=inn).exists():
+        return JsonResponse(
+            {"detail": "Это СТО уже заявлено другим участником программы"}, status=409
+        )
+    # Заявиться можно только на того, кто ещё не пришёл. Иначе достаточно было
+    # бы вписать ИНН любого действующего клиента и забрать бонус за чужого.
+    if ClientProfile.objects.filter(inn=inn).exists():
+        return JsonResponse(
+            {
+                "detail": "СТО с таким ИНН уже зарегистрировано в AutoTerra — "
+                "заявку можно подать только на нового участника"
+            },
+            status=409,
+        )
+
+    # region у Referral — строка, а у клиента это ссылка на справочник.
+    # Раньше сюда клали сам объект Region и полагались на его __str__.
+    region = payload.get("region") or (client.region.name if client.region_id else "")
+
     item = Referral.objects.create(
         inviter=client,
-        invitee_inn=payload.get("inviteeInn"),
-        invitee_name=payload.get("inviteeName"),
-        region=payload.get("region", client.region),
+        invitee_inn=inn,
+        invitee_name=name,
+        region=region,
+        # Заявка сама себя не подтверждает: право на подарок появится, только
+        # когда приглашённое СТО подтвердит это при регистрации.
+        confirmation="pending",
     )
     return JsonResponse({"referral": _format_referral(item)}, status=201)
+
+
+@csrf_exempt
+@require_POST
+def confirm_referral(request, referral_id):
+    """Приглашённый подтверждает или отклоняет заявку на себя.
+
+    Последнее звено защиты: ручную заявку по чужому ИНН может подать кто
+    угодно, и до этого решения она не даёт права на подарок.
+    """
+    client, err = _require_client(request)
+    if err:
+        return err
+
+    referral = Referral.objects.filter(id=referral_id).select_related("inviter").first()
+    if referral is None:
+        return JsonResponse({"detail": "Приглашение не найдено"}, status=404)
+    # Решать может только тот, кого заявили. Сравниваем по ИНН — именно по нему
+    # заявку и подавали.
+    if referral.invitee_inn != client.inn:
+        return JsonResponse({"detail": "Это приглашение адресовано не вам"}, status=403)
+    if referral.confirmation != "pending":
+        return JsonResponse(
+            {"detail": "Решение уже принято", "confirmation": referral.confirmation},
+            status=409,
+        )
+
+    confirmed = bool(_json(request).get("confirmed"))
+    referral.confirmation = "confirmed" if confirmed else "declined"
+    referral.confirmed_at = timezone.now()
+    referral.save(update_fields=["confirmation", "confirmed_at"])
+    if confirmed:
+        # Покупки могли быть и до подтверждения — пересчитываем сразу.
+        referral.sync_from_invitee()
+    return JsonResponse({"referral": _format_referral(referral)})
 
 
 @require_GET

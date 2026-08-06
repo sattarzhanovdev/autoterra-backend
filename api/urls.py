@@ -88,6 +88,8 @@ urlpatterns = [
     path("courier/tasks/<int:task_id>/assign/", views.assign_courier_task),
     path("referrals/", views.referrals),
     path("referrals/create/", views.create_referral),
+    # Приглашённый подтверждает, что его действительно привели.
+    path("referrals/<int:referral_id>/confirm/", views.confirm_referral),
     # Согласование подарка дистрибьютором (п. 7 ТЗ).
     path("referrals/pending-gifts/", views.distributor_referral_gifts),
     path("referrals/<int:referral_id>/decide-gift/", views.decide_referral_gift),

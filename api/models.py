@@ -1169,15 +1169,51 @@ class Referral(models.Model):
     gift_comment = models.CharField("Комментарий к решению", max_length=255, blank=True)
     created_at = models.DateTimeField("Создан", auto_now_add=True)
 
+    # Кто кого привёл — со слов пригласившего. Ручную заявку по чужому ИНН может
+    # подать кто угодно, поэтому она не даёт права на подарок, пока сам
+    # приглашённый её не подтвердит. Регистрация по коду подтверждения не
+    # требует: код и есть доказательство.
+    CONFIRMATION_CHOICES = [
+        ("auto", "По реферальному коду"),
+        ("pending", "Ждёт подтверждения приглашённого"),
+        ("confirmed", "Приглашённый подтвердил"),
+        ("declined", "Приглашённый отказался"),
+    ]
+    confirmation = models.CharField(
+        "Подтверждение приглашённым",
+        max_length=16,
+        choices=CONFIRMATION_CHOICES,
+        default="auto",
+    )
+    confirmed_at = models.DateTimeField("Когда подтверждено", blank=True, null=True)
+
     class Meta:
         verbose_name = "Реферал"
         verbose_name_plural = "Рефералы"
         ordering = ("-created_at",)
+        constraints = [
+            # Один пригласивший не может заявить одно СТО дважды. Глобальную
+            # уникальность по ИНН держит create_referral: там она сопровождается
+            # понятным ответом, а не 500-й от базы.
+            models.UniqueConstraint(
+                fields=("inviter", "invitee_inn"),
+                name="referral_unique_inviter_invitee",
+            ),
+        ]
 
     @property
     def gift_is_issued(self) -> bool:
         """Подарок можно показывать клиенту как полученный."""
         return self.condition_met and self.gift_status == "approved"
+
+    @property
+    def counts_toward_bonus(self) -> bool:
+        """Засчитывается ли связка при начислении подарка.
+
+        Неподтверждённая заявка не считается: иначе достаточно было бы вписать
+        ИНН чужого клиента и получить подарок за его покупки.
+        """
+        return self.confirmation in ("auto", "confirmed")
 
     def sync_from_invitee(self):
         invitee = ClientProfile.objects.filter(inn=self.invitee_inn).first()
@@ -1216,7 +1252,9 @@ class Referral(models.Model):
         threshold = getattr(settings, "REFERRAL_BONUS_THRESHOLD", 30000)
         gift = getattr(settings, "REFERRAL_BONUS_GIFT", "Сертификат на 5000 ₽")
         gift_amount = getattr(settings, "REFERRAL_BONUS_AMOUNT", 5000)
-        if amount >= float(threshold) and not self.condition_met:
+        # Суммы показываем всегда — пригласивший видит прогресс, — а вот подарок
+        # заводим только по подтверждённой связке.
+        if amount >= float(threshold) and not self.condition_met and self.counts_toward_bonus:
             self.condition_met = True
             self.gift = gift
             self.gift_amount = gift_amount
