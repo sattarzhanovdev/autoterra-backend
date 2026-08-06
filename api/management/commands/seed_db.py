@@ -35,8 +35,13 @@ class Command(BaseCommand):
         region_kzn = Region.objects.create(code="16", name="Казань - Поволжье")
 
         # 3. Create Users & Profiles
-        def create_user(username, role, region=None):
+        def create_user(username, role, region=None, is_staff=False):
             user = User.objects.create_user(username=username, password=password)
+            if is_staff:
+                # Без is_staff в Django-админку не пускают вообще, поэтому
+                # менеджер не мог открыть аналитику закупок.
+                user.is_staff = True
+                user.save(update_fields=["is_staff"])
             # Profile is created by signal, so we just update it
             profile, _ = Profile.objects.get_or_create(user=user)
             profile.role = role
@@ -61,7 +66,7 @@ class Command(BaseCommand):
         region_kzn.save()
 
         # Manager (Admin / Central Office)
-        u_manager = create_user("manager_main", "admin")
+        u_manager = create_user("manager_main", "admin", is_staff=True)
 
         # Courier
         u_courier = create_user("courier_msk", "courier")

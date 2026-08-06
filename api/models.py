@@ -866,14 +866,20 @@ class ColorRequest(models.Model):
 
     client = models.ForeignKey(ClientProfile, on_delete=models.CASCADE, related_name="color_requests", verbose_name="Клиент")
     car_brand = models.CharField("Марка", max_length=128)
-    car_model = models.CharField("Модель", max_length=128)
+    # Модель, год и VIN больше не спрашиваются при подборе: цвет определяют
+    # марка и код, а лишние поля только удлиняли форму. В базе остаются —
+    # в старых заявках они заполнены, и терять эти данные нельзя.
+    car_model = models.CharField("Модель", max_length=128, blank=True)
     car_year = models.CharField("Год", max_length=4, blank=True)
-    vin = models.CharField("VIN", max_length=32)
+    vin = models.CharField("VIN", max_length=32, blank=True)
     color_code = models.CharField("Код цвета", max_length=64)
     color_name = models.CharField("Название цвета", max_length=128, blank=True)
     paint_type = models.CharField(
         "Тип покрытия", max_length=32, choices=PAINT_TYPE_CHOICES, default="baseClear"
     )
+    # Уточнение к типу покрытия: маляр дописывает своими словами, если из трёх
+    # вариантов ни один не описывает состав точно.
+    paint_type_note = models.CharField("Уточнение по покрытию", max_length=255, blank=True)
     urgent = models.BooleanField("Срочно", default=False)
     comment = models.TextField("Комментарий", blank=True)
     

@@ -39,6 +39,8 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    # Разделители разрядов в отчётах: 1 234 567 ₽ вместо 1234567.
+    "django.contrib.humanize",
     "corsheaders",
     "api",
 ]

@@ -1065,6 +1065,7 @@ def _format_color_request(item):
         # Тип покрытия: от него зависят рецепт и цена добора.
         "paintType": item.paint_type,
         "paintTypeLabel": item.get_paint_type_display(),
+        "paintTypeNote": item.paint_type_note or None,
         "urgent": item.urgent,
         "comment": item.comment or None,
         "transferMethod": item.transfer_method,
@@ -2494,6 +2495,8 @@ def update_color_request(request, request_id):
     color_request.vin = payload.get("vin", color_request.vin)
     color_request.color_code = payload.get("colorCode", color_request.color_code)
     color_request.color_name = payload.get("colorName", color_request.color_name)
+    if "paintTypeNote" in payload:
+        color_request.paint_type_note = (payload.get("paintTypeNote") or "").strip()[:255]
     if "paintType" in payload:
         paint_type, err = _paint_type(payload.get("paintType"))
         if err:
@@ -2560,6 +2563,7 @@ def create_color_request(request):
                 color_code=(payload.get("colorCode") or "").strip(),
                 color_name=(payload.get("colorName") or "").strip(),
                 paint_type=paint_type,
+                paint_type_note=(payload.get("paintTypeNote") or "").strip()[:255],
                 urgent=urgent,
                 comment=(payload.get("comment") or "").strip(),
                 transfer_method=(payload.get("transferMethod") or "courier").strip(),
@@ -4218,6 +4222,93 @@ def decide_referral_gift(request, referral_id):
     # согласовании из админки, а не только отсюда.
     referral.save(update_fields=["gift_status", "gift_comment", "gift_decided_by", "gift_decided_at"])
     return JsonResponse({"referral": _format_referral(referral)})
+
+
+@require_GET
+def purchase_analytics(request):
+    """Аналитика закупок для менеджера: срезы или выгрузка файлом.
+
+    Считает тот же сервис, что и страница в админке. Менеджер видит только
+    свои регионы — глобальный видит всю Россию.
+
+    Фильтры: date_from, date_to, distributor, region, sku, status.
+    Выгрузка: ?export=xlsx | csv
+    """
+    from api.services import purchase_analytics as analytics
+    from api.services.exports import ExportUnavailable
+
+    user, is_global, err = _require_manager_scope(request)
+    if err:
+        return err
+
+    regions = _get_manager_regions(user, is_global)
+    allowed = None if regions is None else list(regions.values_list("id", flat=True))
+    filters = analytics.Filters.from_request(request, allowed_region_ids=allowed)
+
+    export_format = request.GET.get("export")
+    if export_format:
+        try:
+            return analytics.export(filters, export_format)
+        except ExportUnavailable as exc:
+            return JsonResponse({"detail": str(exc)}, status=503)
+
+    data = analytics.report(filters)
+    totals = data["totals"]
+    return JsonResponse({
+        "totals": {
+            "count": totals["count"],
+            "amount": float(totals["amount"]),
+            "average": float(totals["average"]),
+            "clients": totals["clients"],
+            "quantity": totals["quantity"],
+        },
+        "bySku": [
+            {
+                "sku": row["sku"],
+                "name": row["name"],
+                "quantity": row["quantity"],
+                "amount": float(row["amount"]),
+                "documents": row["documents"],
+            }
+            for row in data["bySku"]
+        ],
+        "byClient": [
+            {
+                "name": row["client__company_name"],
+                "inn": row["client__inn"],
+                "region": row["client__region__name"] or "",
+                "documents": row["documents"],
+                "amount": float(row["amount"]),
+            }
+            for row in data["byClient"]
+        ],
+        "byRegion": [
+            {
+                "region": row["client__region__name"] or "",
+                "clients": row["clients"],
+                "documents": row["documents"],
+                "amount": float(row["amount"]),
+            }
+            for row in data["byRegion"]
+        ],
+        "byDistributor": [
+            {
+                "distributor": row["distributor__name"] or "",
+                "documents": row["documents"],
+                "amount": float(row["amount"]),
+            }
+            for row in data["byDistributor"]
+        ],
+        "byMonth": [
+            {
+                "month": row["month"].strftime("%Y-%m") if row["month"] else "",
+                "documents": row["documents"],
+                "amount": float(row["amount"]),
+            }
+            for row in data["byMonth"]
+        ],
+        "filters": filters.as_dict(),
+    })
 
 
 @require_GET

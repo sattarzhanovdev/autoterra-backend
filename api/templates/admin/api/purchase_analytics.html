@@ -1,0 +1,205 @@
+{% extends "admin/base_site.html" %}
+{% load humanize %}
+
+{% block extrastyle %}{{ block.super }}
+<style>
+  .pa-filters { background:#fff; border:1px solid #ddd; padding:16px; margin-bottom:20px; }
+  .pa-filters .row { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; }
+  .pa-filters label { display:block; font-size:11px; font-weight:700; text-transform:uppercase;
+                      letter-spacing:.5px; color:#666; margin-bottom:4px; }
+  .pa-filters input, .pa-filters select { padding:6px 8px; border:1px solid #ccc; min-width:150px; }
+  .pa-kpis { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:24px; }
+  .pa-kpi { flex:1; min-width:150px; background:#fff; border:1px solid #ddd;
+            border-left:4px solid #F01D2C; padding:14px 16px; }
+  .pa-kpi .value { font-size:22px; font-weight:800; color:#171717; }
+  .pa-kpi .label { font-size:10px; font-weight:700; letter-spacing:.6px;
+                   text-transform:uppercase; color:#777; margin-top:2px; }
+  .pa-grid { display:flex; flex-wrap:wrap; gap:20px; }
+  .pa-card { flex:1; min-width:320px; background:#fff; border:1px solid #ddd; padding:0 0 8px; }
+  .pa-card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.6px;
+                margin:0; padding:12px 16px; border-bottom:1px solid #eee; }
+  .pa-card table { width:100%; border-collapse:collapse; font-size:12px; }
+  .pa-card th { text-align:left; font-size:10px; text-transform:uppercase;
+                color:#777; padding:8px 16px; border-bottom:1px solid #eee; }
+  .pa-card td { padding:8px 16px; border-bottom:1px solid #f4f4f4; }
+  .pa-card td.num, .pa-card th.num { text-align:right; white-space:nowrap; }
+  .pa-empty { padding:20px 16px; color:#888; font-size:12px; }
+  .pa-actions { margin-left:auto; display:flex; gap:8px; }
+  .pa-actions a.button { white-space:nowrap; }
+  .pa-hint { font-size:12px; color:#666; margin:0 0 16px; line-height:1.5; }
+</style>
+{% endblock %}
+
+{% block content %}
+<h1>Аналитика закупок</h1>
+
+<p class="pa-hint">
+  Закупка — это документ клиента: дата, сумма, статус. Внутри него позиции с
+  артикулами. В отчёте по умолчанию учитываются только <strong>подтверждённые</strong>
+  документы: непроверенный документ ещё не факт продажи. Выгрузка отдаёт строки
+  по позициям, поэтому в файле виден каждый артикул.
+</p>
+
+<form method="get" class="pa-filters">
+  <div class="row">
+    <div>
+      <label for="date_from">Дата с</label>
+      <input type="date" id="date_from" name="date_from" value="{{ filters.date_from }}">
+    </div>
+    <div>
+      <label for="date_to">Дата по</label>
+      <input type="date" id="date_to" name="date_to" value="{{ filters.date_to }}">
+    </div>
+    <div>
+      <label for="distributor">Дистрибьютор</label>
+      <select id="distributor" name="distributor">
+        <option value="">Все</option>
+        {% for d in distributors %}
+          <option value="{{ d.id }}" {% if filters.distributor == d.id|stringformat:"s" %}selected{% endif %}>{{ d.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label for="region">Регион</label>
+      <select id="region" name="region">
+        <option value="">Все</option>
+        {% for r in regions %}
+          <option value="{{ r.id }}" {% if filters.region == r.id|stringformat:"s" %}selected{% endif %}>{{ r.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label for="sku">Артикул (SKU)</label>
+      <input type="text" id="sku" name="sku" value="{{ filters.sku }}" placeholder="напр. DV-1234">
+    </div>
+    <div>
+      <label for="status">Статус</label>
+      <select id="status" name="status">
+        <option value="">Подтверждённые</option>
+        {% for code, label in statuses %}
+          <option value="{{ code }}" {% if filters.status == code %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="pa-actions">
+      <button type="submit" class="button default">Показать</button>
+      <a class="button" href="?">Сбросить</a>
+    </div>
+  </div>
+</form>
+
+<div class="pa-kpis">
+  <div class="pa-kpi">
+    <div class="value">{{ totals.amount|floatformat:0|intcomma }} ₽</div>
+    <div class="label">Сумма закупок</div>
+  </div>
+  <div class="pa-kpi">
+    <div class="value">{{ totals.count|intcomma }}</div>
+    <div class="label">Документов</div>
+  </div>
+  <div class="pa-kpi">
+    <div class="value">{{ totals.average|floatformat:0|intcomma }} ₽</div>
+    <div class="label">Средний чек</div>
+  </div>
+  <div class="pa-kpi">
+    <div class="value">{{ totals.clients|intcomma }}</div>
+    <div class="label">Клиентов закупалось</div>
+  </div>
+  <div class="pa-kpi">
+    <div class="value">{{ totals.quantity|intcomma }}</div>
+    <div class="label">Единиц товара</div>
+  </div>
+</div>
+
+<p>
+  <a class="button default" href="?export=xlsx{% for k, v in filters.items %}{% if v %}&amp;{{ k }}={{ v }}{% endif %}{% endfor %}">Скачать Excel</a>
+  <a class="button" href="?export=csv{% for k, v in filters.items %}{% if v %}&amp;{{ k }}={{ v }}{% endif %}{% endfor %}">Скачать CSV</a>
+</p>
+
+<div class="pa-grid">
+  <div class="pa-card">
+    <h2>Что закупают — топ артикулов</h2>
+    {% if bySku %}
+      <table>
+        <tr><th>Артикул</th><th>Товар</th><th class="num">Кол-во</th><th class="num">Сумма</th></tr>
+        {% for row in bySku %}
+          <tr>
+            <td>{{ row.sku }}</td>
+            <td>{{ row.name }}</td>
+            <td class="num">{{ row.quantity|intcomma }}</td>
+            <td class="num">{{ row.amount|floatformat:0|intcomma }} ₽</td>
+          </tr>
+        {% endfor %}
+      </table>
+    {% else %}<div class="pa-empty">Нет данных под эти фильтры.</div>{% endif %}
+  </div>
+
+  <div class="pa-card">
+    <h2>Кто закупает — топ клиентов</h2>
+    {% if byClient %}
+      <table>
+        <tr><th>Клиент</th><th>Регион</th><th class="num">Док.</th><th class="num">Сумма</th></tr>
+        {% for row in byClient %}
+          <tr>
+            <td>{{ row.client__company_name }}<br><span style="color:#999">{{ row.client__inn }}</span></td>
+            <td>{{ row.client__region__name|default:"—" }}</td>
+            <td class="num">{{ row.documents }}</td>
+            <td class="num">{{ row.amount|floatformat:0|intcomma }} ₽</td>
+          </tr>
+        {% endfor %}
+      </table>
+    {% else %}<div class="pa-empty">Нет данных под эти фильтры.</div>{% endif %}
+  </div>
+</div>
+
+<div class="pa-grid" style="margin-top:20px">
+  <div class="pa-card">
+    <h2>По регионам</h2>
+    {% if byRegion %}
+      <table>
+        <tr><th>Регион</th><th class="num">Клиентов</th><th class="num">Док.</th><th class="num">Сумма</th></tr>
+        {% for row in byRegion %}
+          <tr>
+            <td>{{ row.client__region__name|default:"—" }}</td>
+            <td class="num">{{ row.clients }}</td>
+            <td class="num">{{ row.documents }}</td>
+            <td class="num">{{ row.amount|floatformat:0|intcomma }} ₽</td>
+          </tr>
+        {% endfor %}
+      </table>
+    {% else %}<div class="pa-empty">Нет данных под эти фильтры.</div>{% endif %}
+  </div>
+
+  <div class="pa-card">
+    <h2>По дистрибьюторам</h2>
+    {% if byDistributor %}
+      <table>
+        <tr><th>Дистрибьютор</th><th class="num">Док.</th><th class="num">Сумма</th></tr>
+        {% for row in byDistributor %}
+          <tr>
+            <td>{{ row.distributor__name|default:"—" }}</td>
+            <td class="num">{{ row.documents }}</td>
+            <td class="num">{{ row.amount|floatformat:0|intcomma }} ₽</td>
+          </tr>
+        {% endfor %}
+      </table>
+    {% else %}<div class="pa-empty">Нет данных под эти фильтры.</div>{% endif %}
+  </div>
+</div>
+
+<div class="pa-card" style="margin-top:20px">
+  <h2>Динамика по месяцам</h2>
+  {% if byMonth %}
+    <table>
+      <tr><th>Месяц</th><th class="num">Документов</th><th class="num">Сумма</th></tr>
+      {% for row in byMonth %}
+        <tr>
+          <td>{{ row.month|date:"F Y" }}</td>
+          <td class="num">{{ row.documents }}</td>
+          <td class="num">{{ row.amount|floatformat:0|intcomma }} ₽</td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% else %}<div class="pa-empty">Нет данных под эти фильтры.</div>{% endif %}
+</div>
+{% endblock %}

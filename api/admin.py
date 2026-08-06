@@ -499,11 +499,52 @@ class PaymentAdmin(admin.ModelAdmin):
 
 @admin.register(Purchase)
 class PurchaseAdmin(admin.ModelAdmin):
-    list_display = ("id", "document_number", "client", "distributor", "date", "total_amount", "status", "document_file")
-    list_filter = ("status", "distributor", "date")
-    search_fields = ("document_number", "client__company_name", "client__inn")
+    list_display = ("id", "document_number", "client", "client_region", "distributor", "date", "total_amount", "status", "document_file")
+    # Регион и категория клиента — основные разрезы аналитики, без них
+    # приходилось выгружать всё и фильтровать в Excel руками.
+    list_filter = ("status", "distributor", "client__region", "client__category", "date")
+    search_fields = (
+        "document_number",
+        "client__company_name",
+        "client__inn",
+        # Поиск по артикулу: «кто и когда брал этот товар».
+        "items__sku",
+        "items__name",
+    )
+    date_hierarchy = "date"
     readonly_fields = ("created_at",)
     inlines = (PurchaseItemInline,)
+    actions = ("export_xlsx", "export_csv")
+
+    def get_queryset(self, request):
+        # Список читает регион и дистрибьютора у каждой строки — иначе N+1.
+        return super().get_queryset(request).select_related(
+            "client", "client__region", "distributor"
+        )
+
+    @admin.display(description="Регион", ordering="client__region__name")
+    def client_region(self, obj):
+        return obj.client.region.name if obj.client and obj.client.region_id else "—"
+
+    def _export(self, request, queryset, fmt):
+        """Выгрузка отмеченных покупок позициями — с артикулами."""
+        from .services import purchase_analytics as analytics
+        from .services.exports import ExportUnavailable
+
+        # Документы уже отобраны галочками — фильтры отчёта здесь не нужны.
+        filters = analytics.Filters()
+        try:
+            return analytics.export_queryset(queryset, filters, fmt)
+        except ExportUnavailable as exc:
+            self.message_user(request, str(exc), messages.ERROR)
+
+    @admin.action(description="Скачать в Excel (позициями)")
+    def export_xlsx(self, request, queryset):
+        return self._export(request, queryset, "xlsx")
+
+    @admin.action(description="Скачать в CSV (позициями)")
+    def export_csv(self, request, queryset):
+        return self._export(request, queryset, "csv")
 
 
 @admin.register(ColorRequest)
@@ -687,8 +728,43 @@ class AuthTokenAdmin(admin.ModelAdmin):
         urls = super().get_urls()
         custom_urls = [
             path("dashboard/", self.admin_site.admin_view(self.dashboard_view), name="api_dashboard"),
+            path(
+                "purchases-analytics/",
+                self.admin_site.admin_view(self.purchase_analytics_view),
+                name="api_purchase_analytics",
+            ),
         ]
         return custom_urls + urls
+
+    def purchase_analytics_view(self, request):
+        """Аналитика по закупкам: срезы и выгрузка с одними фильтрами.
+
+        Считает тот же сервис, что и приложение менеджера, — иначе цифры в
+        админке и в приложении со временем разойдутся.
+        """
+        from .services import purchase_analytics as analytics
+        from .services.exports import ExportUnavailable
+
+        filters = analytics.Filters.from_request(request)
+
+        export_format = request.GET.get("export")
+        if export_format:
+            try:
+                return analytics.export(filters, export_format)
+            except ExportUnavailable as exc:
+                self.message_user(request, str(exc), messages.ERROR)
+
+        data = analytics.report(filters)
+        context = {
+            **self.admin_site.each_context(request),
+            "title": "Аналитика закупок",
+            "filters": filters.as_dict(),
+            "regions": Region.objects.filter(is_active=True).order_by("name"),
+            "distributors": Distributor.objects.filter(is_active=True).order_by("name"),
+            "statuses": Purchase.STATUS_CHOICES,
+            **data,
+        }
+        return render(request, "admin/api/purchase_analytics.html", context)
 
     def dashboard_view(self, request):
         from django.db.models import Count
@@ -711,16 +787,20 @@ class AuthTokenAdmin(admin.ModelAdmin):
         referrals_qs = Referral.objects.all()
 
         if region_id:
+            # Регион — внешний ключ: фильтруем по id. Раньше здесь стояло имя
+            # региона, отчего запрос падал с ValueError, исключение
+            # проглатывалось, и фильтр молча не применялся.
             try:
-                reg_name = Region.objects.get(id=region_id).name
-                clients_qs = clients_qs.filter(region=reg_name)
-                purchases_qs = purchases_qs.filter(client__region=reg_name)
-                orders_qs = orders_qs.filter(client__region=reg_name)
-                tickets_qs = tickets_qs.filter(client__region=reg_name)
-                color_qs = color_qs.filter(client__region=reg_name)
-                referrals_qs = referrals_qs.filter(inviter__region=reg_name)
-            except (Region.DoesNotExist, ValueError):
-                pass
+                region_pk = int(region_id)
+            except (TypeError, ValueError):
+                region_pk = None
+            if region_pk is not None:
+                clients_qs = clients_qs.filter(region_id=region_pk)
+                purchases_qs = purchases_qs.filter(client__region_id=region_pk)
+                orders_qs = orders_qs.filter(client__region_id=region_pk)
+                tickets_qs = tickets_qs.filter(client__region_id=region_pk)
+                color_qs = color_qs.filter(client__region_id=region_pk)
+                referrals_qs = referrals_qs.filter(inviter__region_id=region_pk)
 
         if distributor_id:
             clients_qs = clients_qs.filter(distributor_id=distributor_id)
@@ -770,8 +850,11 @@ class AuthTokenAdmin(admin.ModelAdmin):
         context["pur_data"] = [i["count"] for i in pur_trend]
 
         # Regional Activity
-        reg_activity = clients_qs.values("region").annotate(count=Count("id")).order_by("-count")[:10]
-        context["reg_activity_labels"] = [i["region"] for i in reg_activity]
+        # values("region") дал бы id региона — на подписях осей нужно название.
+        reg_activity = (
+            clients_qs.values("region__name").annotate(count=Count("id")).order_by("-count")[:10]
+        )
+        context["reg_activity_labels"] = [i["region__name"] or "—" for i in reg_activity]
         context["reg_activity_data"] = [i["count"] for i in reg_activity]
 
         return render(request, "admin/api/dashboard.html", context)
