@@ -29,6 +29,12 @@ class Command(BaseCommand):
             action="store_true",
             help="Записать начисления. Без этого флага команда только показывает найденное.",
         )
+        parser.add_argument(
+            "--drop-legacy-gifts",
+            action="store_true",
+            help="Убрать плоские подарки старой схемы («Сертификат на 5000 ₽»). "
+                 "Они остались в карточках от порогового бонуса, которого больше нет.",
+        )
 
     def handle(self, *args, **options):
         referrals = Referral.objects.select_related("inviter").order_by("id")
@@ -85,3 +91,30 @@ class Command(BaseCommand):
         self.stdout.write(
             self.style.SUCCESS(f"Доначислено: {credited} ₽ по {len(planned)} связкам")
         )
+
+        if options["drop_legacy_gifts"]:
+            self._drop_legacy_gifts()
+
+    def _drop_legacy_gifts(self):
+        """Стирает подарки, выставленные автоматически по старому порогу.
+
+        Начисление денег они не делали — деньги теперь идут процентом, — но в
+        карточке приглашения так и висит «Сертификат на 5000 ₽» рядом с
+        реальной ставкой. Подарки, по которым бонус уже начислен, не трогаем:
+        за ними стоят настоящие операции по счёту.
+        """
+        from api.models import BonusTransaction
+
+        paid_out = set(
+            BonusTransaction.objects.filter(kind="referral", referral__isnull=False)
+            .exclude(comment__contains="%")
+            .values_list("referral_id", flat=True)
+        )
+        stale = Referral.objects.exclude(gift="").exclude(id__in=paid_out)
+        count = stale.count()
+        if not count:
+            self.stdout.write("Плоских подарков не осталось.")
+            return
+
+        stale.update(gift="", gift_amount=0, gift_status="none", gift_comment="")
+        self.stdout.write(self.style.SUCCESS(f"Убрано плоских подарков: {count}"))
