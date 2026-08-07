@@ -1245,25 +1245,17 @@ class Referral(models.Model):
             self.purchase_amount = amount
             updates.append("purchase_amount")
             
-        # Подарок — только за реальную покупку выше порога (п. 7 ТЗ).
-        # Порог и сам подарок настраиваются, а не зашиты в код.
-        from django.conf import settings
-
-        threshold = getattr(settings, "REFERRAL_BONUS_THRESHOLD", 30000)
-        gift = getattr(settings, "REFERRAL_BONUS_GIFT", "Сертификат на 5000 ₽")
-        gift_amount = getattr(settings, "REFERRAL_BONUS_AMOUNT", 5000)
-        # Суммы показываем всегда — пригласивший видит прогресс, — а вот подарок
-        # заводим только по подтверждённой связке.
-        if amount >= float(threshold) and not self.condition_met and self.counts_toward_bonus:
+        # Бонус считается процентом от оборота приглашённого и капает на
+        # бонусный счёт автоматически — начислением занимается
+        # api.services.referral_bonus. Здесь только отмечаем, что условие
+        # выполнено: с первого же рубля ставка уже не нулевая.
+        #
+        # Плоский подарок «набрал 30 000 — получи сертификат на 5 000» убран:
+        # это было 16,7% от оборота, выше маржи. Поля gift* остались ради
+        # истории уже выданных подарков.
+        if amount > 0 and not self.condition_met and self.counts_toward_bonus:
             self.condition_met = True
-            self.gift = gift
-            self.gift_amount = gift_amount
-            # Не «выдан», а «ждёт согласования»: решение за дистрибьютором.
-            self.gift_status = "pending"
             updates.append("condition_met")
-            updates.append("gift")
-            updates.append("gift_amount")
-            updates.append("gift_status")
             # Notification + FCM push are sent via api.signals._referral_post_save
 
         if updates:
@@ -1459,6 +1451,7 @@ class BonusTransaction(models.Model):
         ("referral", "Начислен по реферальной программе"),
         ("order", "Списан в счёт заказа"),
         ("refund", "Возвращён после отмены оплаты"),
+        ("expired", "Сгорел из-за неактивности"),
         ("manual", "Ручная корректировка"),
     ]
 
@@ -1493,15 +1486,11 @@ class BonusTransaction(models.Model):
         verbose_name = "Операция по бонусам"
         verbose_name_plural = "Операции по бонусам"
         ordering = ("-created_at",)
-        constraints = [
-            # Один реферал приносит бонус ровно один раз — даже если запись
-            # пересохранят или согласование повторят.
-            models.UniqueConstraint(
-                fields=("referral",),
-                condition=models.Q(kind="referral"),
-                name="unique_referral_bonus_credit",
-            ),
-        ]
+        # Ограничения «один реферал — одно начисление» больше нет: бонус
+        # капает процентом по мере закупок приглашённого, и операций по одной
+        # связке столько же, сколько у него оплат. От задвоения защищает не
+        # база, а расчёт разницы в api.services.referral_bonus.accrue: он
+        # начисляет только то, чего не хватает до текущей ступени.
 
     def __str__(self):
         return f"{self.client_id}: {self.amount} ({self.get_kind_display()})"

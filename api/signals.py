@@ -207,3 +207,53 @@ def _referral_post_save(sender, instance, created, **kwargs) -> None:
                 "Signal handler failed: Referral pk=%s gift_status=%s",
                 instance.pk, instance.gift_status,
             )
+
+
+# ── Реферальный бонус процентом от закупок ────────────────────────────────────
+#
+# Бонус капает по факту оплаты, поэтому ловим сам переход закупки в
+# «подтверждена», а заказа — в «выполнен». Сигналом, а не в обработчике
+# запроса: статус меняют и из админки, и через интеграцию с 1С, и бонус должен
+# начисляться одинаково во всех случаях.
+
+def _stash_status(instance, sender, attr):
+    if instance.pk is None:
+        setattr(instance, attr, None)
+        return
+    previous = sender.objects.filter(pk=instance.pk).values("status").first() or {}
+    setattr(instance, attr, previous.get("status"))
+
+
+def _accrue_for(client, context):
+    """Доначислить бонус тому, кто привёл этого клиента."""
+    try:
+        from api.services.referral_bonus import accrue_for_invitee
+        accrue_for_invitee(client)
+    except Exception:
+        logger.exception("Не удалось начислить реферальный бонус (%s)", context)
+
+
+@receiver(pre_save, sender="api.Purchase")
+def _purchase_pre_save(sender, instance, **kwargs) -> None:
+    _stash_status(instance, sender, "_pre_status")
+
+
+@receiver(post_save, sender="api.Purchase")
+def _purchase_post_save(sender, instance, created, **kwargs) -> None:
+    if getattr(instance, "_pre_status", None) == "verified":
+        return  # уже была подтверждена — оборот не вырос
+    if instance.status == "verified" and instance.client_id:
+        _accrue_for(instance.client, f"Purchase pk={instance.pk}")
+
+
+@receiver(pre_save, sender="api.Order")
+def _order_pre_save(sender, instance, **kwargs) -> None:
+    _stash_status(instance, sender, "_pre_order_status")
+
+
+@receiver(post_save, sender="api.Order")
+def _order_post_save(sender, instance, created, **kwargs) -> None:
+    if getattr(instance, "_pre_order_status", None) == "fulfilled":
+        return
+    if instance.status == "fulfilled" and instance.client_id:
+        _accrue_for(instance.client, f"Order pk={instance.pk}")

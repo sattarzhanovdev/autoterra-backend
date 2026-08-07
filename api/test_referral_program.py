@@ -165,7 +165,12 @@ class ReferralRegistrationTests(TestCase):
     REFERRAL_BONUS_GIFT="Сертификат на 5000 ₽",
 )
 class ReferralGiftTests(TestCase):
-    """Подарок начисляется только за подтверждённую покупку выше порога."""
+    """Оборот приглашённого учитывается только по подтверждённым закупкам.
+
+    Плоский подарок «набрал 30 000 — сертификат на 5 000» убран: это было
+    16,7% от оборота, выше маржи. Начисление процентом проверяется в
+    test_referral_bonus_percent.py, здесь — только учёт оборота.
+    """
 
     def setUp(self):
         self.http = Client()
@@ -214,19 +219,19 @@ class ReferralGiftTests(TestCase):
         )
         return order
 
-    def test_purchase_below_threshold_no_gift(self):
+    def test_any_verified_purchase_counts(self):
+        """Порога больше нет: ставка ненулевая с первого рубля."""
         self._purchase(20_000)
         self.referral.sync_from_invitee()
 
         self.assertTrue(self.referral.has_purchase)
-        self.assertFalse(self.referral.condition_met)
+        self.assertTrue(self.referral.condition_met)
 
-    def test_purchase_above_threshold_grants_gift(self):
+    def test_turnover_is_tracked(self):
         self._purchase(35_000)
         self.referral.sync_from_invitee()
 
         self.assertTrue(self.referral.condition_met)
-        self.assertEqual(self.referral.gift, "Сертификат на 5000 ₽")
         self.assertEqual(float(self.referral.purchase_amount), 35_000)
 
     def test_unverified_purchase_does_not_count(self):
@@ -243,12 +248,12 @@ class ReferralGiftTests(TestCase):
         self.assertTrue(self.referral.condition_met)
 
     @override_settings(REFERRAL_BONUS_THRESHOLD=10_000, REFERRAL_BONUS_GIFT="Отсрочка 14 дней")
-    def test_threshold_and_gift_are_configurable(self):
+    def test_turnover_counts_purchases_and_orders_together(self):
         self._purchase(12_000)
+        self._fulfilled_order(8_000)
         self.referral.sync_from_invitee()
 
-        self.assertTrue(self.referral.condition_met)
-        self.assertEqual(self.referral.gift, "Отсрочка 14 дней")
+        self.assertEqual(float(self.referral.purchase_amount), 20_000)
 
     # ── Что видит пригласивший в приложении ──────────────────────────────────
 
@@ -264,8 +269,10 @@ class ReferralGiftTests(TestCase):
 
         self.assertEqual(data["referralCode"], self.inviter.referral_code)
         self.assertIn(f"ref={self.inviter.referral_code}", data["inviteLink"])
-        self.assertEqual(data["bonusThreshold"], 30000.0)
-        self.assertEqual(data["bonusGift"], "Сертификат на 5000 ₽")
+        # Ступени приходят с сервера — приложение их не зашивает.
+        self.assertEqual(data["bonusTiers"][0], {"from": 0.0, "rate": 0.5})
+        self.assertEqual(data["bonusTiers"][-1], {"from": 800000.0, "rate": 2.5})
+        self.assertEqual(data["activityMin"], 10000.0)
 
     def test_endpoint_shows_purchase_made_after_invite(self):
         """Покупка случилась позже создания записи — цифры должны подтянуться."""
@@ -278,11 +285,9 @@ class ReferralGiftTests(TestCase):
         self.assertTrue(item["conditionMet"])
         self.assertEqual(item["purchaseAmount"], 35_000.0)
         self.assertEqual(data["stats"]["buyersCount"], 1)
-        # Условие выполнено, но подарок ещё ждёт дистрибьютора (п. 7 шаг 6),
-        # поэтому в выданных он не числится. Согласование — в test_tz_gaps.
-        self.assertEqual(item["giftStatus"], "pending")
-        self.assertEqual(data["stats"]["giftCount"], 0)
-        self.assertEqual(data["stats"]["pendingGiftCount"], 1)
+        # 35 000 — первая ступень, 0,5% = 175 ₽.
+        self.assertEqual(item["bonusRate"], 0.5)
+        self.assertEqual(item["bonusEarned"], 175.0)
 
     def test_client_profile_exposes_referral_code(self):
         response = self.http.get(

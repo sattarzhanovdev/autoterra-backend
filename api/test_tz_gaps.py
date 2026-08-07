@@ -70,12 +70,23 @@ class ReferralGiftApprovalTests(_Base):
         self.dist_token = self._token(dist_user, "dist-token")
 
     def _reach_threshold(self):
+        """Заводит подарок, ждущий согласования.
+
+        Автоматически по порогу он больше не появляется — регулярное
+        вознаграждение теперь процент от оборота, который капает на счёт сам
+        (см. test_referral_bonus_percent). Согласование осталось для разовых
+        подарков: их назначает дистрибьютор или менеджер вручную.
+        """
         Purchase.objects.create(
             client=self.invitee, distributor=self.distributor,
             document_number="D1", date="2026-01-01",
             total_amount=Decimal(35_000), status="verified",
         )
         self.referral.sync_from_invitee()
+        self.referral.gift = "Отсрочка 14 дней"
+        self.referral.gift_amount = Decimal(5000)
+        self.referral.gift_status = "pending"
+        self.referral.save(update_fields=["gift", "gift_amount", "gift_status"])
         self.referral.refresh_from_db()
 
     def _decide(self, approved, comment="", token=None):

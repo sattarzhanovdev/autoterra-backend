@@ -62,8 +62,12 @@ class ReferralAntiFraudTests(TestCase):
         # is_registered=True, но has_purchase=False т.к. фильтр по 'verified'
         self.assertFalse(self.referral.condition_met)
 
-    def test_bonus_awarded_only_after_verified_threshold(self):
-        """Проверка: бонус начисляется только после преодоления порога в 30к verified суммой"""
+    def test_turnover_accumulates_across_verified_purchases(self):
+        """Оборот приглашённого суммируется по всем подтверждённым закупкам.
+
+        Порога больше нет: бонус — процент от оборота, и ставка ненулевая с
+        первого рубля. Сам расчёт процента — в test_referral_bonus_percent.
+        """
         invitee_user = User.objects.create_user(username="invitee3")
         invitee = ClientProfile.objects.create(
             user=invitee_user, inn=self.invitee_inn, company_name="Prospect",
@@ -77,7 +81,8 @@ class ReferralAntiFraudTests(TestCase):
             total_amount=10000, status="verified", date="2026-06-06"
         )
         self.referral.sync_from_invitee()
-        self.assertFalse(self.referral.condition_met, "Должно быть False для 10к")
+        self.assertEqual(float(self.referral.purchase_amount), 10000)
+        self.assertTrue(self.referral.condition_met)
 
         # 2. Добавляем еще 25 000 (verified)
         Purchase.objects.create(
@@ -85,8 +90,6 @@ class ReferralAntiFraudTests(TestCase):
             total_amount=25000, status="verified", date="2026-06-07"
         )
         self.referral.sync_from_invitee()
-        
-        # ИТОГО: 35 000 > 30 000
+
         self.referral.refresh_from_db()
-        self.assertTrue(self.referral.condition_met)
-        self.assertEqual(self.referral.gift, "Сертификат на 5000 ₽")
+        self.assertEqual(float(self.referral.purchase_amount), 35000)

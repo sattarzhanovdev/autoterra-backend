@@ -60,6 +60,7 @@ from .models import (
 from .pagination import paginate, paginated_response
 from .serializers import RegistrationSerializer, PurchaseSerializer, coerce_decimal
 from .services.bonuses import balance as bonus_balance
+from .services import referral_bonus
 from .services.exports import EXPORTERS as EXPORT_FORMATS, ExportUnavailable, export_clients
 from .services.pricing import price_details, price_for_client
 from .services.tiers import sync_client_tier
@@ -1235,6 +1236,10 @@ def _format_referral(item):
         # auto · pending · confirmed · declined. Пригласивший должен видеть,
         # что его заявка ещё не подтверждена приглашённым и подарка не будет.
         "confirmation": item.confirmation,
+        # Ставка по достигнутой ступени и сколько уже начислено за этого
+        # приглашённого — иначе цифра на бонусном счёте берётся ниоткуда.
+        "bonusRate": float(referral_bonus.rate_for(item.purchase_amount)),
+        "bonusEarned": float(referral_bonus.accrued_for(item)),
         "createdAt": item.created_at.isoformat(),
     }
 
@@ -4215,8 +4220,15 @@ def referrals(request):
             # Личный код и готовая ссылка — их клиент и отправляет коллегам.
             "referralCode": client.referral_code,
             "inviteLink": f"{base_url}?ref={client.referral_code}",
-            "bonusThreshold": float(getattr(settings, "REFERRAL_BONUS_THRESHOLD", 30000)),
-            "bonusGift": getattr(settings, "REFERRAL_BONUS_GIFT", ""),
+            # Бонус — процент от закупок приглашённого по ступеням, а не
+            # плоский подарок за достижение порога. Ставки отдаём приложению,
+            # чтобы экран не пересказывал зашитые в него цифры.
+            "bonusTiers": [
+                {"from": float(threshold), "rate": float(rate)}
+                for threshold, rate in referral_bonus.tiers()
+            ],
+            "activityMin": float(referral_bonus.activity_min()),
+            "bonusBalance": float(bonus_balance(client)),
         },
     ))
 
