@@ -9,6 +9,7 @@
 
 from datetime import date
 from decimal import Decimal
+from io import StringIO
 
 from django.contrib.auth.models import User
 from django.test import TestCase, override_settings
@@ -227,3 +228,49 @@ class ExpiryTests(_Base):
         entry = BonusTransaction.objects.get(client=self.inviter, kind="expired")
         self.assertEqual(entry.amount, Decimal("-4500.00"))
         self.assertIn("08.2026", entry.comment)
+
+
+class BackfillCommandTests(_Base):
+    """Закупки, подтверждённые до выката, сигналом уже не поймать."""
+
+    def test_recalc_credits_existing_turnover(self):
+        from django.core.management import call_command
+
+        # Связка появляется после закупки — сигнал по ней не сработал.
+        self._purchase(self.invitee, 300_000)
+        self._referral()
+        self.assertEqual(balance(self.inviter), Decimal("0.00"))
+
+        call_command("recalc_referral_bonuses", "--apply", stdout=StringIO())
+
+        self.assertEqual(balance(self.inviter), Decimal("4500.00"))
+
+    def test_recalc_is_idempotent(self):
+        from django.core.management import call_command
+
+        self._purchase(self.invitee, 300_000)
+        self._referral()
+        call_command("recalc_referral_bonuses", "--apply", stdout=StringIO())
+        call_command("recalc_referral_bonuses", "--apply", stdout=StringIO())
+
+        self.assertEqual(balance(self.inviter), Decimal("4500.00"))
+
+    def test_dry_run_credits_nothing(self):
+        from django.core.management import call_command
+
+        self._purchase(self.invitee, 300_000)
+        self._referral()
+
+        call_command("recalc_referral_bonuses", stdout=StringIO())
+
+        self.assertEqual(balance(self.inviter), Decimal("0.00"))
+
+    def test_unconfirmed_claim_is_skipped(self):
+        from django.core.management import call_command
+
+        self._purchase(self.invitee, 300_000)
+        self._referral(confirmation="pending")
+
+        call_command("recalc_referral_bonuses", "--apply", stdout=StringIO())
+
+        self.assertEqual(balance(self.inviter), Decimal("0.00"))
