@@ -1716,6 +1716,9 @@ def order_config(request):
         "stores": [_format_store(s) for s in stores_qs],
         "categories": categories,
         "brands": brands,
+        # Баланс нужен уже в корзине: клиент должен видеть, сколько бонусов
+        # закроет собираемый заказ, а не узнавать об этом на шаге оплаты.
+        "bonusBalance": float(bonus_balance(client)),
     })
 
 
