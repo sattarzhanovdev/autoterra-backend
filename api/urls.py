@@ -91,8 +91,6 @@ urlpatterns = [
     # Приглашённый подтверждает, что его действительно привели.
     path("referrals/<int:referral_id>/confirm/", views.confirm_referral),
     # Согласование подарка дистрибьютором (п. 7 ТЗ).
-    path("referrals/pending-gifts/", views.distributor_referral_gifts),
-    path("referrals/<int:referral_id>/decide-gift/", views.decide_referral_gift),
     # Обучающие материалы (п. 10 ТЗ).
     path("learning-materials/", views.learning_materials),
     # Бонусный счёт: баланс и история операций.

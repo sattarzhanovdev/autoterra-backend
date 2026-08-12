@@ -70,58 +70,6 @@ class _Base(TestCase):
         BonusTransaction.objects.create(
             client=self.client_profile, amount=Decimal(amount), kind="manual"
         )
-
-
-class BonusCreditTests(_Base):
-    """Начисление после согласования подарка."""
-
-    def setUp(self):
-        super().setUp()
-        self.invitee = self._client("+79002223344", "7778889990", "Приглашённый")
-        self.referral = Referral.objects.create(
-            inviter=self.client_profile, invitee_inn=self.invitee.inn,
-            invitee_name="Приглашённый", region=self.region.name,
-            condition_met=True, gift="Сертификат на 5000 ₽",
-            gift_amount=Decimal("5000"), gift_status="pending",
-        )
-
-    def test_approval_puts_money_on_the_account(self):
-        self.referral.gift_status = "approved"
-        self.referral.save(update_fields=["gift_status"])
-
-        self.assertEqual(bonuses.balance(self.client_profile), Decimal("5000.00"))
-
-    def test_pending_gift_gives_nothing(self):
-        self.assertEqual(bonuses.balance(self.client_profile), Decimal("0.00"))
-
-    def test_declined_gift_gives_nothing(self):
-        self.referral.gift_status = "declined"
-        self.referral.save(update_fields=["gift_status"])
-
-        self.assertEqual(bonuses.balance(self.client_profile), Decimal("0.00"))
-
-    def test_one_referral_pays_out_only_once(self):
-        """Согласование могут повторить — денег от этого больше не станет."""
-        self.referral.gift_status = "approved"
-        self.referral.save(update_fields=["gift_status"])
-        bonuses.credit_referral_bonus(self.referral)
-        bonuses.credit_referral_bonus(self.referral)
-
-        self.assertEqual(
-            BonusTransaction.objects.filter(kind="referral").count(), 1
-        )
-        self.assertEqual(bonuses.balance(self.client_profile), Decimal("5000.00"))
-
-    def test_non_monetary_gift_does_not_touch_the_account(self):
-        # Отсрочка или статус — это не рубли, их отрабатывает дистрибьютор.
-        self.referral.gift = "Отсрочка 14 дней"
-        self.referral.gift_amount = Decimal("0")
-        self.referral.gift_status = "approved"
-        self.referral.save(update_fields=["gift", "gift_amount", "gift_status"])
-
-        self.assertEqual(bonuses.balance(self.client_profile), Decimal("0.00"))
-
-
 class BonusSpendTests(_Base):
     """Списание в счёт заказа."""
 

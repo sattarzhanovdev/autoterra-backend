@@ -624,7 +624,7 @@ def _require_client(request):
     if user is None:
         return None, JsonResponse({"detail": "Unauthorized"}, status=401)
     
-    role = getattr(user, "profile", None).role if hasattr(user, "profile") else "client"
+    role = _resolve_role(user)
     if role != "client":
         return None, JsonResponse({"detail": "Нет доступа клиента"}, status=403)
         
@@ -1228,9 +1228,9 @@ def _format_referral(item):
         "hasPurchase": item.has_purchase,
         "purchaseAmount": float(item.purchase_amount),
         "conditionMet": item.condition_met,
-        # Подарок показываем только после согласования: до него клиенту нельзя
-        # обещать скидку или отсрочку, это деньги дистрибьютора.
-        "gift": item.gift if item.gift_is_issued else None,
+        # Поля подарка остались ради истории уже выданных плоских подарков —
+        # новых через приложение не согласовывают.
+        "gift": item.gift or None,
         "giftStatus": item.gift_status,
         "giftComment": item.gift_comment or None,
         # auto · pending · confirmed · declined. Пригласивший должен видеть,
@@ -1497,10 +1497,10 @@ def me(request):
     user = _current_user(request)
     if user is None:
         return JsonResponse({"detail": "Unauthorized"}, status=401)
-        
+
     profile = getattr(user, "profile", None)
-    role = profile.role if profile else "client"
-    
+    role = _resolve_role(user)
+
     if role == "client":
         try:
             client = user.client_profile
@@ -1588,7 +1588,7 @@ def dashboard(request):
             "invitedCount": referrals.count(),
             "buyersCount": referrals.filter(has_purchase=True).count(),
             # Как и на экране рефералов: выданным считается только согласованный.
-            "giftCount": referrals.filter(condition_met=True, gift_status="approved").count(),
+            "giftCount": referrals.filter(condition_met=True).count(),
         },
         # Бонусы уменьшают сумму к оплате в ЮKassa, поэтому баланс нужен и на
         # главной, и в профиле.
@@ -2859,6 +2859,23 @@ def distributors(request):
         qs.distinct(),
         lambda d: {"id": str(d.id), "name": d.name},
     ))
+
+
+def _resolve_role(user):
+    """Роль пользователя для приложения.
+
+    У суперпользователя, заведённого через `createsuperuser`, нет Profile —
+    а Центральный админ это как раз он. Без этой ветки он определялся как
+    клиент, упирался в «Профиль клиента не создан» и в приложение не попадал
+    вообще. Признак тот же, что и в _is_user_global.
+    """
+    profile = getattr(user, "profile", None)
+    role = getattr(profile, "role", None)
+    if role:
+        return role
+    if user.is_superuser or user.is_staff:
+        return "admin"
+    return "client"
 
 
 def _is_user_global(user, profile=None):
@@ -4207,10 +4224,10 @@ def referrals(request):
         "invitedCount": qs.count(),
         "registeredCount": qs.filter(is_registered=True).count(),
         "buyersCount": qs.filter(has_purchase=True).count(),
-        # Выданным считается только согласованный подарок: до решения
-        # дистрибьютора обещать клиенту нечего (п. 7 ТЗ).
-        "giftCount": qs.filter(condition_met=True, gift_status="approved").count(),
-        "pendingGiftCount": qs.filter(gift_status="pending").count(),
+        # Согласование подарка убрано: бонус капает автоматически, как только
+        # у приглашённого прошла подтверждённая покупка. Считаем связки,
+        # по которым начисление уже идёт.
+        "giftCount": qs.filter(condition_met=True).count(),
         "purchaseAmount": float(sum(r.purchase_amount for r in qs)),
     }
     base_url = getattr(settings, "REFERRAL_INVITE_BASE_URL", "https://autoterra.shop/register")
@@ -4333,58 +4350,6 @@ def confirm_referral(request, referral_id):
     if confirmed:
         # Покупки могли быть и до подтверждения — пересчитываем сразу.
         referral.sync_from_invitee()
-    return JsonResponse({"referral": _format_referral(referral)})
-
-
-@require_GET
-def distributor_referral_gifts(request):
-    """Подарки, ждущие согласования, — по клиентам своего региона (п. 7 ТЗ)."""
-    distributor, is_admin, err = _require_distributor_scope(request)
-    if err:
-        return err
-
-    qs = Referral.objects.filter(gift_status="pending").select_related("inviter")
-    if not is_admin:
-        qs = qs.filter(inviter__distributor=distributor)
-
-    def _format(item):
-        data = _format_referral(item)
-        data["inviterName"] = item.inviter.company_name
-        data["inviterInn"] = item.inviter.inn
-        # Согласующему нужен сам подарок, даже пока он не выдан.
-        data["proposedGift"] = item.gift or None
-        return data
-
-    return JsonResponse(paginated_response(request, qs.order_by("-created_at"), _format))
-
-
-@csrf_exempt
-@require_POST
-def decide_referral_gift(request, referral_id):
-    """Дистрибьютор согласовывает или отклоняет подарок пригласившему."""
-    distributor, is_admin, err = _require_distributor_scope(request)
-    if err:
-        return err
-
-    referral = Referral.objects.filter(id=referral_id).select_related("inviter").first()
-    if referral is None:
-        return JsonResponse({"detail": "Реферал не найден"}, status=404)
-    if not is_admin and referral.inviter.distributor_id != getattr(distributor, "id", None):
-        return JsonResponse({"detail": "Клиент не из вашего региона"}, status=403)
-    if referral.gift_status != "pending":
-        return JsonResponse(
-            {"detail": "Решение уже принято", "giftStatus": referral.gift_status}, status=409
-        )
-
-    payload = _json(request)
-    approved = bool(payload.get("approved"))
-    referral.gift_status = "approved" if approved else "declined"
-    referral.gift_comment = (payload.get("comment") or "").strip()[:255]
-    referral.gift_decided_by = _current_user(request)
-    referral.gift_decided_at = timezone.now()
-    # Уведомление отправит сигнал _referral_post_save — так оно уходит и при
-    # согласовании из админки, а не только отсюда.
-    referral.save(update_fields=["gift_status", "gift_comment", "gift_decided_by", "gift_decided_at"])
     return JsonResponse({"referral": _format_referral(referral)})
 
 
@@ -5130,7 +5095,13 @@ def manager_tasks(request):
         return err
 
     if request.method == 'GET':
-        qs = ManagerTask.objects.select_related('client').filter(manager=user)
+        qs = ManagerTask.objects.select_related('client', 'manager')
+        # Обычный менеджер видит только свои задачи. Глобальная роль
+        # (админ/суперадмин) заходит на тот же экран, чтобы посмотреть, как он
+        # выглядит, — и раньше получала пустой список: задачи-то заведены на
+        # других менеджеров. Показываем ей все.
+        if not is_global:
+            qs = qs.filter(manager=user)
         status_filter = request.GET.get('status')
         if status_filter:
             qs = qs.filter(status=status_filter)

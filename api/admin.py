@@ -577,45 +577,11 @@ class ReferralAdmin(admin.ModelAdmin):
         "condition_met",
         "gift_status",
     )
-    list_filter = ("region", "is_registered", "has_purchase", "condition_met", "gift_status")
+    # gift_status остался колонкой ради истории старых подарков, но фильтровать
+    # по нему нечего: у новых связок он всегда "none".
+    list_filter = ("region", "is_registered", "has_purchase", "condition_met")
     search_fields = ("inviter__company_name", "invitee_name", "invitee_inn")
     readonly_fields = ("created_at", "gift_decided_at")
-    actions = ("approve_gift", "decline_gift")
-
-    def _decide(self, request, queryset, approved):
-        """Решение по подарку. Уведомление клиенту отправит сигнал."""
-        pending = queryset.filter(gift_status="pending")
-        decided = 0
-        for referral in pending:
-            referral.gift_status = "approved" if approved else "declined"
-            referral.gift_decided_by = request.user
-            referral.gift_decided_at = timezone.now()
-            # save() целиком, а не update(): у .update() не срабатывают сигналы,
-            # и клиент не получил бы уведомления.
-            referral.save(update_fields=["gift_status", "gift_decided_by", "gift_decided_at"])
-            decided += 1
-
-        skipped = queryset.count() - decided
-        if decided:
-            self.message_user(
-                request,
-                f"Обработано: {decided}. Клиентам отправлено уведомление.",
-                messages.SUCCESS,
-            )
-        if skipped:
-            self.message_user(
-                request,
-                f"Пропущено: {skipped} — решение по ним уже принято.",
-                messages.WARNING,
-            )
-
-    @admin.action(description="Согласовать подарок")
-    def approve_gift(self, request, queryset):
-        self._decide(request, queryset, True)
-
-    @admin.action(description="Отклонить подарок")
-    def decline_gift(self, request, queryset):
-        self._decide(request, queryset, False)
 
 
 @admin.register(ExpertTicket)

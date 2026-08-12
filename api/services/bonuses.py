@@ -1,7 +1,8 @@
 """Бонусный счёт клиента.
 
-Подарок по реферальной программе после согласования дистрибьютором попадает
-сюда рублями, а при оплате заказа уменьшает сумму, которая уходит в ЮKassa.
+Реферальный бонус капает сюда автоматически процентом от закупок
+приглашённого — начислением занимается ``api.services.referral_bonus``.
+При оплате заказа бонус уменьшает сумму, которая уходит в ЮKassa.
 
 Баланс нигде не хранится отдельным числом — он всегда сумма операций. Так
 любое расхождение видно по реестру, а не остаётся догадкой.
@@ -29,39 +30,6 @@ def balance(client) -> Decimal:
         total=Sum("amount")
     )["total"]
     return Decimal(total or 0).quantize(Decimal("0.01"))
-
-
-def credit_referral_bonus(referral) -> "object | None":
-    """Начислить подарок пригласившему. Повторный вызов ничего не делает.
-
-    Вызывается при согласовании подарка дистрибьютором. Идемпотентность держит
-    ограничение в базе, а не только эта проверка: согласование могут повторить
-    из админки, из приложения и сигналом одновременно.
-    """
-    from api.models import BonusTransaction
-
-    amount = Decimal(referral.gift_amount or 0)
-    if amount <= 0:
-        # Подарок не деньгами — отсрочка или статус. Его отрабатывает
-        # дистрибьютор вне приложения, на счёт он не попадает.
-        return None
-    if referral.gift_status != "approved":
-        return None
-
-    with transaction.atomic():
-        existing = BonusTransaction.objects.filter(
-            referral=referral, kind="referral"
-        ).first()
-        if existing:
-            return existing
-
-        return BonusTransaction.objects.create(
-            client=referral.inviter,
-            amount=amount,
-            kind="referral",
-            referral=referral,
-            comment=f"Приглашён {referral.invitee_name}",
-        )
 
 
 def spendable_for_order(client, order_total: Decimal) -> Decimal:

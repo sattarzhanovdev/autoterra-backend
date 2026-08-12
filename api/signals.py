@@ -153,20 +153,18 @@ def _expert_ticket_post_save(sender, instance, created, **kwargs) -> None:
 
 @receiver(pre_save, sender="api.Referral")
 def _referral_pre_save(sender, instance, **kwargs) -> None:
-    """Stash whether condition_met / gift_status were already set before save."""
+    """Запоминаем, было ли условие выполнено до сохранения."""
     if instance.pk is None:
         instance._pre_condition_met = False
-        instance._pre_gift_status = "none"
         return
     previous = (
         sender.objects
         .filter(pk=instance.pk)
-        .values("condition_met", "gift_status")
+        .values("condition_met")
         .first()
         or {}
     )
     instance._pre_condition_met = previous.get("condition_met") or False
-    instance._pre_gift_status = previous.get("gift_status") or "none"
 
 
 @receiver(post_save, sender="api.Referral")
@@ -184,29 +182,6 @@ def _referral_post_save(sender, instance, created, **kwargs) -> None:
                 instance.pk, getattr(instance.inviter, "pk", None),
             )
 
-    # Решение по подарку живёт здесь, а не в обработчике запроса: согласовать
-    # можно и из админки, а клиент должен узнать об этом в любом случае.
-    was_status = getattr(instance, "_pre_gift_status", "none")
-    if was_status != instance.gift_status and instance.gift_status in ("approved", "declined"):
-        # Сначала деньги, потом уведомление: в тексте указывается баланс, и он
-        # должен быть уже пополнен.
-        if instance.gift_status == "approved":
-            try:
-                from api.services.bonuses import credit_referral_bonus
-                credit_referral_bonus(instance)
-            except Exception:
-                logger.exception(
-                    "Не удалось начислить бонус по рефералу pk=%s", instance.pk
-                )
-
-        try:
-            from api.services.notification_triggers import on_referral_gift_decided
-            on_referral_gift_decided(instance)
-        except Exception:
-            logger.exception(
-                "Signal handler failed: Referral pk=%s gift_status=%s",
-                instance.pk, instance.gift_status,
-            )
 
 
 # ── Реферальный бонус процентом от закупок ────────────────────────────────────
