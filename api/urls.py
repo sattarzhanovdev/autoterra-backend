@@ -12,6 +12,9 @@ urlpatterns = [
     path("login/", views.login),
     path("me/", views.me),
     path("auth/me/", views.me),
+    # Обязателен для публикации в App Store и Google Play: удалить аккаунт
+    # должно быть можно прямо из приложения.
+    path("auth/delete-account/", views.delete_account),
     path("dashboard/", views.dashboard),
     path("stores/", views.stores),
     path("stores/<int:store_id>/", views.store_detail),

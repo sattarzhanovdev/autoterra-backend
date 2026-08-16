@@ -1568,6 +1568,68 @@ def me(request):
     return JsonResponse({"detail": "Профиль не найден"}, status=403)
 
 
+@csrf_exempt
+@require_POST
+@transaction.atomic
+def delete_account(request):
+    """Удаление аккаунта по требованию пользователя.
+
+    Apple (App Review Guideline 5.1.1(v)) и Google Play требуют, чтобы аккаунт
+    можно было удалить прямо из приложения, иначе публикацию не пропустят.
+
+    Заказы и платежи при этом остаются: это первичные учётные документы, их
+    хранение обязательно и от нас не зависит. Поэтому персональные данные в
+    профиле затираем, вход отключаем безвозвратно, а документы остаются
+    привязанными к обезличенной записи. Именно это и написано пользователю в
+    диалоге подтверждения — расхождений между обещанием и поведением быть не
+    должно, ревью такое проверяет.
+    """
+    user = _current_user(request)
+    if user is None:
+        return JsonResponse({"detail": "Unauthorized"}, status=401)
+
+    stamp = timezone.now().strftime("%Y%m%d%H%M%S")
+    # Суффикс с id и временем — потому что username и phone уникальны, а
+    # удаляться может не один аккаунт.
+    placeholder = f"deleted-{user.id}-{stamp}"
+
+    AuditLog.objects.create(
+        user=user,
+        action="account_deleted",
+        model_name="User",
+        object_id=str(user.id),
+        changes={"username": user.username, "role": _resolve_role(user)},
+    )
+
+    client = getattr(user, "client_profile", None)
+    if client is not None:
+        client.company_name = "Удалённый аккаунт"
+        client.contact_name = "Удалённый пользователь"
+        client.phone = placeholder
+        client.inn = "0000000000"
+        # Пустую строку положить нельзя: ClientProfile.save() зовёт full_clean(),
+        # а city обязательное. Ставим прочерк.
+        client.city = "—"
+        # Архив, а не блокировка: клиент не нарушал правил, он ушёл сам.
+        client.status = "archived"
+        client.save()
+
+    # Токены доступа и push-токены: сессия должна оборваться на всех
+    # устройствах, а пуши — перестать приходить немедленно.
+    user.auth_tokens.all().delete()
+    user.device_tokens.all().delete()
+
+    user.is_active = False
+    user.username = placeholder
+    user.first_name = ""
+    user.last_name = ""
+    user.email = ""
+    user.set_unusable_password()
+    user.save()
+
+    return JsonResponse({"status": "success", "detail": "Аккаунт удалён"})
+
+
 @require_GET
 def dashboard(request):
     client, err = _require_client(request)
