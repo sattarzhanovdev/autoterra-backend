@@ -1823,6 +1823,15 @@ def order_detail(request, order_id):
     if not allowed:
         return JsonResponse({"detail": "Нет доступа к заказу"}, status=403)
 
+    from api.services import payments as pay
+    pending = order.payments.filter(provider="yookassa", status__in=["pending", "waiting_for_capture"]).first()
+    if pending and pending.provider_payment_id:
+        try:
+            _refresh_payment(pending)
+            order.refresh_from_db()
+            order._prefetched_objects_cache = {}
+        except (pay.PaymentProviderError, pay.PaymentConfigError):
+            return JsonResponse({"detail": "Не удалось проверить оплату в ЮKassa. Обновите заказ позднее."}, status=503)
     return JsonResponse({"order": _format_order(order)})
 
 
@@ -1904,14 +1913,18 @@ def create_order(request):
 
 @csrf_exempt
 @require_POST
+@transaction.atomic
 def cancel_order(request, order_id):
     client, err = _require_client(request)
     if err:
         return err
     
-    order = client.orders.filter(id=order_id).first()
+    order = client.orders.select_for_update().filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
+    if order.payments.filter(status__in=["pending", "waiting_for_capture"]).exists():
+        return JsonResponse({"detail": "Дождитесь завершения или отмены платежа в ЮKassa, затем обновите заказ."}, status=409)
+
 
     # Клиент может отменить заказ только до оплаты (new / confirmed / adjusted)
     if not order.can_transition_to("cancelled"):
@@ -2012,14 +2025,18 @@ def _items_snapshot(order):
 
 @csrf_exempt
 @require_POST
+@transaction.atomic
 def confirm_order(request, order_id):
     """Оператор подтверждает заказ как есть: new/adjusted → confirmed."""
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
         return err
-    order = _scope_orders(distributor, is_admin).filter(id=order_id).first()
+    order = _scope_orders(distributor, is_admin).select_for_update().filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
+    if order.payments.filter(status__in=["pending", "waiting_for_capture"]).exists():
+        return JsonResponse({"detail": "Дождитесь завершения или отмены платежа в ЮKassa, затем обновите заказ."}, status=409)
+
     if not order.can_transition_to("confirmed"):
         return JsonResponse({"detail": f"Нельзя подтвердить заказ в статусе «{order.get_status_display()}»"}, status=400)
 
@@ -2047,6 +2064,7 @@ def confirm_order(request, order_id):
 
 @csrf_exempt
 @require_POST
+@transaction.atomic
 def adjust_order(request, order_id):
     """Оператор корректирует состав заказа: new → adjusted.
 
@@ -2062,9 +2080,12 @@ def adjust_order(request, order_id):
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
         return err
-    order = _scope_orders(distributor, is_admin).filter(id=order_id).first()
+    order = _scope_orders(distributor, is_admin).select_for_update().filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
+    if order.payments.filter(status__in=["pending", "waiting_for_capture"]).exists():
+        return JsonResponse({"detail": "Дождитесь завершения или отмены платежа в ЮKassa, затем обновите заказ."}, status=409)
+
     if not order.can_transition_to("adjusted"):
         return JsonResponse({"detail": f"Нельзя корректировать заказ в статусе «{order.get_status_display()}»"}, status=400)
 
@@ -2202,14 +2223,18 @@ def adjust_order(request, order_id):
 
 @csrf_exempt
 @require_POST
+@transaction.atomic
 def reject_order(request, order_id):
     """Оператор отклоняет заказ с указанием причины."""
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
         return err
-    order = _scope_orders(distributor, is_admin).filter(id=order_id).first()
+    order = _scope_orders(distributor, is_admin).select_for_update().filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
+    if order.payments.filter(status__in=["pending", "waiting_for_capture"]).exists():
+        return JsonResponse({"detail": "Дождитесь завершения или отмены платежа в ЮKassa, затем обновите заказ."}, status=409)
+
     if not order.can_transition_to("rejected"):
         return JsonResponse({"detail": f"Нельзя отклонить заказ в статусе «{order.get_status_display()}»"}, status=400)
 
@@ -2231,14 +2256,18 @@ def reject_order(request, order_id):
 
 @csrf_exempt
 @require_POST
+@transaction.atomic
 def accept_adjustment(request, order_id):
     """Клиент соглашается со скорректированным заказом: adjusted → confirmed."""
     client, err = _require_client(request)
     if err:
         return err
-    order = client.orders.filter(id=order_id).first()
+    order = client.orders.select_for_update().filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
+    if order.payments.filter(status__in=["pending", "waiting_for_capture"]).exists():
+        return JsonResponse({"detail": "Дождитесь завершения или отмены платежа в ЮKassa, затем обновите заказ."}, status=409)
+
     if order.status != "adjusted":
         return JsonResponse({"detail": "Заказ не в статусе корректировки"}, status=400)
 
@@ -2254,14 +2283,18 @@ def accept_adjustment(request, order_id):
 
 @csrf_exempt
 @require_POST
+@transaction.atomic
 def ship_order(request, order_id):
     """Оператор отмечает отправку: paid → shipped."""
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
         return err
-    order = _scope_orders(distributor, is_admin).filter(id=order_id).first()
+    order = _scope_orders(distributor, is_admin).select_for_update().filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
+    if order.payments.filter(status__in=["pending", "waiting_for_capture"]).exists():
+        return JsonResponse({"detail": "Дождитесь завершения или отмены платежа в ЮKassa, затем обновите заказ."}, status=409)
+
     if not order.can_transition_to("shipped"):
         return JsonResponse({"detail": f"Нельзя отправить заказ в статусе «{order.get_status_display()}»"}, status=400)
 
@@ -2321,21 +2354,11 @@ def _mark_order_paid(order, payment):
     sync_client_tier(order.client)
 
 
-@csrf_exempt
-@require_POST
-def pay_order(request, order_id):
-    """Клиент инициирует оплату подтверждённого заказа через YooKassa.
-
-    Оплатить можно ТОЛЬКО заказ в статусе confirmed/adjusted (гарантия наличия
-    товара). Возвращает confirmation_url, куда нужно перенаправить клиента.
-    Статус заказа станет `paid` только после webhook `payment.succeeded`.
-    """
+@transaction.atomic
+def _prepare_order_payment(client, order_id, payload):
     from api.services import payments as pay
 
-    client, err = _require_client(request)
-    if err:
-        return err
-    order = client.orders.filter(id=order_id).first()
+    order = client.orders.select_for_update().filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
     if order.status not in Order.PAYABLE_STATUSES:
@@ -2347,14 +2370,13 @@ def pay_order(request, order_id):
 
     # Переиспользуем ещё не оплаченный платёж (не создаём дубли при повторном тапе)
     existing = order.payments.filter(status__in=["pending", "waiting_for_capture"]).first()
-    if existing and existing.confirmation_url:
-        return JsonResponse({"payment": _format_payment(existing)}, status=200)
+    if existing:
+        return existing
 
     # Бонусы уменьшают сумму, которая уходит в ЮKassa. Списываем до обращения
     # к провайдеру: платить нужно уже остаток.
     from api.services import bonuses
 
-    payload = _json(request)
     raw_bonus = payload.get("useBonus")
     if raw_bonus is True:
         # true — «списать сколько можно», чтобы приложению не считать самому.
@@ -2364,7 +2386,7 @@ def pay_order(request, order_id):
             requested_bonus = Decimal(str(raw_bonus or 0))
         except (InvalidOperation, ValueError):
             return JsonResponse({"detail": "Некорректная сумма бонусов"}, status=400)
-    if requested_bonus < 0:
+    if not requested_bonus.is_finite() or requested_bonus < 0:
         return JsonResponse({"detail": "Сумма бонусов не может быть отрицательной"}, status=400)
 
     applied_bonus = bonuses.debit_for_order(client, order, requested_bonus)
@@ -2401,83 +2423,148 @@ def pay_order(request, order_id):
         currency="RUB",
         status="pending",
         idempotence_key=idempotence_key,
+        raw_response={"request": pay.payment_body(order, payable)},
     )
+    return payment
+
+
+@transaction.atomic
+def _apply_provider_payment(payment_id, response):
+    from api.services import payments as pay, bonuses
+
+    initial = Payment.objects.get(pk=payment_id)
+    order = Order.objects.select_for_update().get(pk=initial.order_id)
+    payment = Payment.objects.select_for_update().get(pk=payment_id)
+    pay.validate_payment(payment, response)
+    # An older response must never undo a terminal result (webhook/GET races).
+    if payment.status in ("succeeded", "canceled"):
+        return payment
+    payment.provider_payment_id = response["id"]
+    payment.status = response["status"]
+    payment.confirmation_url = (response.get("confirmation") or {}).get("confirmation_url", "")
+    payment.raw_response = response
+    if payment.status == "succeeded":
+        payment.paid_at = timezone.now()
+    payment.save()
+    if payment.status == "succeeded":
+        _mark_order_paid(order, payment)
+    elif payment.status == "canceled":
+        bonuses.refund_for_order(order)
+    return payment
+
+
+def _refresh_payment(payment):
+    from api.services import payments as pay
+
+    response = pay.fetch_payment(payment.provider_payment_id)
+    return _apply_provider_payment(payment.pk, response)
+
+
+def _create_provider_payment(payment):
+    from api.services import payments as pay
+
+    with transaction.atomic():
+        Order.objects.select_for_update().get(pk=payment.order_id)
+        payment = Payment.objects.select_for_update().get(pk=payment.pk)
+        if payment.status in ("succeeded", "canceled"):
+            return payment
+        already_sent = payment.raw_response.get("dispatched", False)
+        if not payment.provider_payment_id:
+            payment.raw_response["dispatched"] = True
+            payment.save(update_fields=["raw_response"])
+    if payment.provider_payment_id:
+        return _refresh_payment(payment)
     try:
-        resp = pay.create_payment(
-            order=order,
-            amount=payable,
-            idempotence_key=idempotence_key,
-            description=f"Заказ ORD-{order.id:05d} · {order.client.company_name}",
+        response = pay.create_payment(
+            order=payment.order, amount=payment.amount,
+            idempotence_key=payment.idempotence_key,
+            request_body=payment.raw_response.get("request"),
         )
     except pay.PaymentProviderError as exc:
-        payment.status = "canceled"
-        payment.raw_response = {"error": str(exc)}
-        payment.save(update_fields=["status", "raw_response"])
-        # Платёж не создан — бонус не должен сгореть.
-        bonuses.refund_for_order(order)
-        return JsonResponse({"detail": f"Ошибка платёжного провайдера: {exc}"}, status=502)
+        # Even a definite rejection of a RETRY cannot prove that the earlier
+        # request failed (e.g. credentials changed after a lost success response).
+        if already_sent:
+            raise pay.PaymentUncertainError("Результат предыдущего запроса неизвестен") from exc
+        raise
+    return _apply_provider_payment(payment.pk, response)
 
-    payment.provider_payment_id = resp.get("id", "")
-    payment.status = resp.get("status", "pending")
-    payment.confirmation_url = (resp.get("confirmation") or {}).get("confirmation_url", "")
-    payment.raw_response = resp
-    payment.save(update_fields=["provider_payment_id", "status", "confirmation_url", "raw_response"])
 
-    return JsonResponse(
-        {"payment": _format_payment(payment), "bonusApplied": float(applied_bonus)},
-        status=201,
-    )
+@csrf_exempt
+@require_POST
+def pay_order(request, order_id):
+    from api.services import payments as pay, bonuses
+
+    client, err = _require_client(request)
+    if err:
+        return err
+    payload = _json(request)
+    if not isinstance(payload, dict):
+        return JsonResponse({"detail": "Некорректный запрос"}, status=400)
+    # Commit the attempt and key BEFORE making an external request. A timeout,
+    # process crash or parallel tap must reuse this exact request, never charge twice.
+    payment = _prepare_order_payment(client, order_id, payload)
+    if isinstance(payment, HttpResponse):
+        return payment
+    try:
+        if payment.provider_payment_id:
+            payment = _refresh_payment(payment)
+        else:
+            if ((timezone.now() - payment.created_at).total_seconds() >= 23 * 3600
+                    or not payment.idempotence_key or not payment.raw_response.get("request")):
+                return JsonResponse({"detail": "Платёж требует проверки оператором в ЮKassa. Повторное списание заблокировано."}, status=409)
+            payment = _create_provider_payment(payment)
+    except pay.PaymentUncertainError:
+        return JsonResponse({"detail": "ЮKassa пока не подтвердила создание платежа. Повторите попытку: повторного списания не будет."}, status=503)
+    except pay.PaymentConfigError:
+        return JsonResponse({"detail": "Оплата временно недоступна"}, status=503)
+    except pay.PaymentProviderError:
+        # A failed GET says nothing about the financial outcome. Only a definite
+        # rejection of POST can release this attempt and its reserved bonus.
+        if not payment.provider_payment_id:
+            with transaction.atomic():
+                Order.objects.select_for_update().get(pk=payment.order_id)
+                payment = Payment.objects.select_for_update().get(pk=payment.pk)
+                if payment.status == "pending" and not payment.provider_payment_id:
+                    payment.status = "canceled"
+                    payment.save(update_fields=["status"])
+                    bonuses.refund_for_order(payment.order)
+        return JsonResponse({"detail": "Не удалось выполнить запрос к ЮKassa. Попробуйте позднее."}, status=502)
+    return JsonResponse({"payment": _format_payment(payment), "bonusApplied": float(_bonus_applied(payment.order))}, status=201)
 
 
 @csrf_exempt
 @require_POST
 def yookassa_webhook(request):
-    """Приём уведомлений от YooKassa (payment.succeeded / payment.canceled).
-
-    Настраивается в ЛК ЮKassa: HTTP-уведомления → указать URL этого endpoint-а.
-    Мы перепроверяем статус платежа через API, чтобы не доверять телу запроса.
-    """
     from api.services import payments as pay
 
     payload = _json(request)
-    event = payload.get("event")
-    obj = payload.get("object") or {}
-    provider_payment_id = obj.get("id")
-    if not provider_payment_id:
-        return JsonResponse({"detail": "no payment id"}, status=400)
-
-    payment = Payment.objects.filter(provider_payment_id=provider_payment_id).select_related("order").first()
+    if not isinstance(payload, dict) or not isinstance(payload.get("object"), dict):
+        return JsonResponse({"detail": "Invalid notification"}, status=400)
+    if payload.get("event") not in ("payment.succeeded", "payment.canceled", "payment.waiting_for_capture"):
+        return JsonResponse({"status": "ignored"})
+    provider_id = payload["object"].get("id")
+    if not isinstance(provider_id, str) or not provider_id:
+        return JsonResponse({"detail": "Invalid payment id"}, status=400)
+    payment = Payment.objects.filter(provider="yookassa", provider_payment_id=provider_id).first()
     if not payment:
-        # Платёж не наш / уже удалён — отвечаем 200, чтобы ЮKassa не ретраила бесконечно
-        return JsonResponse({"detail": "unknown payment"}, status=200)
-
-    # Перепроверяем реальный статус у провайдера (защита от подделки webhook-а)
-    real_status = obj.get("status")
-    if pay.is_configured():
-        try:
-            fresh = pay.fetch_payment(provider_payment_id)
-            real_status = fresh.get("status", real_status)
-        except pay.PaymentProviderError:
-            logger.exception("YooKassa verify failed for %s", provider_payment_id)
-
-    order = payment.order
-
-    if event == "payment.succeeded" or real_status == "succeeded":
-        if payment.status != "succeeded":
-            payment.status = "succeeded"
-            payment.paid_at = timezone.now()
-            payment.save(update_fields=["status", "paid_at"])
-        # Двигаем заказ в paid только из оплачиваемого статуса (идемпотентно)
-        _mark_order_paid(order, payment)
-    elif event == "payment.canceled" or real_status == "canceled":
-        payment.status = "canceled"
-        payment.save(update_fields=["status"])
-        # Оплата не состоялась — списанные бонусы возвращаем на счёт.
-        from api.services import bonuses
-
-        bonuses.refund_for_order(order)
-
+        # Notification can arrive before the creation response is persisted.
+        # Retry rather than silently lose an actual successful payment.
+        return JsonResponse({"detail": "Payment not registered yet"}, status=503)
+    try:
+        _refresh_payment(payment)
+    except (pay.PaymentProviderError, pay.PaymentConfigError):
+        logger.warning("YooKassa verification unavailable for payment %s", payment.pk)
+        return JsonResponse({"detail": "Verification unavailable"}, status=503)
     return JsonResponse({"status": "ok"})
+
+
+@require_GET
+def yookassa_return(request):
+    # A redirect is not proof of payment. The app checks its authenticated API.
+    return HttpResponse('<!doctype html><html lang="ru"><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<title>АвтоТерра — оплата</title><body><h1>Вернитесь в АвтоТерра</h1>'
+        '<p>Откройте приложение и карточку заказа. Статус обновится после проверки в ЮKassa.</p></body></html>')
 
 
 @require_GET
@@ -4076,14 +4163,18 @@ def distributor_update_delivery_status(request, task_id):
 
 @csrf_exempt
 @require_http_methods(["PATCH", "POST"])
+@transaction.atomic
 def distributor_update_order_status(request, order_id):
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
         return err
     
-    order = _scope_orders(distributor, is_admin).filter(id=order_id).first()
+    order = _scope_orders(distributor, is_admin).select_for_update().filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
+    if order.payments.filter(status__in=["pending", "waiting_for_capture"]).exists():
+        return JsonResponse({"detail": "Дождитесь завершения или отмены платежа в ЮKassa, затем обновите заказ."}, status=409)
+
 
     payload = _json(request)
     status = payload.get("status")
@@ -4094,6 +4185,8 @@ def distributor_update_order_status(request, order_id):
     if status not in ["new", "accepted", "rejected", "fulfilled"]:
         return JsonResponse({"detail": "Некорректный статус"}, status=400)
 
+    if not order.can_transition_to(status):
+        return JsonResponse({"detail": "Недопустимый переход статуса заказа"}, status=400)
     old_status = order.status
     order.status = status
     if status == "rejected" and reason:

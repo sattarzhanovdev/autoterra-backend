@@ -33,6 +33,7 @@ urlpatterns = [
     path("orders/<int:order_id>/pay/", views.pay_order),                  # клиент
     # Webhook от YooKassa (без авторизации, вызывается платёжной системой)
     path("payments/yookassa/webhook/", views.yookassa_webhook),
+    path("payments/yookassa/return/", views.yookassa_return),
     path("purchases/", views.purchases),
     path("purchases/create/", views.create_purchase),
     path("manager/dashboard/", views.manager_dashboard),

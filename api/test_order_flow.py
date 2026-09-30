@@ -1,4 +1,6 @@
 import json
+from unittest.mock import patch
+from django.test import override_settings
 
 from django.test import TestCase, Client
 from django.contrib.auth.models import User
@@ -145,6 +147,7 @@ class SafeOrderFlowTests(TestCase):
         resp = self._post(f"/api/orders/{order.id}/pay/", self._cli())
         self.assertEqual(resp.status_code, 503)
 
+    @override_settings(YOOKASSA_SHOP_ID="test-shop")
     def test_webhook_marks_order_paid(self):
         order = self._make_order(status="confirmed")
         payment = Payment.objects.create(
@@ -155,7 +158,11 @@ class SafeOrderFlowTests(TestCase):
             "event": "payment.succeeded",
             "object": {"id": "pay-123", "status": "succeeded", "metadata": {"order_id": str(order.id)}},
         }
-        resp = self._post("/api/payments/yookassa/webhook/", {}, body)
+        verified = dict(body["object"], paid=True,
+            amount={"value": str(order.total_amount), "currency": "RUB"},
+            recipient={"account_id": "test-shop"})
+        with patch("api.services.payments.fetch_payment", return_value=verified):
+            resp = self._post("/api/payments/yookassa/webhook/", {}, body)
         self.assertEqual(resp.status_code, 200)
         order.refresh_from_db()
         payment.refresh_from_db()

@@ -615,7 +615,7 @@ class Order(models.Model):
     STATUS_TRANSITIONS = {
         "new": {"confirmed", "adjusted", "rejected", "cancelled", "accepted"},
         "confirmed": {"paid", "cancelled"},
-        "adjusted": {"confirmed", "paid", "cancelled"},  # confirmed = клиент согласился
+        "adjusted": {"confirmed", "cancelled"},  # confirmed = клиент согласился
         "accepted": {"paid", "shipped", "rejected", "fulfilled", "cancelled"},  # legacy
         "rejected": set(),
         "paid": {"shipped"},
@@ -625,7 +625,7 @@ class Order(models.Model):
     }
 
     # Статусы, в которых клиент может инициировать оплату
-    PAYABLE_STATUSES = {"confirmed", "adjusted"}
+    PAYABLE_STATUSES = {"confirmed", "accepted"}
 
     DELIVERY_CHOICES = [
         ("courier", "Курьерская доставка"),

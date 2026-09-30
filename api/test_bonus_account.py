@@ -132,6 +132,7 @@ class BonusSpendTests(_Base):
         self.assertEqual(bonuses.balance(self.client_profile), Decimal("5000.00"))
 
 
+@override_settings(YOOKASSA_SHOP_ID="")
 class PayOrderWithBonusTests(_Base):
     """Оплата заказа: бонус уменьшает сумму, уходящую в ЮKassa."""
 
@@ -151,6 +152,9 @@ class PayOrderWithBonusTests(_Base):
              patch("api.services.payments.create_payment") as create:
             create.return_value = {
                 "id": "pay-1", "status": "pending",
+                "amount": {"value": "25000.00", "currency": "RUB"},
+                "metadata": {"order_id": str(order.pk)},
+                "recipient": {"account_id": ""},
                 "confirmation": {"confirmation_url": "https://pay.example/1"},
             }
             response = self._pay(order, useBonus=5000)
@@ -167,6 +171,9 @@ class PayOrderWithBonusTests(_Base):
              patch("api.services.payments.create_payment") as create:
             create.return_value = {
                 "id": "pay-2", "status": "pending",
+                "amount": {"value": "30000.00", "currency": "RUB"},
+                "metadata": {"order_id": str(order.pk)},
+                "recipient": {"account_id": ""},
                 "confirmation": {"confirmation_url": "https://pay.example/2"},
             }
             self._pay(order)
@@ -182,6 +189,9 @@ class PayOrderWithBonusTests(_Base):
              patch("api.services.payments.create_payment") as create:
             create.return_value = {
                 "id": "pay-3", "status": "pending",
+                "amount": {"value": "25000.00", "currency": "RUB"},
+                "metadata": {"order_id": str(order.pk)},
+                "recipient": {"account_id": ""},
                 "confirmation": {"confirmation_url": "https://pay.example/3"},
             }
             self._pay(order, useBonus=True)

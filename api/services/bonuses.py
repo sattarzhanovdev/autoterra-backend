@@ -48,7 +48,7 @@ def debit_for_order(client, order, requested: Decimal):
     """
     from api.models import BonusTransaction, ClientProfile
 
-    requested = Decimal(requested or 0)
+    requested = min(Decimal(requested or 0), Decimal(order.total_amount)).quantize(Decimal("0.01"))
     if requested <= ZERO:
         return ZERO
 
@@ -57,7 +57,7 @@ def debit_for_order(client, order, requested: Decimal):
         # прочитают один и тот же баланс и спишут бонус дважды.
         ClientProfile.objects.select_for_update().get(pk=client.pk)
 
-        already = BonusTransaction.objects.filter(order=order, kind="order").aggregate(
+        already = BonusTransaction.objects.filter(order=order, kind__in=["order", "refund"]).aggregate(
             total=Sum("amount")
         )["total"]
         if already:

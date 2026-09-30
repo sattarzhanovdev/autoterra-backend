@@ -123,6 +123,8 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": BASE_DIR / "db.sqlite3",
+        # Serialize short financial transactions on SQLite as well as row locks.
+        "OPTIONS": {"transaction_mode": "IMMEDIATE", "timeout": 30},
     }
 }
 
@@ -216,6 +218,5 @@ YOOKASSA_SHOP_ID = os.environ.get("YOOKASSA_SHOP_ID", "")
 YOOKASSA_SECRET_KEY = os.environ.get("YOOKASSA_SECRET_KEY", "")
 YOOKASSA_API_URL = os.environ.get("YOOKASSA_API_URL", "https://api.yookassa.ru/v3")
 # Куда вернётся пользователь после оплаты (deep-link в приложение или веб-страница)
-YOOKASSA_RETURN_URL = os.environ.get("YOOKASSA_RETURN_URL", "https://autoterra.ru/payment/return")
-# Секрет для проверки входящих webhook-ов (необязателен; см. views).
-YOOKASSA_WEBHOOK_SECRET = os.environ.get("YOOKASSA_WEBHOOK_SECRET", "")
+YOOKASSA_RETURN_URL = os.environ.get("YOOKASSA_RETURN_URL", "https://autoterra.shop/api/payments/yookassa/return/")
+# Webhook проверяется повторным запросом к API ЮKassa, отдельного секрета нет.

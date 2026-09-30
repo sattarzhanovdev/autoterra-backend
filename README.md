@@ -41,3 +41,7 @@ The Flutter app uses `http://127.0.0.1:8000/api` by default. Override it with:
 ```bash
 flutter run --dart-define=API_BASE_URL=http://127.0.0.1:8000/api
 ```
+
+## Оплата и сборка Android
+
+Настройка ключей ЮKassa, webhook, фоновой сверки и APK: [PAYMENTS_YOOKASSA.md](PAYMENTS_YOOKASSA.md).

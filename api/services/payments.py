@@ -8,7 +8,8 @@ Flow
 1. Клиент нажимает «Оплатить» → create_payment() создаёт платёж в ЮKassa
    с confirmation.type = "redirect" и возвращает confirmation_url.
 2. Клиент оплачивает по ссылке → ЮKassa шлёт webhook `payment.succeeded`.
-3. Webhook-обработчик помечает заказ оплаченным.
+3. Webhook, карточка заказа и фоновая сверка проверяют ответ API ЮKassa
+   перед изменением статуса заказа.
 
 Все суммы в рублях, две десятичных цифры (требование ЮKassa).
 """
@@ -16,13 +17,14 @@ Flow
 from __future__ import annotations
 
 import base64
+from http.client import HTTPException
 import json
 import logging
 import ssl
 import urllib.error
 import urllib.request
 import uuid
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from django.conf import settings
 
@@ -42,6 +44,10 @@ class PaymentProviderError(RuntimeError):
     """Raised when the YooKassa API returns an error."""
 
 
+class PaymentUncertainError(PaymentProviderError):
+    """The request may have reached the provider. Keep its idempotence key."""
+
+
 def is_configured() -> bool:
     return bool(settings.YOOKASSA_SHOP_ID and settings.YOOKASSA_SECRET_KEY)
 
@@ -57,15 +63,8 @@ def _ssl_context():
     return ssl.create_default_context()
 
 
-def create_payment(order, amount: Decimal, idempotence_key: str, description: str = "") -> dict:
-    """Create a YooKassa payment and return the parsed JSON response.
-
-    Raises PaymentConfigError if creds are missing, PaymentProviderError on API error.
-    """
-    if not is_configured():
-        raise PaymentConfigError("YOOKASSA_SHOP_ID / YOOKASSA_SECRET_KEY не заданы")
-
-    body = {
+def payment_body(order, amount, description=""):
+    return {
         "amount": {
             "value": f"{Decimal(amount):.2f}",
             "currency": "RUB",
@@ -80,6 +79,17 @@ def create_payment(order, amount: Decimal, idempotence_key: str, description: st
             "order_id": str(order.id),
         },
     }
+
+
+def create_payment(order, amount: Decimal, idempotence_key: str, description: str = "", request_body=None) -> dict:
+    """Create a YooKassa payment and return the parsed JSON response.
+
+    Raises PaymentConfigError if creds are missing, PaymentProviderError on API error.
+    """
+    if not is_configured():
+        raise PaymentConfigError("YOOKASSA_SHOP_ID / YOOKASSA_SECRET_KEY не заданы")
+
+    body = request_body or payment_body(order, amount, description)
 
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
@@ -98,10 +108,11 @@ def create_payment(order, amount: Decimal, idempotence_key: str, description: st
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "ignore")
         logger.error("YooKassa create_payment failed %s: %s", exc.code, detail)
-        raise PaymentProviderError(f"YooKassa error {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
+        error = PaymentUncertainError if exc.code >= 500 or exc.code in (408, 409, 429) or "Idempotence" in detail else PaymentProviderError
+        raise error(f"YooKassa error {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, HTTPException) as exc:
         logger.error("YooKassa create_payment network error: %s", exc)
-        raise PaymentProviderError(f"Сеть недоступна: {exc}") from exc
+        raise PaymentUncertainError("Не удалось получить ответ ЮKassa") from exc
 
 
 def fetch_payment(provider_payment_id: str) -> dict:
@@ -118,8 +129,32 @@ def fetch_payment(provider_payment_id: str) -> dict:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "ignore")
-        raise PaymentProviderError(f"YooKassa error {exc.code}: {detail}") from exc
+        error = PaymentUncertainError if exc.code >= 500 or exc.code in (408, 409, 429) or "Idempotence" in detail else PaymentProviderError
+        raise error(f"YooKassa error {exc.code}") from exc
+
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, HTTPException) as exc:
+        raise PaymentProviderError("Не удалось проверить платёж") from exc
 
 
 def new_idempotence_key() -> str:
     return uuid.uuid4().hex
+
+
+def validate_payment(payment, response):
+    """Only authenticated provider responses with matching financial data count."""
+    try:
+        amount = response["amount"]
+        valid = (
+            bool(response["id"])
+            and (not payment.provider_payment_id or response["id"] == payment.provider_payment_id)
+            and Decimal(amount["value"]) == payment.amount
+            and amount["currency"] == payment.currency
+            and str(response["metadata"]["order_id"]) == str(payment.order_id)
+            and str(response["recipient"]["account_id"]) == str(settings.YOOKASSA_SHOP_ID)
+            and response["status"] in {"pending", "waiting_for_capture", "succeeded", "canceled"}
+            and (response["status"] != "succeeded" or response.get("paid") is True)
+        )
+    except (KeyError, TypeError, InvalidOperation, ValueError):
+        valid = False
+    if not valid:
+        raise PaymentUncertainError("Ответ ЮKassa не соответствует платежу")
