@@ -39,7 +39,7 @@ class ModelRoleTests(TestCase):
     def test_client_profile_creation_and_distributor_assignment(self):
         """Test 1 & 5: Region creation, ClientProfile binding, and auto-distributor assignment"""
         user = User.objects.create_user(username="client1", password="password")
-        client = ClientProfile.objects.create(
+        client = ClientProfile.objects.create(status="active", 
             user=user,
             inn="1234567890",
             company_name="Test Company",
@@ -85,7 +85,7 @@ class ModelRoleTests(TestCase):
     def test_inn_uniqueness_in_region(self):
         """Test 3: Unique INN in same region"""
         user1 = User.objects.create_user(username="u1", password="p")
-        ClientProfile.objects.create(
+        ClientProfile.objects.create(status="active", 
             user=user1,
             inn="1234567890",
             company_name="C1",
@@ -112,7 +112,7 @@ class ModelRoleTests(TestCase):
     def test_same_inn_different_regions(self):
         """Test 4: Same INN in DIFFERENT regions (status 'under_review')"""
         user1 = User.objects.create_user(username="u1", password="p")
-        ClientProfile.objects.create(
+        ClientProfile.objects.create(status="active", 
             user=user1,
             inn="1234567890",
             company_name="C1",
@@ -123,7 +123,7 @@ class ModelRoleTests(TestCase):
         )
         
         user2 = User.objects.create_user(username="u2", password="p")
-        client2 = ClientProfile.objects.create(
+        client2 = ClientProfile.objects.create(status="active", 
             user=user2,
             inn="1234567890",
             company_name="C2",

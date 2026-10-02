@@ -33,7 +33,7 @@ class ClientExportTests(TestCase):
         user = User.objects.create_user(
             username="+79001110000", password="pw", email="client@test.ru"
         )
-        self.client_profile = ClientProfile.objects.create(
+        self.client_profile = ClientProfile.objects.create(status="active", 
             user=user, inn="5556667778", company_name="ООО «Ромашка»",
             contact_name="Иван Иванов", phone="+79001110000",
             region=self.region, city="Москва", distributor=self.distributor,
@@ -162,7 +162,7 @@ class ClientExportAdminTests(TestCase):
             [("Ромашка", "Москва"), ("Василёк", "Казань")], start=1
         ):
             user = User.objects.create_user(username=f"+7900111000{index}", password="pw")
-            ClientProfile.objects.create(
+            ClientProfile.objects.create(status="active", 
                 user=user, inn=f"555666777{index}", company_name=company,
                 contact_name="Иван", phone=f"+7900111000{index}",
                 region=self.region, city=city, distributor=self.distributor,

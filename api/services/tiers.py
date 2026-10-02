@@ -8,10 +8,12 @@
 """
 
 import logging
+from django.db import transaction
 
 logger = logging.getLogger(__name__)
 
 
+@transaction.atomic
 def sync_client_tier(client, allow_downgrade: bool = False) -> dict:
     """Пересчитывает оборот клиента и, если заслужил, поднимает ранг.
 
@@ -19,6 +21,7 @@ def sync_client_tier(client, allow_downgrade: bool = False) -> dict:
     """
     from api.models import ClientProfile, client_turnover, grown_partner_status, partner_tier_for_total
 
+    client = ClientProfile.objects.select_for_update().get(pk=client.pk)
     turnover = client_turnover(client)
     old = client.partner_status
 

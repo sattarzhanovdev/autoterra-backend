@@ -37,7 +37,7 @@ class ReferralCodeTests(TestCase):
 
     def _client(self, username, inn, company="Компания"):
         user = User.objects.create_user(username=username, password="pw")
-        return ClientProfile.objects.create(
+        return ClientProfile.objects.create(status="active", 
             user=user, inn=inn, company_name=company, contact_name="Иван",
             phone=username, region=self.region, city="Москва", distributor=self.distributor,
         )
@@ -84,7 +84,7 @@ class ReferralRegistrationTests(TestCase):
         self.region = Region.objects.create(code="77", name="Москва", distributor=self.distributor)
 
         inviter_user = User.objects.create_user(username="+79001110000", password="pw")
-        self.inviter = ClientProfile.objects.create(
+        self.inviter = ClientProfile.objects.create(status="active", 
             user=inviter_user, inn="5556667778", company_name="ООО Пригласивший",
             contact_name="Иван", phone="+79001110000",
             region=self.region, city="Москва", distributor=self.distributor,
@@ -92,7 +92,7 @@ class ReferralRegistrationTests(TestCase):
         self.inviter_token = AuthToken.objects.create(key="inviter-token", user=inviter_user)
 
     def _register(self, **overrides):
-        payload = {
+        payload = {"email": "client@example.com", "termsAccepted": True, "personalDataConsent": True, 
             "username": "+79002223344",
             "password": "verysecret123",
             "inn": "7778889990",
@@ -184,7 +184,7 @@ class ReferralGiftTests(TestCase):
         )
 
         inviter_user = User.objects.create_user(username="+79001110000", password="pw")
-        self.inviter = ClientProfile.objects.create(
+        self.inviter = ClientProfile.objects.create(status="active", 
             user=inviter_user, inn="5556667778", company_name="Пригласивший",
             contact_name="Иван", phone="+79001110000",
             region=self.region, city="Москва", distributor=self.distributor,
@@ -192,7 +192,7 @@ class ReferralGiftTests(TestCase):
         self.inviter_token = AuthToken.objects.create(key="inviter-token", user=inviter_user)
 
         invitee_user = User.objects.create_user(username="+79002223344", password="pw")
-        self.invitee = ClientProfile.objects.create(
+        self.invitee = ClientProfile.objects.create(status="active", 
             user=invitee_user, inn="7778889990", company_name="Приглашённый",
             contact_name="Пётр", phone="+79002223344",
             region=self.region, city="Москва", distributor=self.distributor,

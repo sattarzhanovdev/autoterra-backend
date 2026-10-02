@@ -30,7 +30,7 @@ class RegistrationEmailTests(TestCase):
         mail.outbox = []
 
     def _register(self, **overrides):
-        payload = {
+        payload = {"email": "client@example.com", "termsAccepted": True, "personalDataConsent": True, 
             "username": "+79001112233",
             "password": "verysecret123",
             "inn": "5556667778",
@@ -95,7 +95,7 @@ class RegistrationEmailTests(TestCase):
             code="16", name="Казань", distributor=self.distributor
         )
         other_user = User.objects.create_user(username="+79009998877", password="pw")
-        ClientProfile.objects.create(
+        ClientProfile.objects.create(status="active", 
             user=other_user, inn="5556667778", company_name="Ромашка Казань",
             contact_name="Пётр", phone="+79009998877",
             region=other_region, city="Казань", distributor=self.distributor,
@@ -218,7 +218,7 @@ class RegistrationEmailTransactionTests(TransactionTestCase):
         with patch("django.core.mail.EmailMultiAlternatives.send", spy):
             response = self.http.post(
                 "/api/register/",
-                data={
+                data={"email": "client@example.com", "termsAccepted": True, "personalDataConsent": True, 
                     "username": "+79001112233",
                     "password": "verysecret123",
                     "inn": "5556667778",

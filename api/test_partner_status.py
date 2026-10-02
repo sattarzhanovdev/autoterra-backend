@@ -26,7 +26,7 @@ class PartnerStatusOnVerifyTests(TestCase):
         self.region = Region.objects.create(code="77", name="Msk", distributor=self.distributor)
 
         self.client_user = User.objects.create_user(username="client")
-        self.profile = ClientProfile.objects.create(
+        self.profile = ClientProfile.objects.create(status="active", 
             user=self.client_user, inn="1234567890", company_name="Client",
             region=self.region, distributor=self.distributor,
             phone="1", city="Msk", contact_name="Me",

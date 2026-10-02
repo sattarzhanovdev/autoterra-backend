@@ -27,7 +27,7 @@ class ReferralClaimGuardTests(TestCase):
 
     def _client(self, username, inn, company="Компания"):
         user = User.objects.create_user(username=username, password="pw")
-        return ClientProfile.objects.create(
+        return ClientProfile.objects.create(status="active", 
             user=user, inn=inn, company_name=company, contact_name="Иван",
             phone=username, region=self.region, city="Пермь", distributor=self.distributor,
         )
@@ -128,7 +128,7 @@ class ReferralCodeBeatsManualClaimTests(TestCase):
 
     def _client(self, username, inn, company="Компания"):
         user = User.objects.create_user(username=username, password="pw")
-        return ClientProfile.objects.create(
+        return ClientProfile.objects.create(status="active", 
             user=user, inn=inn, company_name=company, contact_name="Иван",
             phone=username, region=self.region, city="Пермь", distributor=self.distributor,
         )
@@ -182,7 +182,7 @@ class ClaimNeedsInviteeConfirmationTests(TestCase):
 
     def _client(self, username, inn, company="Компания"):
         user = User.objects.create_user(username=username, password="pw")
-        return ClientProfile.objects.create(
+        return ClientProfile.objects.create(status="active", 
             user=user, inn=inn, company_name=company, contact_name="Иван",
             phone=username, region=self.region, city="Пермь", distributor=self.distributor,
         )
@@ -228,7 +228,7 @@ class ClaimNeedsInviteeConfirmationTests(TestCase):
 
         response = self.http.post(
             "/api/register/",
-            data=json.dumps({
+            data=json.dumps({"email": "client@example.com", "termsAccepted": True, "personalDataConsent": True, 
                 "username": "+79001110009",
                 "password": "Str0ngPass!",
                 "inn": "7736050003",

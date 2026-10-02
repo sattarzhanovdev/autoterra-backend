@@ -12,7 +12,7 @@ class ColorLabTests(TestCase):
         )
         self.region = Region.objects.create(code="77", name="Msk", distributor=self.distributor)
         self.client_user = User.objects.create_user(username="client_user")
-        self.client_profile = ClientProfile.objects.create(
+        self.client_profile = ClientProfile.objects.create(status="active", 
             user=self.client_user,
             inn="1234567890",
             company_name="Client",

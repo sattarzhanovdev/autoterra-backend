@@ -126,6 +126,8 @@ def _send_order_email(order):
             "",
             f"Клиент: {client.company_name}",
             f"ИНН: {client.inn}",
+            f"Регион: {client.region.name}",
+            f"Адрес: {order.store.address if order.store else chr(8212)}",
             f"Дистрибьютор: {order.distributor.name}",
             f"Способ получения: {delivery}",
             f"Магазин/точка: {store_name}",
@@ -326,7 +328,12 @@ def _send_registration_email(client):
         region_name = client.region.name if client.region_id else "—"
 
         # Plain-text fallback
+        address = "; ".join(client.stores.values_list("address", flat=True))
         lines = [
+            f"Адрес: {address}",
+            f"Email: {client.user.email}",
+            f"Дистрибьютор: {client.distributor}",
+            f"Дата: {client.created_at.isoformat()}",
             f"Новая регистрация: {client.company_name}",
             "",
             f"ИНН: {client.inn}",
@@ -366,6 +373,10 @@ def _send_registration_email(client):
           <td style="padding:28px 32px 28px 32px;">
             <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
               {info_row("Компания", client.company_name)}
+              {info_row("Адрес", address)}
+              {info_row("Email", client.user.email)}
+              {info_row("Дистрибьютор", client.distributor)}
+              {info_row("Дата", client.created_at.isoformat())}
               {info_row("ИНН", client.inn)}
               {info_row("Регион", region_name)}
               {info_row("Город", client.city)}
@@ -405,7 +416,7 @@ def _send_order_status_email(order, old_status, new_status, recipients=None):
     client (order.client.user.email) directly.
     """
     if recipients is None:
-        recipients = getattr(settings, "ORDER_NOTIFICATION_EMAILS", None)
+        recipients = list(getattr(settings, "ORDER_NOTIFICATION_EMAILS", [])) + _client_email_list(order)
     recipients = [r for r in (recipients or []) if r]
     if not recipients or old_status == new_status:
         return
@@ -615,7 +626,7 @@ def _current_user(request):
     if not auth.startswith("Bearer "):
         return None
     token = auth.replace("Bearer ", "", 1).strip()
-    obj = AuthToken.objects.filter(key=token).select_related("user").first()
+    obj = AuthToken.objects.filter(key=token, user__is_active=True).select_related("user").first()
     return obj.user if obj else None
 
 
@@ -629,7 +640,15 @@ def _require_client(request):
         return None, JsonResponse({"detail": "Нет доступа клиента"}, status=403)
         
     try:
-        return user.client_profile, None
+        client = user.client_profile
+        if client.status != "active":
+            return None, JsonResponse({
+                "detail": "Доступ к аккаунту ограничен. Обратитесь к менеджеру AutoTerra." if client.status in ("blocked", "archived") else "Ваша регистрация получена. После проверки менеджером мы уведомим вас.",
+                "code": "account_not_active", "status": client.status,
+            }, status=403)
+        if not client.distributor_id or not client.distributor.is_active:
+            return None, JsonResponse({"detail": "Региональный дистрибьютор недоступен"}, status=403)
+        return client, None
     except ClientProfile.DoesNotExist:
         return None, JsonResponse({"detail": "Профиль клиента не создан в admin"}, status=403)
 
@@ -638,7 +657,7 @@ def _require_distributor_scope(request):
     user = _current_user(request)
     if user is None:
         return None, False, JsonResponse({"detail": "Unauthorized"}, status=401)
-    if user.is_staff or user.is_superuser:
+    if _is_user_global(user):
         return None, True, None
         
     role = getattr(user, "profile", None).role if hasattr(user, "profile") else "unknown"
@@ -646,7 +665,7 @@ def _require_distributor_scope(request):
         return None, False, JsonResponse({"detail": "Нет доступа дистрибьютора"}, status=403)
 
     distributor = getattr(user, "distributor_profile", None)
-    if distributor is None:
+    if distributor is None or not distributor.is_active:
         return None, False, JsonResponse({"detail": "Профиль дистрибьютора не создан в admin"}, status=403)
     return distributor, False, None
 
@@ -654,7 +673,7 @@ def _require_distributor_scope(request):
 def _is_courier_user(user):
     if not user:
         return False
-    if user.is_staff or user.is_superuser:
+    if _is_user_global(user):
         return True
     return getattr(user, "profile", None) and user.profile.role == "courier"
 
@@ -665,13 +684,13 @@ def _require_courier_scope(request):
         return None, False, JsonResponse({"detail": "Unauthorized"}, status=401)
     if not _is_courier_user(user):
         return None, False, JsonResponse({"detail": "Нет доступа курьера"}, status=403)
-    return user, bool(user.is_staff or user.is_superuser), None
+    return user, bool(_is_user_global(user)), None
 
 
 def _is_expert_user(user):
     if not user:
         return False
-    if user.is_staff or user.is_superuser:
+    if _is_user_global(user):
         return True
     return getattr(user, "profile", None) and user.profile.role == "ai_expert"
 
@@ -682,7 +701,7 @@ def _require_expert_scope(request):
         return None, False, JsonResponse({"detail": "Unauthorized"}, status=401)
     if not _is_expert_user(user):
         return None, False, JsonResponse({"detail": "Нет доступа эксперта"}, status=403)
-    return user, bool(user.is_staff or user.is_superuser), None
+    return user, bool(_is_user_global(user)), None
 
 
 def _scope_courier_tasks(user, is_admin):
@@ -704,7 +723,7 @@ def _append_task_history(task, status, user=None, comment=""):
 
 def _scope_clients(distributor, is_admin):
     qs = ClientProfile.objects.select_related("distributor", "manager", "user", "region")
-    return qs if is_admin else qs.filter(region__distributor=distributor)
+    return qs if is_admin else qs.filter(distributor=distributor)
 
 
 def _scope_purchases(distributor, is_admin):
@@ -849,6 +868,9 @@ def _format_client(client):
         "distributorId": str(client.distributor_id),
         "managerId": str(client.manager_id) if client.manager_id else None,
         "registrationSource": client.registration_source,
+        "email": client.user.email,
+        "address": "; ".join(client.stores.values_list("address", flat=True)),
+        "distributorName": client.distributor.name if client.distributor else "",
         "status": client.status,
         "partnerStatus": client.partner_status,
         "referralCode": client.referral_code,
@@ -945,7 +967,7 @@ def _format_order_item(item):
     elif product.status == "onOrder":
         available = None  # товар под заказ — остаток не ограничивает
     else:
-        available = product.quantity
+        available = product.quantity + item.reserved_quantity
 
     return {
         "id": str(item.id),
@@ -1330,7 +1352,7 @@ def register(request):
     try:
         with transaction.atomic():
             # Создаем пользователя
-            user = User.objects.create_user(username=username, password=password)
+            user = User.objects.create_user(username=username, password=password, email=validated_data["email"])
             
             # Создаем профиль
             client = ClientProfile.objects.create(
@@ -1373,6 +1395,7 @@ def register(request):
             "code": "server_error"
         }, status=500)
 
+    AuditLog.objects.create(user=user, action='Client registered with consent', model_name='ClientProfile', object_id=str(client.pk), changes={'termsAccepted': True, 'personalDataConsent': True})
     # Письмо — уже после коммита: SMTP не должен держать транзакцию открытой,
     # и уведомление не должно уйти по клиенту, чья запись откатилась.
     _send_registration_email(client)
@@ -1386,7 +1409,7 @@ def register(request):
         "status": "success",
         "token": token,
         "client": _format_client(client),
-        "requires_approval": status == "under_review",
+        "requires_approval": status != "active",
         "pendingReferral": _format_pending_claim(pending_claim) if pending_claim else None,
     }, status=201)
 
@@ -1416,13 +1439,13 @@ def login(request):
             matches.append(normalized)
             
         user = User.objects.filter(username__in=matches).first()
-        if user is None or not user.check_password(password):
+        if user is None or not user.is_active or not user.check_password(password):
             return JsonResponse({"detail": "Неверный логин или пароль"}, status=401)
 
     token = secrets.token_hex(24)
     AuthToken.objects.create(key=token, user=user)
 
-    role = getattr(user, "profile", None).role if hasattr(user, "profile") else "client"
+    role = _resolve_role(user)
     
     if role == "client":
         try:
@@ -1473,7 +1496,7 @@ def password_reset(request):
     if user is None:
         return JsonResponse({"detail": "Аккаунт с такими данными не найден"}, status=404)
 
-    role = getattr(user, "profile", None).role if hasattr(user, "profile") else "client"
+    role = _resolve_role(user)
     account_inn = None
     if role == "client":
         client = getattr(user, "client_profile", None)
@@ -1484,6 +1507,23 @@ def password_reset(request):
 
     if account_inn != inn:
         return JsonResponse({"detail": "Аккаунт с такими данными не найден"}, status=404)
+
+    from django.contrib.auth.tokens import default_token_generator
+    code = str(payload.get('code') or '').strip()
+    if not code:
+        if not user.email:
+            return JsonResponse({'detail': 'Для восстановления пароля обратитесь к менеджеру: email не указан.'}, status=400)
+        from django.core.mail import send_mail
+        try:
+            send_mail('Восстановление пароля AutoTerra',
+                      f'Код для восстановления пароля (действует 15 минут):\n{default_token_generator.make_token(user)}',
+                      settings.DEFAULT_FROM_EMAIL, [user.email])
+        except Exception:
+            logger.exception('Password reset email failed for user=%s', user.pk)
+            return JsonResponse({'detail': 'Не удалось отправить код. Попробуйте позднее.'}, status=503)
+        return JsonResponse({'status': 'code_sent', 'detail': 'Введите код из письма на email вашего аккаунта.'})
+    if not default_token_generator.check_token(user, code):
+        return JsonResponse({'detail': 'Код недействителен или истёк. Запросите новый.'}, status=400)
 
     user.set_password(new_password)
     user.save(update_fields=["password"])
@@ -1811,14 +1851,19 @@ def order_detail(request, order_id):
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
 
-    role = getattr(getattr(user, "profile", None), "role", "client")
+    role = _resolve_role(user)
     if role == "client":
-        allowed = getattr(getattr(user, "client_profile", None), "id", None) == order.client_id
-    elif role in ("distributor", "operator"):
+        client, err = _require_client(request)
+        if err:
+            return err
+        allowed = client.pk == order.client_id
+    elif role == "distributor":
         distributor = getattr(user, "distributor_profile", None)
-        allowed = distributor is not None and distributor.id == order.distributor_id
+        allowed = distributor is not None and distributor.is_active and distributor.id == order.distributor_id
+    elif role == "manager":
+        allowed = user.managed_regions.filter(pk=order.client.region_id).exists()
     else:
-        allowed = role in ("admin", "manager")
+        allowed = _is_user_global(user)
 
     if not allowed:
         return JsonResponse({"detail": "Нет доступа к заказу"}, status=403)
@@ -1854,59 +1899,48 @@ def create_order(request):
         if store is None:
             return JsonResponse({"detail": "Указанный магазин не найден"}, status=400)
 
-    with transaction.atomic():
-        order = Order.objects.create(
-            client=client, 
-            store=store, 
-            distributor=client.distributor, 
-            delivery_method=payload.get("deliveryMethod", "courier"),
-            comment=(payload.get("comment") or "").strip()
-        )
+    if payload.get("deliveryMethod", "courier") not in dict(Order.DELIVERY_CHOICES):
+        return JsonResponse({"detail": "Некорректный способ доставки"}, status=400)
+    quantities = {}
+    try:
+        if not isinstance(items, list):
+            raise ValueError
         for raw in items:
-            product = Product.objects.filter(id=raw.get("productId"), distributor=client.distributor, is_active=True).first()
-            if product:
-                qty = int(raw.get("quantity") or 1)
-                
-                # STOCK VALIDATION
-                # If NOT onOrder, check if we have enough quantity
-                if product.status != "onOrder" and product.quantity < qty:
-                    transaction.set_rollback(True)
-                    return JsonResponse({
-                        "detail": f"Недостаточно товара '{product.name}' на складе. Доступно: {product.quantity}"
-                    }, status=400)
+            pid = int(raw["productId"])
+            qty = raw["quantity"]
+            if isinstance(qty, bool) or str(qty) != str(int(qty)) or not 0 < int(qty) <= 1000000:
+                raise ValueError
+            quantities[pid] = quantities.get(pid, 0) + int(qty)
+    except (ValueError, TypeError, KeyError, OverflowError):
+        return JsonResponse({"detail": "Количество должно быть положительным целым числом"}, status=400)
 
-                OrderItem.objects.create(
-                    order=order, 
-                    product=product, 
-                    sku=product.sku, 
-                    name=product.name, 
-                    category=product.category, 
-                    brand=product.brand, 
-                    volume=product.volume,
-                    price=price_for_client(client, product),
-                    quantity=qty
-                )
-                
-                # Update quantity
-                product.quantity = max(0, product.quantity - qty)
-                if product.quantity > 5:
-                    product.status = "inStock"
-                elif product.quantity > 0:
-                    product.status = "low"
-                else:
-                    # If it was already onOrder, keep it onOrder (allowing further backorders)
-                    # Otherwise, it becomes outOfStock
-                    if product.status != "onOrder":
-                        product.status = "outOfStock"
-                product.save(update_fields=["quantity", "status"])
+    with transaction.atomic():
+        products_by_id = {p.pk: p for p in Product.objects.select_for_update(of=("self",)).filter(
+            pk__in=quantities, distributor=client.distributor, is_active=True,
+        ).order_by("pk")}
+        if len(products_by_id) != len(quantities):
+            return JsonResponse({"detail": "Товар недоступен у вашего дистрибьютора"}, status=400)
+        for pid, qty in quantities.items():
+            product = products_by_id[pid]
+            if product.status == "outOfStock" or (product.status != "onOrder" and product.quantity < qty):
+                return JsonResponse({"detail": f"Недостаточно товара '{product.name}'. Доступно: {product.quantity}"}, status=400)
+        order = Order.objects.create(
+            client=client, store=store, distributor=client.distributor,
+            delivery_method=payload.get("deliveryMethod", "courier"),
+            comment=(payload.get("comment") or "").strip(),
+        )
+        from .services.stock import reserve_product
+        for pid, qty in quantities.items():
+            product = products_by_id[pid]
+            reserved = reserve_product(product, qty)
+            OrderItem.objects.create(
+                order=order, product=product, sku=product.sku, name=product.name,
+                category=product.category, brand=product.brand, volume=product.volume,
+                price=price_for_client(client, product), quantity=qty, reserved_quantity=reserved,
+            )
+        _log_audit(request, "Order created", order)
 
-    _notify(
-        getattr(client.distributor, "user", None),
-        "Новый заказ",
-        f"{client.company_name}: новый заказ ({order.items.count()} поз.)",
-        "order",
-        link="/distributor",
-    )
+    _notify_operator_order(order, f"Новый заказ ORD-{order.pk:05d}", f"{client.company_name} оформила заказ на {order.total_amount} ₽")
     _send_order_email(order)
     return JsonResponse({"order": _format_order(order)}, status=201)
 
@@ -1919,7 +1953,7 @@ def cancel_order(request, order_id):
     if err:
         return err
     
-    order = client.orders.select_for_update().filter(id=order_id).first()
+    order = client.orders.select_for_update(of=("self",)).filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
     if order.payments.filter(status__in=["pending", "waiting_for_capture"]).exists():
@@ -1950,17 +1984,8 @@ def cancel_order(request, order_id):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _restore_order_stock(order):
-    """Вернуть остатки на склад по всем позициям заказа."""
-    for item in order.items.select_related("product").all():
-        product = item.product
-        if product is None:
-            continue
-        product.quantity += item.quantity
-        if product.quantity > 5:
-            product.status = "inStock"
-        elif product.quantity > 0:
-            product.status = "low"
-        product.save(update_fields=["quantity", "status"])
+    from .services.stock import restore_order_stock
+    return restore_order_stock(order)
 
 
 def _search_products(qs, query):
@@ -1995,7 +2020,9 @@ def _notify_client_order(order, title, body):
 
 
 def _notify_operator_order(order, title, body):
-    _notify(getattr(order.distributor, "user", None), title, body, "order", link="/distributor")
+    recipients = User.objects.filter(Q(pk=order.distributor.user_id) | Q(profile__role='admin') | Q(is_superuser=True), is_active=True).distinct()
+    for recipient in recipients:
+        _notify(recipient, title, body, 'order', link=f'/orders/{order.pk}/review')
 
 
 def _client_email_list(order):
@@ -2031,7 +2058,7 @@ def confirm_order(request, order_id):
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
         return err
-    order = _scope_orders(distributor, is_admin).select_for_update().filter(id=order_id).first()
+    order = _scope_orders(distributor, is_admin).select_for_update(of=("self",)).filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
     if order.payments.filter(status__in=["pending", "waiting_for_capture"]).exists():
@@ -2040,16 +2067,10 @@ def confirm_order(request, order_id):
     if not order.can_transition_to("confirmed"):
         return JsonResponse({"detail": f"Нельзя подтвердить заказ в статусе «{order.get_status_display()}»"}, status=400)
 
-    # Предупреждение о нехватке остатков (не блокирует — оператор решает сам,
-    # но по умолчанию не даём подтвердить дефицитный заказ без ?force=1)
-    shortages = _stock_shortages(
-        [(item.product, item.quantity) for item in order.items.select_related("product").all() if item.product]
-    )
-    if shortages and request.GET.get("force") != "1":
-        return JsonResponse({
-            "detail": "Недостаточно остатков по некоторым позициям. Скорректируйте заказ или подтвердите принудительно (force=1).",
-            "shortages": shortages,
-        }, status=409)
+    # Остаток уже зарезервирован при создании заказа. Оператор не может
+    # принять изменения за клиента.
+    if order.status != "new":
+        return JsonResponse({"detail": "Изменения должен принять клиент"}, status=400)
 
     old_status = order.status
     order.status = "confirmed"
@@ -2080,7 +2101,7 @@ def adjust_order(request, order_id):
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
         return err
-    order = _scope_orders(distributor, is_admin).select_for_update().filter(id=order_id).first()
+    order = _scope_orders(distributor, is_admin).select_for_update(of=("self",)).filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
     if order.payments.filter(status__in=["pending", "waiting_for_capture"]).exists():
@@ -2100,7 +2121,10 @@ def adjust_order(request, order_id):
     qty_by_item = {}
     for row in updates:
         try:
-            qty_by_item[int(row.get("itemId"))] = max(0, int(row.get("quantity") or 0))
+            quantity = row.get("quantity")
+            if isinstance(quantity, bool) or str(quantity) != str(int(quantity)) or int(quantity) < 0:
+                raise ValueError
+            qty_by_item[int(row.get("itemId"))] = int(quantity)
         except (TypeError, ValueError):
             return JsonResponse({"detail": "Некорректные данные позиции"}, status=400)
 
@@ -2109,12 +2133,17 @@ def adjust_order(request, order_id):
     for row in additions:
         try:
             product_id = int(row.get("productId"))
-            quantity = int(row.get("quantity") or 0)
+            raw_quantity = row.get("quantity")
+            if isinstance(raw_quantity, bool) or str(raw_quantity) != str(int(raw_quantity)) or int(raw_quantity) <= 0:
+                raise ValueError
+            quantity = int(raw_quantity)
         except (TypeError, ValueError):
             return JsonResponse({"detail": "Некорректные данные новой позиции"}, status=400)
         if quantity > 0:
             qty_by_new_product[product_id] = qty_by_new_product.get(product_id, 0) + quantity
 
+    if set(qty_by_item) - set(order.items.values_list('pk', flat=True)):
+        return JsonResponse({'detail': 'Позиция не принадлежит заказу'}, status=400)
     original_snapshot = _items_snapshot(order)
 
     with transaction.atomic():
@@ -2123,7 +2152,7 @@ def adjust_order(request, order_id):
                 continue
             new_qty = qty_by_item[item.id]
             delta = item.quantity - new_qty  # >0 → вернуть на склад, <0 → списать ещё
-            product = item.product
+            product = Product.objects.select_for_update(of=("self",)).get(pk=item.product_id)
 
             if delta < 0 and product is not None:
                 # оператор увеличил количество — проверяем остаток
@@ -2134,25 +2163,22 @@ def adjust_order(request, order_id):
                         "detail": f"Недостаточно «{product.name}» на складе. Доступно: {product.quantity}"
                     }, status=400)
 
-            if product is not None:
-                product.quantity = max(0, product.quantity + delta)
-                if product.quantity > 5:
-                    product.status = "inStock"
-                elif product.quantity > 0:
-                    product.status = "low"
-                elif product.status != "onOrder":
-                    product.status = "outOfStock"
-                product.save(update_fields=["quantity", "status"])
-
+            from .services.stock import reserve_product, release_product
+            if delta > 0:
+                released = min(delta, item.reserved_quantity)
+                release_product(product, released)
+                item.reserved_quantity -= released
+            elif delta < 0:
+                item.reserved_quantity += reserve_product(product, -delta)
             if new_qty == 0:
                 item.delete()
             elif new_qty != item.quantity:
                 item.quantity = new_qty
-                item.save(update_fields=["quantity"])
+                item.save(update_fields=["quantity", "reserved_quantity"])
 
         # Добавление товаров, которых клиент не выбирал
         for product_id, quantity in qty_by_new_product.items():
-            product = Product.objects.filter(
+            product = Product.objects.select_for_update(of=("self",)).filter(
                 id=product_id, distributor=order.distributor, is_active=True
             ).first()
             if product is None:
@@ -2160,17 +2186,19 @@ def adjust_order(request, order_id):
                 return JsonResponse(
                     {"detail": "Товар недоступен у этого дистрибьютора"}, status=400
                 )
-            if product.status != "onOrder" and product.quantity < quantity:
+            if product.status == "outOfStock" or (product.status != "onOrder" and product.quantity < quantity):
                 transaction.set_rollback(True)
                 return JsonResponse({
                     "detail": f"Недостаточно «{product.name}» на складе. Доступно: {product.quantity}"
                 }, status=400)
 
             # Тот же товар уже в заказе — наращиваем позицию, а не плодим дубль.
+            reserved = reserve_product(product, quantity)
             existing = order.items.filter(product=product).first()
             if existing:
                 existing.quantity += quantity
-                existing.save(update_fields=["quantity"])
+                existing.reserved_quantity += reserved
+                existing.save(update_fields=["quantity", "reserved_quantity"])
             else:
                 OrderItem.objects.create(
                     order=order,
@@ -2184,16 +2212,8 @@ def adjust_order(request, order_id):
                     # по рангу клиента, а не базовая из прайса.
                     price=price_for_client(order.client, product),
                     quantity=quantity,
+                    reserved_quantity=reserved,
                 )
-
-            product.quantity = max(0, product.quantity - quantity)
-            if product.quantity > 5:
-                product.status = "inStock"
-            elif product.quantity > 0:
-                product.status = "low"
-            elif product.status != "onOrder":
-                product.status = "outOfStock"
-            product.save(update_fields=["quantity", "status"])
 
         if not order.items.exists():
             transaction.set_rollback(True)
@@ -2229,7 +2249,7 @@ def reject_order(request, order_id):
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
         return err
-    order = _scope_orders(distributor, is_admin).select_for_update().filter(id=order_id).first()
+    order = _scope_orders(distributor, is_admin).select_for_update(of=("self",)).filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
     if order.payments.filter(status__in=["pending", "waiting_for_capture"]).exists():
@@ -2262,7 +2282,7 @@ def accept_adjustment(request, order_id):
     client, err = _require_client(request)
     if err:
         return err
-    order = client.orders.select_for_update().filter(id=order_id).first()
+    order = client.orders.select_for_update(of=("self",)).filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
     if order.payments.filter(status__in=["pending", "waiting_for_capture"]).exists():
@@ -2289,7 +2309,7 @@ def ship_order(request, order_id):
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
         return err
-    order = _scope_orders(distributor, is_admin).select_for_update().filter(id=order_id).first()
+    order = _scope_orders(distributor, is_admin).select_for_update(of=("self",)).filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
     if order.payments.filter(status__in=["pending", "waiting_for_capture"]).exists():
@@ -2358,7 +2378,7 @@ def _mark_order_paid(order, payment):
 def _prepare_order_payment(client, order_id, payload):
     from api.services import payments as pay
 
-    order = client.orders.select_for_update().filter(id=order_id).first()
+    order = client.orders.select_for_update(of=("self",)).filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
     if order.status not in Order.PAYABLE_STATUSES:
@@ -2433,8 +2453,8 @@ def _apply_provider_payment(payment_id, response):
     from api.services import payments as pay, bonuses
 
     initial = Payment.objects.get(pk=payment_id)
-    order = Order.objects.select_for_update().get(pk=initial.order_id)
-    payment = Payment.objects.select_for_update().get(pk=payment_id)
+    order = Order.objects.select_for_update(of=("self",)).get(pk=initial.order_id)
+    payment = Payment.objects.select_for_update(of=("self",)).get(pk=payment_id)
     pay.validate_payment(payment, response)
     # An older response must never undo a terminal result (webhook/GET races).
     if payment.status in ("succeeded", "canceled"):
@@ -2464,8 +2484,8 @@ def _create_provider_payment(payment):
     from api.services import payments as pay
 
     with transaction.atomic():
-        Order.objects.select_for_update().get(pk=payment.order_id)
-        payment = Payment.objects.select_for_update().get(pk=payment.pk)
+        Order.objects.select_for_update(of=("self",)).get(pk=payment.order_id)
+        payment = Payment.objects.select_for_update(of=("self",)).get(pk=payment.pk)
         if payment.status in ("succeeded", "canceled"):
             return payment
         already_sent = payment.raw_response.get("dispatched", False)
@@ -2522,8 +2542,8 @@ def pay_order(request, order_id):
         # rejection of POST can release this attempt and its reserved bonus.
         if not payment.provider_payment_id:
             with transaction.atomic():
-                Order.objects.select_for_update().get(pk=payment.order_id)
-                payment = Payment.objects.select_for_update().get(pk=payment.pk)
+                Order.objects.select_for_update(of=("self",)).get(pk=payment.order_id)
+                payment = Payment.objects.select_for_update(of=("self",)).get(pk=payment.pk)
                 if payment.status == "pending" and not payment.provider_payment_id:
                     payment.status = "canceled"
                     payment.save(update_fields=["status"])
@@ -2957,6 +2977,10 @@ def courier_update_task_status(request, task_id):
         if not comment:
             comment = payload.get("courier_comment")
 
+    if status and status not in dict(CourierTask.STATUS_CHOICES):
+        return JsonResponse({'detail': 'Некорректный статус'}, status=400)
+    if status == 'delivered' and task.order_id and task.order.status != 'shipped':
+        return JsonResponse({'detail': 'Заказ ещё не отправлен'}, status=400)
     if status:
         task.status = status
         _append_task_history(task, status, user)
@@ -2969,6 +2993,9 @@ def courier_update_task_status(request, task_id):
         task.proof_photo = request.FILES["proof_photo"]
 
     task.save()
+    if task.status == 'delivered' and task.order_id and task.order.status == 'shipped':
+        task.order.status = 'fulfilled'
+        task.order.save(update_fields=['status'])
     return JsonResponse({"task": _format_courier_task(task)})
 
 
@@ -3000,8 +3027,16 @@ def distributors(request):
     is_global = _is_user_global(user, profile)
     
     qs = Distributor.objects.all()
-    if not is_global and profile and profile.role == "manager":
-        qs = qs.filter(managed_regions__manager=user)
+    if not is_global:
+        if profile and profile.role == "manager":
+            qs = qs.filter(managed_regions__manager=user)
+        elif profile and profile.role == "distributor":
+            qs = qs.filter(user=user)
+        else:
+            client, err = _require_client(request)
+            if err:
+                return err
+            qs = qs.filter(pk=client.distributor_id)
         
     return JsonResponse(paginated_response(
         request,
@@ -3020,10 +3055,10 @@ def _resolve_role(user):
     """
     profile = getattr(user, "profile", None)
     role = getattr(profile, "role", None)
+    if user.is_superuser:
+        return "admin"
     if role:
         return role
-    if user.is_superuser or user.is_staff:
-        return "admin"
     return "client"
 
 
@@ -3043,7 +3078,7 @@ def _require_manager_scope(request):
     profile = getattr(user, "profile", None)
     is_global = _is_user_global(user, profile)
     
-    if profile and profile.role in ["manager", "admin"] or user.is_staff or user.is_superuser:
+    if is_global or (profile and profile.role == "manager"):
         return user, is_global, None
         
     return None, False, JsonResponse({"detail": "Нет доступа менеджера"}, status=403)
@@ -3120,7 +3155,7 @@ def _clients_for_export(request, user):
             return None, err
         return _scope_clients(distributor, is_admin), None
 
-    if role in ("manager", "admin") or user.is_staff or user.is_superuser:
+    if role in ("manager", "admin") or user.is_superuser:
         manager, is_global, err = _require_manager_scope(request)
         if err:
             return None, err
@@ -3775,10 +3810,20 @@ def admin_analytics(request):
     if distributor_id:
         client_qs = client_qs.filter(distributor_id=distributor_id)
         purchase_qs = purchase_qs.filter(distributor_id=distributor_id)
-        # ticket_qs = ticket_qs.filter(client__distributor_id=distributor_id) # ExpertTicket doesn't direct link to dist?
+        ticket_qs = ticket_qs.filter(client__distributor_id=distributor_id)
         order_qs = order_qs.filter(distributor_id=distributor_id)
         sync_log_qs = sync_log_qs.filter(distributor_id=distributor_id)
 
+    for param, lookup in [('dateFrom', 'gte'), ('dateTo', 'lte')]:
+        if request.GET.get(param):
+            value = _date(request.GET[param])
+            if not value:
+                return JsonResponse({'detail': 'Некорректный период'}, status=400)
+            purchase_qs = purchase_qs.filter(**{f'date__{lookup}': value})
+            order_qs = order_qs.filter(**{f'created_at__date__{lookup}': value})
+    paid_orders = order_qs.filter(status__in=['paid', 'shipped', 'fulfilled'])
+    paid_turnover = OrderItem.objects.filter(order__in=paid_orders).aggregate(total=Sum(F('price') * F('quantity')))['total'] or 0
+    verified_turnover = purchase_qs.filter(status='verified').aggregate(total=Sum('total_amount'))['total'] or 0
     total_clients = client_qs.count()
     total_purchases_month = purchase_qs.filter(
         status="verified", 
@@ -3856,7 +3901,14 @@ def admin_analytics(request):
 
     return JsonResponse({
         "totalClients": total_clients,
-        "monthlyTurnover": float(total_purchases_month),
+        "monthlyTurnover": float(total_purchases_month + (OrderItem.objects.filter(order__in=paid_orders, order__created_at__gte=start_of_month).aggregate(total=Sum(F('price') * F('quantity')))['total'] or 0)),
+        "turnover": float(paid_turnover + verified_turnover),
+        "pendingRegistrations": client_qs.filter(status__in=['new', 'under_review']).count(),
+        "activeClients": client_qs.filter(status='active').count(),
+        "paidOrders": paid_orders.count(),
+        "pendingPurchases": purchase_qs.filter(status='pending_verification').count(),
+        "colorLab": ColorRequest.objects.filter(client__in=client_qs).exclude(status__in=['issued', 'cancelled']).count(),
+        "deliveries": CourierTask.objects.filter(client__in=client_qs).exclude(status__in=['delivered', 'cancelled', 'returned']).count(),
         "newOrders": new_orders_month,
         "openTickets": active_tickets,
         "syncSuccessRate": round(sync_success_rate, 1),
@@ -4097,9 +4149,25 @@ def distributor_orders(request):
     
     qs = _scope_orders(distributor, is_admin).order_by("-created_at")
 
-    status_filter = request.GET.get("status")
-    if status_filter:
-        qs = qs.filter(status=status_filter)
+    for param, field in [('status', 'status'), ('region', 'client__region_id'), ('distributor', 'distributor_id'), ('client', 'client_id')]:
+        value = request.GET.get(param)
+        if value:
+            if param != 'status' and not value.isdigit():
+                return JsonResponse({'detail': 'Некорректный фильтр'}, status=400)
+            qs = qs.filter(**{field: value})
+    for param, lookup in [('dateFrom', 'created_at__date__gte'), ('dateTo', 'created_at__date__lte')]:
+        if request.GET.get(param):
+            value = _date(request.GET[param])
+            if not value:
+                return JsonResponse({'detail': 'Некорректная дата'}, status=400)
+            qs = qs.filter(**{lookup: value})
+    search = (request.GET.get('search') or '').strip()
+    if search:
+        number = search.upper().removeprefix('ORD-')
+        condition = Q(client__company_name__icontains=search) | Q(client__inn__icontains=search)
+        if number.isdigit():
+            condition |= Q(pk=int(number))
+        qs = qs.filter(condition)
 
     return JsonResponse(paginated_response(request, qs, _format_order))
 
@@ -4137,6 +4205,12 @@ def distributor_update_delivery_status(request, task_id):
     courier_id = payload.get("courierId")
     reason = payload.get("reason")
     
+    if status and status not in dict(CourierTask.STATUS_CHOICES):
+        return JsonResponse({'detail': 'Некорректный статус'}, status=400)
+    if status == 'delivered' and task.order_id and task.order.status != 'shipped':
+        return JsonResponse({'detail': 'Заказ ещё не отправлен'}, status=400)
+    if courier_id and not User.objects.filter(pk=courier_id, profile__role='courier', is_active=True).exists():
+        return JsonResponse({'detail': 'Курьер не найден'}, status=400)
     old_status = task.status
     if status:
         task.status = status
@@ -4152,6 +4226,9 @@ def distributor_update_delivery_status(request, task_id):
 
     _append_task_history(task, task.status, _current_user(request), f"Обновлено дистрибьютором. Статус: {task.status}, Курьер: {courier_id}")
     task.save()
+    if task.status == 'delivered' and task.order_id and task.order.status == 'shipped':
+        task.order.status = 'fulfilled'
+        task.order.save(update_fields=['status'])
 
     # Раньше назначение курьера на задачу возврата закрывало заявку Color Lab
     # («Выдана»). Возврат курьером отменён — готовое маляр забирает сам, и
@@ -4169,7 +4246,7 @@ def distributor_update_order_status(request, order_id):
     if err:
         return err
     
-    order = _scope_orders(distributor, is_admin).select_for_update().filter(id=order_id).first()
+    order = _scope_orders(distributor, is_admin).select_for_update(of=("self",)).filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
     if order.payments.filter(status__in=["pending", "waiting_for_capture"]).exists():
@@ -4182,7 +4259,7 @@ def distributor_update_order_status(request, order_id):
     courier_id = payload.get("courier_id")
     estimated_delivery_date = payload.get("estimated_delivery_date")
 
-    if status not in ["new", "accepted", "rejected", "fulfilled"]:
+    if status not in ["rejected", "fulfilled"]:
         return JsonResponse({"detail": "Некорректный статус"}, status=400)
 
     if not order.can_transition_to(status):
@@ -4192,22 +4269,12 @@ def distributor_update_order_status(request, order_id):
     if status == "rejected" and reason:
         order.rejection_reason = reason
         
-    # Restore stock if order was NOT rejected before but IS rejected now
-    if status == "rejected" and old_status != "rejected":
-        with transaction.atomic():
-            for item in order.items.all():
-                product = item.product
-                product.quantity += item.quantity
-                if product.quantity > 5:
-                    product.status = "inStock"
-                elif product.quantity > 0:
-                    product.status = "low"
-                # Else stays onOrder or whatever it was
-                product.save(update_fields=["quantity", "status"])
-        
+    if status == "rejected":
+        _restore_order_stock(order)
+
     if courier_id:
         try:
-            courier = User.objects.get(id=courier_id)
+            courier = User.objects.get(id=courier_id, is_active=True, profile__role="courier")
             order.courier = courier
         except User.DoesNotExist:
             pass
@@ -4227,6 +4294,7 @@ def distributor_update_order_status(request, order_id):
 
     _log_audit(request, f"Order status change: {old_status} -> {status}", order, {"reason": reason})
     _send_order_status_email(order, old_status, status)
+    _notify_client_order(order, "Статус заказа", f"Заказ ORD-{order.pk:05d}: {order.get_status_display()}")
 
     return JsonResponse({"order": _format_order(order)})
 
@@ -4290,26 +4358,48 @@ def distributor_stock_upload(request):
     if is_admin:
         return JsonResponse({"detail": "Admin must specify distributorId"}, status=400)
     items = _json(request).get("items", [])
-    with transaction.atomic():
-        for raw in items:
-            defaults = {
-                "name": raw.get("name"),
-                "category": raw.get("category"),
-                "brand": raw.get("brand", "AutoTerra"),
-                "price": _money_value(raw.get("price")),
-                "quantity": int(raw.get("quantity", 0)),
-                "status": raw.get("status", "inStock"),
-            }
-            # Фото передаём только если ключ есть — иначе не затираем уже
-            # загруженные из Excel ссылки.
-            if "images" in raw:
-                defaults["images"] = normalize_product_images(raw.get("images"))
-            Product.objects.update_or_create(
-                distributor=distributor,
-                sku=raw.get("sku"),
-                defaults=defaults,
-            )
-    return JsonResponse({"status": "ok", "processed": len(items)})
+    if not isinstance(items, list) or not items:
+        return JsonResponse({'detail': 'Передайте список товаров'}, status=400)
+    created = updated = 0
+    errors = []
+    for index, raw in enumerate(items, 1):
+        try:
+            sku = str(raw.get('sku') or '').strip()
+            if not sku:
+                raise ValueError('SKU обязателен')
+            defaults = {}
+            for field in ('name', 'category', 'brand', 'description', 'external_id'):
+                if field in raw:
+                    defaults[field] = raw[field]
+            if 'price' in raw:
+                price = coerce_decimal(raw['price'], 12, 2)
+                if price is None or price < 0:
+                    raise ValueError('Некорректная цена')
+                defaults['price'] = price
+            if 'quantity' in raw:
+                quantity = raw['quantity']
+                if isinstance(quantity, bool) or str(quantity) != str(int(quantity)) or int(quantity) < 0:
+                    raise ValueError('Некорректный остаток')
+                defaults['quantity'] = int(quantity)
+            if 'status' in raw:
+                if raw['status'] not in dict(Product.STOCK_CHOICES):
+                    raise ValueError('Некорректный статус')
+                defaults['status'] = raw['status']
+            if 'images' in raw:
+                defaults['images'] = normalize_product_images(raw['images'])
+            if 'videoUrl' in raw:
+                defaults['video_url'] = raw['videoUrl']
+            if 'isActive' in raw:
+                defaults['is_active'] = _bool(raw['isActive'])
+            with transaction.atomic():
+                product, was_created = Product.objects.update_or_create(distributor=distributor, sku=sku, defaults=defaults)
+                _log_audit(request, 'Stock updated', product, {'fields': list(defaults)})
+            created += int(was_created)
+            updated += int(not was_created)
+        except (ValueError, TypeError, IntegrityError):
+            errors.append(f'Строка {index}: некорректные данные товара')
+    return JsonResponse({'status': 'ok', 'processed': created + updated, 'created': created, 'updated': updated, 'errors': errors}, status=200 if created + updated else 400)
+
 
 
 @csrf_exempt
@@ -4358,7 +4448,18 @@ def distributor_reports(request):
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
         return err
-    return JsonResponse({"summary": "Stock and order reports will be here"})
+    orders = _scope_orders(distributor, is_admin)
+    clients = _scope_clients(distributor, is_admin)
+    products = _scope_products(distributor, is_admin)
+    paid = orders.filter(status__in=['paid', 'shipped', 'fulfilled'])
+    turnover = OrderItem.objects.filter(order__in=paid).aggregate(total=Sum(F('price') * F('quantity')))['total'] or 0
+    return JsonResponse({
+        'clients': clients.count(), 'orders': orders.count(),
+        'newOrders': orders.filter(status='new').count(), 'paidOrders': paid.count(),
+        'turnover': float(turnover), 'products': products.count(),
+        'stockQuantity': products.aggregate(total=Sum('quantity'))['total'] or 0,
+        'pendingPurchases': _scope_purchases(distributor, is_admin).filter(status='pending_verification').count(),
+    })
 
 
 # Referral Views
@@ -4644,6 +4745,13 @@ def learning_materials(request):
     user = _current_user(request)
     if user is None:
         return JsonResponse({"detail": "Unauthorized"}, status=401)
+    if _resolve_role(user) == 'client':
+        _, err = _require_client(request)
+        if err:
+            return err
+
+    if user is None:
+        return JsonResponse({"detail": "Unauthorized"}, status=401)
 
     qs = LearningMaterial.objects.all()
     if not _is_expert_user(user):
@@ -4766,6 +4874,13 @@ def expert_answer_ticket(request, ticket_id):
 @require_GET
 def knowledge_cards(request):
     user = _current_user(request)
+    if user is None:
+        return JsonResponse({"detail": "Unauthorized"}, status=401)
+    if _resolve_role(user) == 'client':
+        _, err = _require_client(request)
+        if err:
+            return err
+
     # Check if user is expert to see drafts
     if _is_expert_user(user):
         # Эксперту неодобренные карточки показываем первыми. Сортировка должна
@@ -4856,6 +4971,9 @@ def register_device_token(request):
         return JsonResponse({"detail": "platform must be 'android' or 'ios'"}, status=400)
 
     from api.models import UserDeviceToken
+    if payload.get('remove') is True:
+        UserDeviceToken.objects.filter(user=user, token=token).delete()
+        return JsonResponse({'status': 'removed'})
 
     obj, created = UserDeviceToken.objects.update_or_create(
         token=token,
@@ -5021,7 +5139,10 @@ def manager_clients(request):
         status_filter = request.GET.get('status')
         category_filter = request.GET.get('category')
         region_filter = request.GET.get('region')
-        if status_filter:
+        pending_count = qs.filter(status__in=['new', 'under_review']).count()
+        if status_filter == 'pending':
+            qs = qs.filter(status__in=['new', 'under_review'])
+        elif status_filter:
             qs = qs.filter(status=status_filter)
         if category_filter:
             qs = qs.filter(category=category_filter.lower())
@@ -5032,7 +5153,7 @@ def manager_clients(request):
         if search:
             qs = qs.filter(Q(company_name__icontains=search) | Q(inn__icontains=search))
 
-        return JsonResponse(paginated_response(request, qs, _format_manager_client))
+        return JsonResponse(paginated_response(request, qs, _format_manager_client, extra={"pendingCount": pending_count}))
 
     if request.method == 'POST':
         user, is_global, err = _require_manager_scope(request)
@@ -5192,11 +5313,13 @@ def manager_client_status(request, client_id):
     if new_status not in valid_statuses:
         return JsonResponse({'detail': f'Недопустимый статус. Допустимые: {valid_statuses}'}, status=400)
 
+    old_status = client.status
     client.status = new_status
     if new_status == 'active' and not client.distributor and client.region and client.region.distributor:
         client.distributor = client.region.distributor
 
     client.save(update_fields=['status', 'distributor'])
+    _log_audit(request, 'Client status changed', client, {'before': old_status, 'after': new_status})
     return JsonResponse({'client': _format_manager_client(client)})
 
 
@@ -5258,7 +5381,10 @@ def manager_tasks(request):
         if not is_global:
             qs = qs.filter(manager=user)
         status_filter = request.GET.get('status')
-        if status_filter:
+        pending_count = qs.filter(status__in=['new', 'under_review']).count()
+        if status_filter == 'pending':
+            qs = qs.filter(status__in=['new', 'under_review'])
+        elif status_filter:
             qs = qs.filter(status=status_filter)
         return JsonResponse(paginated_response(request, qs, _format_manager_task))
 
@@ -5379,6 +5505,13 @@ def _score_card(query_words, card):
 @require_POST
 def ai_chat(request):
     user = _current_user(request)
+    if user is None:
+        return JsonResponse({"detail": "Unauthorized"}, status=401)
+    if _resolve_role(user) == 'client':
+        _, err = _require_client(request)
+        if err:
+            return err
+
     if not user:
         return JsonResponse({"detail": "Unauthorized"}, status=401)
     
@@ -5454,7 +5587,7 @@ def ai_chat(request):
 def admin_managers(request):
     """GET — list all users with manager role (for admin task assignment)."""
     user = _current_user(request)
-    if user is None or not (getattr(getattr(user, 'profile', None), 'role', None) in ('admin',) or user.is_staff or user.is_superuser):
+    if user is None or not (getattr(getattr(user, 'profile', None), 'role', None) in ('admin',) or user.is_superuser):
         return JsonResponse({'detail': 'Нет доступа'}, status=403)
 
     if request.method != 'GET':
@@ -5483,7 +5616,7 @@ def admin_managers(request):
 def admin_manager_tasks(request):
     """GET — list all manager tasks. POST — create a task for a specific manager."""
     user = _current_user(request)
-    if user is None or not (getattr(getattr(user, 'profile', None), 'role', None) in ('admin',) or user.is_staff or user.is_superuser):
+    if user is None or not (getattr(getattr(user, 'profile', None), 'role', None) in ('admin',) or user.is_superuser):
         return JsonResponse({'detail': 'Нет доступа'}, status=403)
 
     if request.method == 'GET':
@@ -5492,7 +5625,10 @@ def admin_manager_tasks(request):
         if manager_id:
             qs = qs.filter(manager_id=manager_id)
         status_filter = request.GET.get('status')
-        if status_filter:
+        pending_count = qs.filter(status__in=['new', 'under_review']).count()
+        if status_filter == 'pending':
+            qs = qs.filter(status__in=['new', 'under_review'])
+        elif status_filter:
             qs = qs.filter(status=status_filter)
         return JsonResponse(paginated_response(request, qs, _format_manager_task))
 
@@ -5543,7 +5679,7 @@ def admin_manager_tasks(request):
 def admin_manager_task_detail(request, task_id):
     """DELETE — remove a task (admin only)."""
     user = _current_user(request)
-    if user is None or not (getattr(getattr(user, 'profile', None), 'role', None) in ('admin',) or user.is_staff or user.is_superuser):
+    if user is None or not (getattr(getattr(user, 'profile', None), 'role', None) in ('admin',) or user.is_superuser):
         return JsonResponse({'detail': 'Нет доступа'}, status=403)
 
     task = get_object_or_404(ManagerTask.objects.select_related('client', 'manager'), id=task_id)
@@ -5559,7 +5695,7 @@ def admin_manager_task_detail(request, task_id):
 def admin_manager_clients(request, manager_id):
     """GET — list clients accessible to a specific manager."""
     user = _current_user(request)
-    if user is None or not (getattr(getattr(user, 'profile', None), 'role', None) in ('admin',) or user.is_staff or user.is_superuser):
+    if user is None or not (getattr(getattr(user, 'profile', None), 'role', None) in ('admin',) or user.is_superuser):
         return JsonResponse({'detail': 'Нет доступа'}, status=403)
     if request.method != 'GET':
         return JsonResponse({'detail': 'Method not allowed'}, status=405)

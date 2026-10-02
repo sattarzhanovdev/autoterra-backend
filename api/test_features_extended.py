@@ -30,7 +30,7 @@ class ExtendedFeaturesTests(TestCase):
         self.client_user = User.objects.create_user(username="+79001112233", password="password")
         self.client_user.profile.role = "client"
         self.client_user.profile.save()
-        self.client_profile = ClientProfile.objects.create(
+        self.client_profile = ClientProfile.objects.create(status="active", 
             user=self.client_user,
             inn="1234567890",
             company_name="Auto Shop",

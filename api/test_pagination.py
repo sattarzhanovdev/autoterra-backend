@@ -20,7 +20,7 @@ class PaginationTests(TestCase):
         cls.user = User.objects.create_user(username="+79001112233", password="pass12345")
         cls.user.profile.role = "client"
         cls.user.profile.save()
-        cls.client_profile = ClientProfile.objects.create(
+        cls.client_profile = ClientProfile.objects.create(status="active", 
             user=cls.user,
             inn="1234567890",
             company_name="ООО Тест",

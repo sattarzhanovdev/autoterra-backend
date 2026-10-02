@@ -2,7 +2,7 @@ import json
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from django.core.exceptions import ValidationError
-from django.core.validators import RegexValidator
+from django.core.validators import RegexValidator, validate_email
 from .models import ClientProfile, Region, Purchase, Distributor
 
 
@@ -38,7 +38,7 @@ class BaseSerializer:
 
 class RegistrationSerializer(BaseSerializer):
     def is_valid(self):
-        username = self.data.get('username')
+        username = str(self.data.get('username') or '').strip()
         password = self.data.get('password')
         inn_raw = self.data.get('inn', '')
         # Нормализация ИНН: оставляем только цифры
@@ -48,6 +48,15 @@ class RegistrationSerializer(BaseSerializer):
         company_name = self.data.get('company_name', '').strip()
         contact_name = self.data.get('contact_name', '').strip()
         store_address = self.data.get('store_address', '').strip()
+
+        email = str(self.data.get('email') or '').strip()
+        try:
+            validate_email(email)
+        except ValidationError:
+            self.errors['email'] = 'Введите корректный email'
+        for field in ('termsAccepted', 'personalDataConsent'):
+            if self.data.get(field) is not True:
+                self.errors[field] = 'Необходимо согласие'
 
         if not username:
             self.errors['username'] = "Введите номер телефона"
@@ -68,12 +77,13 @@ class RegistrationSerializer(BaseSerializer):
             return False
 
         try:
-            region = Region.objects.get(id=region_id)
+            region = Region.objects.get(id=region_id, is_active=True, distributor__is_active=True)
         except (Region.DoesNotExist, ValueError):
             self.errors['region_id'] = "Регион не найден"
             return False
 
         self.validated_data = {
+            'email': email,
             'username': username,
             'password': password,
             'inn': inn,

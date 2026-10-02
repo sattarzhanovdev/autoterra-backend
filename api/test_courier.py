@@ -18,15 +18,19 @@ class CourierApiTests(TestCase):
         # 2. Курьер А
         self.courier_a = User.objects.create_user(username="+79001111111", password="password")
         self.courier_a.groups.add(self.courier_group)
+        self.courier_a.profile.role = "courier"
+        self.courier_a.profile.save()
         self.token_a = AuthToken.objects.create(key="token-a", user=self.courier_a)
         
         # 3. Курьер Б
         self.courier_b = User.objects.create_user(username="+79002222222", password="password")
         self.courier_b.groups.add(self.courier_group)
+        self.courier_b.profile.role = "courier"
+        self.courier_b.profile.save()
         self.token_b = AuthToken.objects.create(key="token-b", user=self.courier_b)
         
         # 4. Профиль клиента (для создания задач)
-        self.client_profile = ClientProfile.objects.create(
+        self.client_profile = ClientProfile.objects.create(status="active", 
             user=User.objects.create_user(username="client_user"),
             inn="1234567890", company_name="Client", region=self.region, 
             distributor=self.distributor, phone="111", city="Msk",

@@ -24,7 +24,7 @@ class OrderDeliveryFlowTests(TestCase):
         self.region = Region.objects.create(code="77", name="Msk", distributor=self.distributor)
 
         client_user = User.objects.create_user(username="+79001110000", password="pw")
-        self.client_profile = ClientProfile.objects.create(
+        self.client_profile = ClientProfile.objects.create(status="active", 
             user=client_user, inn="5556667778", company_name="Автосервис",
             contact_name="Иван Иванов", phone="+79001110000",
             region=self.region, city="Москва", distributor=self.distributor,
@@ -132,6 +132,9 @@ class OrderDeliveryFlowTests(TestCase):
         self.assertEqual(response.status_code, 200, response.content)
         task.refresh_from_db()
         self.assertEqual(task.status, "in_progress")
+
+        order.status = "shipped"
+        order.save(update_fields=["status"])
 
         # «Завершить доставку»
         response = self.http.post(

@@ -24,7 +24,7 @@ class ApiRegistrationAndPurchaseTests(TestCase):
         
     def test_registration_success(self):
         """Тест регистрации: валидные данные -> статус 201"""
-        data = {
+        data = {"email": "client@example.com", "termsAccepted": True, "personalDataConsent": True, 
             "username": "+79001112233",
             "password": "Password123",
             "inn": "1234567890",
@@ -61,7 +61,7 @@ class ApiRegistrationAndPurchaseTests(TestCase):
     def test_password_reset_updates_client_password(self):
         """Тест: клиент может сбросить пароль по телефону и ИНН."""
         user = User.objects.create_user(username="+79005556677", password="OldPass123")
-        ClientProfile.objects.create(
+        ClientProfile.objects.create(status="active", 
             user=user,
             inn="1234567890",
             company_name="Password Reset Client",
@@ -72,12 +72,14 @@ class ApiRegistrationAndPurchaseTests(TestCase):
             contact_name="Reset Contact"
         )
 
+        from django.contrib.auth.tokens import default_token_generator
         response = self.client.post(
             "/api/auth/password-reset/",
             data=json.dumps({
                 "phone": "+79005556677",
                 "inn": "1234567890",
                 "new_password": "NewPass123",
+                "code": default_token_generator.make_token(user),
             }),
             content_type="application/json"
         )
@@ -102,7 +104,7 @@ class ApiRegistrationAndPurchaseTests(TestCase):
         # 1. Создаем пользователя и токен для авторизации
         user = User.objects.create_user(username="+79998887766", password="password")
         token = AuthToken.objects.create(key="test-token", user=user)
-        client_profile = ClientProfile.objects.create(
+        client_profile = ClientProfile.objects.create(status="active", 
             user=user,
             inn="9998887766",
             company_name="Purchase Client",

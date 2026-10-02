@@ -72,7 +72,7 @@ class TurnoverTests(TestCase):
         )
         self.region = Region.objects.create(code="77", name="Msk", distributor=self.distributor)
         user = User.objects.create_user(username="+79001110000", password="pw")
-        self.client_profile = ClientProfile.objects.create(
+        self.client_profile = ClientProfile.objects.create(status="active", 
             user=user, inn="5556667778", company_name="Автосервис",
             contact_name="Иван", phone="+79001110000",
             region=self.region, city="Москва", distributor=self.distributor,
@@ -137,7 +137,7 @@ class TierSyncTests(TestCase):
 
     def _client(self, username, inn, status="Базовый"):
         user = User.objects.create_user(username=username, password="pw")
-        return ClientProfile.objects.create(
+        return ClientProfile.objects.create(status="active", 
             user=user, inn=inn, company_name=f"Компания {username}",
             partner_status=status, contact_name="Иван", phone="+79001110000",
             region=self.region, city="Москва", distributor=self.distributor,
@@ -209,7 +209,7 @@ class RecalcCommandTests(TestCase):
         )
         self.region = Region.objects.create(code="77", name="Msk", distributor=self.distributor)
         user = User.objects.create_user(username="+79001110000", password="pw")
-        self.client_profile = ClientProfile.objects.create(
+        self.client_profile = ClientProfile.objects.create(status="active", 
             user=user, inn="5556667778", company_name="Автосервис",
             contact_name="Иван", phone="+79001110000",
             region=self.region, city="Москва", distributor=self.distributor,

@@ -20,7 +20,7 @@ class DecimalGuardTests(TestCase):
             user=self.dist_user, name="Dist", inn="1", phone="1", email="d@e.co"
         )
         self.region = Region.objects.create(code="77", name="Москва", distributor=self.distributor)
-        self.profile = ClientProfile.objects.create(
+        self.profile = ClientProfile.objects.create(status="active", 
             user=User.objects.create_user(username="client_user"),
             inn="1234567890", company_name="C", region=self.region,
             distributor=self.distributor, phone="1", city="Москва", contact_name="N",

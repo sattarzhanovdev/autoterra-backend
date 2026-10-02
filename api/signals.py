@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 @receiver(pre_save, sender="api.ColorRequest")
 def _color_request_pre_save(sender, instance, **kwargs) -> None:
+    if kwargs.get("raw"):
+        return
     """Stash the current persisted status before the save overwrites it."""
     if instance.pk is None:
         instance._pre_status = None
@@ -39,6 +41,8 @@ def _color_request_pre_save(sender, instance, **kwargs) -> None:
 
 @receiver(post_save, sender="api.ColorRequest")
 def _color_request_post_save(sender, instance, created, **kwargs) -> None:
+    if kwargs.get("raw"):
+        return
     if created:
         return  # New requests don't need a status-change notification
 
@@ -60,6 +64,8 @@ def _color_request_post_save(sender, instance, created, **kwargs) -> None:
 
 @receiver(pre_save, sender="api.CourierTask")
 def _courier_task_pre_save(sender, instance, **kwargs) -> None:
+    if kwargs.get("raw"):
+        return
     """Stash current courier_id and status so we can detect what changed."""
     if instance.pk is None:
         # New task — no previous courier
@@ -78,6 +84,8 @@ def _courier_task_pre_save(sender, instance, **kwargs) -> None:
 
 @receiver(post_save, sender="api.CourierTask")
 def _courier_task_post_save(sender, instance, created, **kwargs) -> None:
+    if kwargs.get("raw"):
+        return
     old_courier_id = getattr(instance, "_pre_courier_id", None)
 
     # Fire only when courier transitions None → <User>
@@ -111,6 +119,8 @@ def _courier_task_post_save(sender, instance, created, **kwargs) -> None:
 
 @receiver(pre_save, sender="api.ExpertTicket")
 def _expert_ticket_pre_save(sender, instance, **kwargs) -> None:
+    if kwargs.get("raw"):
+        return
     """Stash the persisted status to detect the moment an expert answers."""
     if instance.pk is None:
         instance._pre_ticket_status = None
@@ -125,6 +135,8 @@ def _expert_ticket_pre_save(sender, instance, **kwargs) -> None:
 
 @receiver(post_save, sender="api.ExpertTicket")
 def _expert_ticket_post_save(sender, instance, created, **kwargs) -> None:
+    if kwargs.get("raw"):
+        return
     # Один обработчик покрывает оба входа: форму вопроса и авто-эскалацию из
     # AI-чата — обе создают ExpertTicket.
     if created:
@@ -153,6 +165,8 @@ def _expert_ticket_post_save(sender, instance, created, **kwargs) -> None:
 
 @receiver(pre_save, sender="api.Referral")
 def _referral_pre_save(sender, instance, **kwargs) -> None:
+    if kwargs.get("raw"):
+        return
     """Запоминаем, было ли условие выполнено до сохранения."""
     if instance.pk is None:
         instance._pre_condition_met = False
@@ -169,6 +183,8 @@ def _referral_pre_save(sender, instance, **kwargs) -> None:
 
 @receiver(post_save, sender="api.Referral")
 def _referral_post_save(sender, instance, created, **kwargs) -> None:
+    if kwargs.get("raw"):
+        return
     was_met = getattr(instance, "_pre_condition_met", False)
 
     # Only fire on the transition False → True (never on already-met referrals)
@@ -210,25 +226,73 @@ def _accrue_for(client, context):
 
 @receiver(pre_save, sender="api.Purchase")
 def _purchase_pre_save(sender, instance, **kwargs) -> None:
+    if kwargs.get("raw"):
+        return
     _stash_status(instance, sender, "_pre_status")
 
 
 @receiver(post_save, sender="api.Purchase")
 def _purchase_post_save(sender, instance, created, **kwargs) -> None:
+    if kwargs.get("raw"):
+        return
     if getattr(instance, "_pre_status", None) == "verified":
         return  # уже была подтверждена — оборот не вырос
     if instance.status == "verified" and instance.client_id:
         _accrue_for(instance.client, f"Purchase pk={instance.pk}")
+        from api.services.tiers import sync_client_tier
+        sync_client_tier(instance.client)
 
 
 @receiver(pre_save, sender="api.Order")
 def _order_pre_save(sender, instance, **kwargs) -> None:
+    if kwargs.get("raw"):
+        return
     _stash_status(instance, sender, "_pre_order_status")
 
 
 @receiver(post_save, sender="api.Order")
 def _order_post_save(sender, instance, created, **kwargs) -> None:
+    if kwargs.get("raw"):
+        return
     if getattr(instance, "_pre_order_status", None) == "fulfilled":
         return
     if instance.status == "fulfilled" and instance.client_id:
         _accrue_for(instance.client, f"Order pk={instance.pk}")
+
+@receiver(pre_save, sender='api.ClientProfile')
+def _client_pre_save(sender, instance, **kwargs):
+    if kwargs.get("raw"):
+        return
+    _stash_status(instance, sender, '_pre_client_status')
+
+
+@receiver(post_save, sender='api.ClientProfile')
+def _client_post_save(sender, instance, created, **kwargs):
+    if kwargs.get("raw"):
+        return
+    old = getattr(instance, '_pre_client_status', None)
+    if created or old is None or old == instance.status:
+        return
+    from django.db import transaction
+    client_id, status = instance.pk, instance.status
+
+    def deliver():
+        from api.models import ClientProfile
+        from api.views import _notify
+        from django.conf import settings
+        from django.core.mail import send_mail
+        client = ClientProfile.objects.select_related('user').get(pk=client_id)
+        body = {
+            'active': 'Ваш аккаунт AutoTerra подтвержден. Теперь вы можете пользоваться каталогом и оформлять заказы.',
+            'under_review': 'Ваша регистрация получена. После проверки менеджером мы уведомим вас.',
+            'new': 'Ваша регистрация получена. После проверки менеджером мы уведомим вас.',
+            'blocked': 'Доступ к аккаунту ограничен. Обратитесь к менеджеру AutoTerra.',
+            'archived': 'Аккаунт перенесён в архив. Обратитесь к менеджеру AutoTerra.',
+        }[status]
+        _notify(client.user, 'Статус аккаунта AutoTerra', body, link='/')
+        if client.user.email:
+            try:
+                send_mail('Статус аккаунта AutoTerra', body, settings.DEFAULT_FROM_EMAIL, [client.user.email])
+            except Exception:
+                logger.exception('Client status email failed: client=%s', client_id)
+    transaction.on_commit(deliver, robust=True)

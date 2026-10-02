@@ -26,7 +26,7 @@ class ColorLabPickupTests(TestCase):
         self.distributor_token = AuthToken.objects.create(key="dist-token", user=distributor_user)
 
         client_user = User.objects.create_user(username="+79001110000", password="pw")
-        self.client_profile = ClientProfile.objects.create(
+        self.client_profile = ClientProfile.objects.create(status="active", 
             user=client_user, inn="5556667778", company_name="Автосервис",
             contact_name="Иван", phone="+79001110000",
             region=self.region, city="Москва", distributor=self.distributor,

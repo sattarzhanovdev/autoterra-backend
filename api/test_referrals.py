@@ -9,7 +9,7 @@ class ReferralAntiFraudTests(TestCase):
         self.region = Region.objects.create(code="77", name="Msk", distributor=self.distributor)
         
         self.inviter_user = User.objects.create_user(username="inviter")
-        self.inviter = ClientProfile.objects.create(
+        self.inviter = ClientProfile.objects.create(status="active", 
             user=self.inviter_user, inn="1111111111", company_name="Inviter",
             region=self.region, distributor=self.distributor,
             city="Moscow", contact_name="Boss", phone="+79000000001"
@@ -28,7 +28,7 @@ class ReferralAntiFraudTests(TestCase):
         """Проверка: регистрация реферала без покупок НЕ дает бонуса"""
         # Создаем профиль приглашенного (регистрация)
         invitee_user = User.objects.create_user(username="invitee")
-        ClientProfile.objects.create(
+        ClientProfile.objects.create(status="active", 
             user=invitee_user, inn=self.invitee_inn, company_name="Prospect",
             region=self.region, distributor=self.distributor,
             city="Moscow", contact_name="Client", phone="+79000000002"
@@ -45,7 +45,7 @@ class ReferralAntiFraudTests(TestCase):
     def test_no_bonus_on_unverified_purchase(self):
         """Проверка: покупка в статусе 'new' (не проверена) НЕ дает бонуса"""
         invitee_user = User.objects.create_user(username="invitee2")
-        invitee = ClientProfile.objects.create(
+        invitee = ClientProfile.objects.create(status="active", 
             user=invitee_user, inn=self.invitee_inn, company_name="Prospect",
             region=self.region, distributor=self.distributor,
             city="Moscow", contact_name="Client", phone="+79000000003"
@@ -69,7 +69,7 @@ class ReferralAntiFraudTests(TestCase):
         первого рубля. Сам расчёт процента — в test_referral_bonus_percent.
         """
         invitee_user = User.objects.create_user(username="invitee3")
-        invitee = ClientProfile.objects.create(
+        invitee = ClientProfile.objects.create(status="active", 
             user=invitee_user, inn=self.invitee_inn, company_name="Prospect",
             region=self.region, distributor=self.distributor,
             city="Moscow", contact_name="Client", phone="+79000000004"

@@ -22,7 +22,7 @@ class ColorRequestPaintTypeTests(TestCase):
         self.region = Region.objects.create(code="78", name="Spb", distributor=self.distributor)
 
         client_user = User.objects.create_user(username="+79005550000", password="pw")
-        self.client_profile = ClientProfile.objects.create(
+        self.client_profile = ClientProfile.objects.create(status="active", 
             user=client_user, inn="6667778889", company_name="Автосервис",
             contact_name="Иван", phone="+79005550000",
             region=self.region, city="Санкт-Петербург", distributor=self.distributor,

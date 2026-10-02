@@ -43,7 +43,7 @@ class OrderNotificationTests(TestCase):
         )
         self.cli_user.profile.role = "client"
         self.cli_user.profile.save()
-        self.client_profile = ClientProfile.objects.create(
+        self.client_profile = ClientProfile.objects.create(status="active", 
             user=self.cli_user, inn="1234567890", company_name="СТО Тест",
             region=self.region, distributor=self.distributor, phone="1",
             city="Msk", contact_name="Иван",

@@ -35,7 +35,7 @@ class NotificationTriggerTests(TestCase):
         self.region = Region.objects.create(code="77", name="Msk", distributor=self.distributor)
 
         self.client_user = User.objects.create_user(username="+79001110000", password="pw")
-        self.client_profile = ClientProfile.objects.create(
+        self.client_profile = ClientProfile.objects.create(status="active", 
             user=self.client_user, inn="5556667778", company_name="Автосервис",
             contact_name="Иван", phone="+79001110000",
             region=self.region, city="Москва", distributor=self.distributor,
@@ -271,7 +271,7 @@ class ColorRequestNotificationRegressionTests(TestCase):
         )
         region = Region.objects.create(code="77", name="Msk", distributor=distributor)
         self.user = User.objects.create_user(username="+79001110000", password="pw")
-        self.client_profile = ClientProfile.objects.create(
+        self.client_profile = ClientProfile.objects.create(status="active", 
             user=self.user, inn="5556667778", company_name="Автосервис",
             contact_name="Иван", phone="+79001110000",
             region=region, city="Москва", distributor=distributor,

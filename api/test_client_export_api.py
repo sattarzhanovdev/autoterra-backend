@@ -46,7 +46,7 @@ class ClientExportApiTests(TestCase):
 
     def _client_profile(self, company, inn, region, distributor):
         user = User.objects.create_user(username=f"+7900{inn[-6:]}", password="pw")
-        return ClientProfile.objects.create(
+        return ClientProfile.objects.create(status="active", 
             user=user, inn=inn, company_name=company, contact_name="Иван",
             phone="+79001110000", region=region, city=region.name, distributor=distributor,
         )

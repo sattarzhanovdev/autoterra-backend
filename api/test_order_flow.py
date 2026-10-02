@@ -35,7 +35,7 @@ class SafeOrderFlowTests(TestCase):
         self.cli_user = User.objects.create_user(username="cli", password="pw", email="cli@e.co")
         self.cli_user.profile.role = "client"
         self.cli_user.profile.save()
-        self.client_profile = ClientProfile.objects.create(
+        self.client_profile = ClientProfile.objects.create(status="active", 
             user=self.cli_user, inn="1234567890", company_name="СТО Тест",
             region=self.region, distributor=self.distributor, phone="1",
             city="Msk", contact_name="Иван",
@@ -62,7 +62,7 @@ class SafeOrderFlowTests(TestCase):
         OrderItem.objects.create(
             order=order, product=self.product, sku=self.product.sku, name=self.product.name,
             category=self.product.category, brand=self.product.brand, price=self.product.price,
-            quantity=qty,
+            quantity=qty, reserved_quantity=qty,
         )
         return order
 
@@ -89,16 +89,12 @@ class SafeOrderFlowTests(TestCase):
         order.refresh_from_db()
         self.assertIsNotNone(order.confirmed_at)
 
-    def test_confirm_blocked_by_stock_shortage(self):
+    def test_confirm_uses_existing_reservation(self):
         order = self._make_order(qty=2)
-        self.product.quantity = 1
+        self.product.quantity = 0
         self.product.save()
-        resp = self._post(f"/api/orders/{order.id}/confirm/", self._dist())
-        self.assertEqual(resp.status_code, 409)
-        self.assertIn("shortages", resp.json())
-        # force=1 обходит проверку
-        resp2 = self._post(f"/api/orders/{order.id}/confirm/?force=1", self._dist())
-        self.assertEqual(resp2.status_code, 200)
+        response = self._post(f"/api/orders/{order.id}/confirm/", self._dist())
+        self.assertEqual(response.status_code, 200)
 
     def test_adjust_records_history_and_restores_stock(self):
         order = self._make_order(qty=4)
@@ -191,7 +187,7 @@ class SafeOrderFlowTests(TestCase):
         item = resp.json()["order"]["items"][0]
         self.assertEqual(item["id"], str(order.items.first().id))
         self.assertEqual(item["productId"], str(self.product.id))
-        self.assertEqual(item["availableQuantity"], 10)
+        self.assertEqual(item["availableQuantity"], 12)  # free stock plus this order reservation
 
     def test_item_id_is_accepted_by_adjust(self):
         """id из выдачи должен подходить для корректировки без преобразований."""
@@ -230,7 +226,7 @@ class SafeOrderFlowTests(TestCase):
         other_user = User.objects.create_user(username="cli2", password="pw")
         other_user.profile.role = "client"
         other_user.profile.save()
-        ClientProfile.objects.create(
+        ClientProfile.objects.create(status="active", 
             user=other_user, inn="9999999999", company_name="Чужой",
             region=self.region, distributor=self.distributor, phone="2",
             city="Msk", contact_name="Пётр",

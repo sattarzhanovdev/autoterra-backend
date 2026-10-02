@@ -6,3 +6,5 @@ firebase-admin==6.6.0
 # Выгрузка списков: Excel — openpyxl, PDF — reportlab.
 # Word собирается на стандартной библиотеке (zipfile + OOXML), зависимости не нужно.
 reportlab==4.0.4
+
+psycopg[binary]>=3.2,<4

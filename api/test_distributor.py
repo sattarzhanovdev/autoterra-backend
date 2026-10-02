@@ -9,6 +9,8 @@ class DistributorApiTests(TestCase):
         
         # 1. Среда
         self.dist_user = User.objects.create_user(username="+79001110001", password="password")
+        self.dist_user.profile.role = "distributor"
+        self.dist_user.profile.save()
         self.distributor = Distributor.objects.create(
             user=self.dist_user, name="Main Dist", inn="123", phone="123", email="d@e.co"
         )
@@ -17,7 +19,7 @@ class DistributorApiTests(TestCase):
         
         # 2. Клиент
         self.client_user = User.objects.create_user(username="client_user")
-        self.client_profile = ClientProfile.objects.create(
+        self.client_profile = ClientProfile.objects.create(status="active", 
             user=self.client_user,
             inn="1234567890", 
             company_name="Test Client", 
@@ -74,6 +76,8 @@ class DistributorApiTests(TestCase):
     def test_distributor_cannot_verify_other_distributor_purchase(self):
         """Проверка: Дистрибьютор не видит/не может править покупки не своего региона"""
         other_user = User.objects.create_user(username="+79001110002", password="password")
+        other_user.profile.role = "distributor"
+        other_user.profile.save()
         other_dist = Distributor.objects.create(user=other_user, name="Other", inn="456", phone="456", email="o@e.co")
         other_token = AuthToken.objects.create(key="other-token", user=other_user)
         

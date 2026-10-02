@@ -18,9 +18,15 @@ def _load_env_file(path):
 
 _load_env_file(BASE_DIR / ".env")
 
-SECRET_KEY = os.environ.get("SECRET_KEY", "dev-autoterra-change-me")
-DEBUG = os.environ.get("DEBUG", "True").lower() in ("true", "1", "t")
-ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "*").split(",")
+DEBUG = os.environ.get("DEBUG", "False").lower() in ("true", "1", "t")
+SECRET_KEY = os.environ.get("SECRET_KEY", "dev-autoterra-change-me" if DEBUG else "")
+ALLOWED_HOSTS = [v.strip() for v in os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1" if DEBUG else "").split(",") if v.strip()]
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
+SECURE_SSL_REDIRECT = os.environ.get("SECURE_SSL_REDIRECT", str(not DEBUG)).lower() == "true"
+SECURE_HSTS_SECONDS = 31536000 if not DEBUG else 0
+CSRF_TRUSTED_ORIGINS = [v.strip() for v in os.environ.get("CSRF_TRUSTED_ORIGINS", "").split(",") if v.strip()]
+ORDER_RESERVATION_TTL_HOURS = int(os.environ.get("ORDER_RESERVATION_TTL_HOURS", "24"))
 
 # Firebase Cloud Messaging — path to the service-account JSON from Firebase Console
 FCM_SERVICE_ACCOUNT_FILE = os.environ.get(
@@ -60,23 +66,7 @@ MIDDLEWARE = [
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://localhost:8080",
-    "http://127.0.0.1:8000",
-    "http://localhost:49581",
-    "http://127.0.0.1:49581",
-    "http://89.111.132.221",
-    "http://89.111.132.221:8000",
-    "https://autoterra.ru",
-    "http://localhost:38913",
-    # Flutter web dev server
-    "http://localhost:5000",
-    "http://127.0.0.1:5000",
-    "http://localhost:8081",
-    "http://localhost:8082",
-    "http://localhost:9090",
-]
+CORS_ALLOWED_ORIGINS = [v.strip() for v in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if v.strip()]
 CORS_ALLOW_ALL_ORIGINS = DEBUG  # wildcard only when DEBUG=True (local dev)
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_METHODS = [
@@ -119,14 +109,24 @@ ELASTICSEARCH_URL = os.environ.get("ELASTICSEARCH_URL", "")
 ELASTICSEARCH_INDEX = os.environ.get("ELASTICSEARCH_INDEX", "autoterra-products")
 ELASTICSEARCH_TIMEOUT = float(os.environ.get("ELASTICSEARCH_TIMEOUT", "3"))
 
-DATABASES = {
-    "default": {
+DB_ENGINE = os.environ.get("DB_ENGINE", "sqlite3" if DEBUG else "postgresql")
+if DB_ENGINE in ("sqlite3", "django.db.backends.sqlite3"):
+    DATABASES = {"default": {
         "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
-        # Serialize short financial transactions on SQLite as well as row locks.
+        "NAME": os.environ.get("DB_NAME", str(BASE_DIR / "db.sqlite3")),
         "OPTIONS": {"transaction_mode": "IMMEDIATE", "timeout": 30},
-    }
-}
+    }}
+else:
+    DATABASES = {"default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.environ.get("DB_NAME", "autoterra"),
+        "USER": os.environ.get("DB_USER", ""),
+        "PASSWORD": os.environ.get("DB_PASSWORD", ""),
+        "HOST": os.environ.get("DB_HOST", "127.0.0.1"),
+        "PORT": os.environ.get("DB_PORT", "5432"),
+        "CONN_MAX_AGE": 60,
+        "TEST": {"CHARSET": "UTF8", "TEMPLATE": "template0"},
+    }}
 
 LANGUAGE_CODE = "ru-ru"
 TIME_ZONE = "Asia/Bishkek"
@@ -220,3 +220,5 @@ YOOKASSA_API_URL = os.environ.get("YOOKASSA_API_URL", "https://api.yookassa.ru/v
 # Куда вернётся пользователь после оплаты (deep-link в приложение или веб-страница)
 YOOKASSA_RETURN_URL = os.environ.get("YOOKASSA_RETURN_URL", "https://autoterra.shop/api/payments/yookassa/return/")
 # Webhook проверяется повторным запросом к API ЮKassa, отдельного секрета нет.
+
+PASSWORD_RESET_TIMEOUT = 15 * 60

@@ -54,7 +54,7 @@ class RankDiscountTests(TestCase):
     def _client(self, username, tier):
         RankDiscountTests._inn_counter += 1
         user = User.objects.create_user(username=username, password="pw")
-        profile = ClientProfile.objects.create(
+        profile = ClientProfile.objects.create(status="active", 
             user=user, inn=f"{5000000000 + self._inn_counter}",
             company_name=f"Компания {username}", partner_status=tier,
             contact_name="Иван", phone="+79001110000",

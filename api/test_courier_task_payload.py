@@ -18,7 +18,7 @@ class CourierTaskPayloadTests(TestCase):
         )
         self.region = Region.objects.create(code="77", name="Msk", distributor=self.distributor)
         user = User.objects.create_user(username="+79001110000", password="pw")
-        self.client_profile = ClientProfile.objects.create(
+        self.client_profile = ClientProfile.objects.create(status="active", 
             user=user, inn="5556667778", company_name="Автосервис",
             contact_name="Иван Иванов", phone="+79001110000",
             region=self.region, city="Москва", distributor=self.distributor,

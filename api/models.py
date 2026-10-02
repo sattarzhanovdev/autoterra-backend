@@ -394,7 +394,7 @@ class ClientProfile(models.Model):
             self.distributor = self.region.distributor
         
         # 2. Status logic: if INN exists in ANOTHER region, set to under_review
-        if self.inn and self.region:
+        if self._state.adding and self.inn and self.region:
             existing_other = ClientProfile.objects.filter(inn=self.inn).exclude(region=self.region).exclude(pk=self.pk)
             if existing_other.exists():
                 self.status = "under_review"
@@ -613,10 +613,10 @@ class Order(models.Model):
     # значение — множество допустимых следующих статусов. Служит единственным
     # источником правды для валидации во всех endpoint-ах заказа.
     STATUS_TRANSITIONS = {
-        "new": {"confirmed", "adjusted", "rejected", "cancelled", "accepted"},
+        "new": {"confirmed", "adjusted", "rejected", "cancelled"},
         "confirmed": {"paid", "cancelled"},
         "adjusted": {"confirmed", "cancelled"},  # confirmed = клиент согласился
-        "accepted": {"paid", "shipped", "rejected", "fulfilled", "cancelled"},  # legacy
+        "accepted": {"confirmed", "rejected", "cancelled"},  # legacy
         "rejected": set(),
         "paid": {"shipped"},
         "shipped": {"fulfilled"},
@@ -625,7 +625,7 @@ class Order(models.Model):
     }
 
     # Статусы, в которых клиент может инициировать оплату
-    PAYABLE_STATUSES = {"confirmed", "accepted"}
+    PAYABLE_STATUSES = {"confirmed"}
 
     DELIVERY_CHOICES = [
         ("courier", "Курьерская доставка"),
@@ -651,6 +651,7 @@ class Order(models.Model):
     )
     estimated_delivery_date = models.DateField("Ожидаемая дата доставки", null=True, blank=True)
 
+    stock_restored = models.BooleanField(default=False)
     confirmed_at = models.DateTimeField("Подтверждён", null=True, blank=True)
     paid_at = models.DateTimeField("Оплачен", null=True, blank=True)
     shipped_at = models.DateTimeField("Отправлен", null=True, blank=True)
@@ -685,6 +686,7 @@ class OrderItem(models.Model):
     brand = models.CharField("Бренд", max_length=128)
     volume = models.DecimalField("Объём", max_digits=8, decimal_places=2, default=0)
     price = models.DecimalField("Цена", max_digits=12, decimal_places=2, default=0)
+    reserved_quantity = models.PositiveIntegerField(default=0)
     quantity = models.PositiveIntegerField("Количество", default=1)
 
     class Meta:
@@ -1039,6 +1041,8 @@ ORDER_STATUSES_WITH_DELIVERY = ORDER_STATUSES_PAID
 
 @receiver(post_save, sender=Order)
 def manage_order_courier_task(sender, instance, created, **kwargs):
+    if kwargs.get("raw"):
+        return
     """Создаёт задачу курьеру для оплаченного заказа с курьерской доставкой.
 
     Раньше триггером был только 'accepted' — legacy-статус: заказы, идущие
@@ -1097,6 +1101,8 @@ def manage_order_courier_task(sender, instance, created, **kwargs):
 
 @receiver(post_save, sender=ColorRequest)
 def create_color_lab_courier_task(sender, instance, created, **kwargs):
+    if kwargs.get("raw"):
+        return
     if created and instance.transfer_method == 'courier':
         CourierTask.objects.create(
             client=instance.client,
@@ -1381,12 +1387,16 @@ from django.dispatch import receiver
 
 @receiver(post_save, sender=User)
 def create_user_profile(sender, instance, created, **kwargs):
+    if kwargs.get("raw"):
+        return
     if created:
         Profile.objects.get_or_create(user=instance)
 
 
 @receiver(post_save, sender=User)
 def save_user_profile(sender, instance, **kwargs):
+    if kwargs.get("raw"):
+        return
     if hasattr(instance, "profile"):
         instance.profile.save()
 
@@ -1618,6 +1628,8 @@ class ContactHistory(models.Model):
 
 @receiver(post_save, sender=ClientProfile)
 def sync_client_distributor_data(sender, instance, **kwargs):
+    if kwargs.get("raw"):
+        return
     """
     If a client's distributor is updated, migrate all historical and pending
     orders, purchases, and color requests to the new distributor.
