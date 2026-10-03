@@ -7,7 +7,7 @@ from django.core import mail
 from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.utils import timezone
-from .models import AuthToken, ClientProfile, Distributor, Notification, Order, Product, Region, Store
+from .models import AuthToken, ClientProfile, Distributor, ManagerTask, Notification, Order, Product, Region, Store
 from .services.stock import restore_order_stock
 
 
@@ -109,6 +109,48 @@ class ProductionFlowTests(TestCase):
         self.product.refresh_from_db()
         self.assertEqual(self.product.quantity, 4)
 
+    def test_backorder_adjustment_preserves_physical_reservation(self):
+        self.activate()
+        self.product.status = 'onOrder'
+        self.product.quantity = 2
+        self.product.save(update_fields=['status', 'quantity'])
+
+        order = Order.objects.get(pk=self.order(7).json()['order']['id'])
+        item = order.items.get()
+        self.assertEqual(item.reserved_quantity, 2)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.quantity, 0)
+
+        response = self.post(
+            f'/api/orders/{order.pk}/adjust/',
+            {'items': [{'itemId': item.pk, 'quantity': 6}], 'reason': 'Уменьшение'},
+            'dealer',
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        item.refresh_from_db()
+        self.product.refresh_from_db()
+        self.assertEqual(item.reserved_quantity, 2)
+        self.assertEqual(self.product.quantity, 0)
+        self.assertEqual(self.post(f'/api/orders/{order.pk}/cancel/').status_code, 200)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.quantity, 2)
+
+        order = Order.objects.get(pk=self.order(7).json()['order']['id'])
+        item = order.items.get()
+        response = self.post(
+            f'/api/orders/{order.pk}/adjust/',
+            {'items': [{'itemId': item.pk, 'quantity': 1}], 'reason': 'Частичное наличие'},
+            'dealer',
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        item.refresh_from_db()
+        self.product.refresh_from_db()
+        self.assertEqual(item.reserved_quantity, 1)
+        self.assertEqual(self.product.quantity, 1)
+        self.assertEqual(self.post(f'/api/orders/{order.pk}/cancel/').status_code, 200)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.quantity, 2)
+
     def test_expiry_and_pending_payment_guard(self):
         self.activate()
         order = Order.objects.get(pk=self.order().json()['order']['id'])
@@ -138,6 +180,81 @@ class ProductionFlowTests(TestCase):
         self.region.manager = None
         self.region.save()
         self.assertEqual(self.client.get(f'/api/orders/{order.pk}/', HTTP_AUTHORIZATION='Bearer manager').status_code, 403)
+
+    def test_manager_tasks_filter_and_regional_scope(self):
+        task = ManagerTask.objects.create(
+            client=self.customer,
+            manager=self.manager,
+            text='Позвонить клиенту',
+        )
+        response = self.client.get(
+            '/api/manager/tasks/?status=pending',
+            HTTP_AUTHORIZATION='Bearer manager',
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual([row['id'] for row in response.json()['results']], [str(task.pk)])
+        self.assertEqual(
+            self.client.get(
+                '/api/manager/tasks/?status=unknown',
+                HTTP_AUTHORIZATION='Bearer manager',
+            ).status_code,
+            400,
+        )
+
+        outsider_user = User.objects.create_user('outsider')
+        outsider = ClientProfile.objects.create(
+            user=outsider_user,
+            inn='9999999999',
+            company_name='Чужой регион',
+            region=self.region_b,
+            distributor=self.other,
+            city='B',
+            contact_name='Иван',
+            phone='2',
+            status='active',
+        )
+        response = self.post(
+            '/api/manager/tasks/',
+            {'clientId': outsider.pk, 'text': 'Нельзя'},
+            'manager',
+        )
+        self.assertEqual(response.status_code, 404)
+
+        response = self.post(
+            '/api/manager/clients/',
+            {'inn': '8888888888', 'name': 'Чужой клиент', 'regionId': self.region_b.pk},
+            'manager',
+        )
+        self.assertEqual(response.status_code, 403)
+
+        response = self.post(
+            '/api/manager/clients/',
+            {
+                'inn': '7777777777',
+                'name': 'Неверный дилер',
+                'regionId': self.region_b.pk,
+                'distributorId': self.dist.pk,
+            },
+            'admin',
+        )
+        self.assertEqual(response.status_code, 400)
+
+        response = self.post(
+            '/api/manager/clients/',
+            {
+                'inn': '6666666666',
+                'name': 'Корректный клиент',
+                'regionId': self.region_b.pk,
+                'distributorId': self.other.pk,
+                'city': 'Бишкек',
+                'phone': '+996700000001',
+                'contact': 'Тестовый контакт',
+            },
+            'admin',
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        created = ClientProfile.objects.get(pk=response.json()['client']['id'])
+        self.assertEqual(created.distributor, self.other)
 
     @patch('django.core.mail.EmailMultiAlternatives.send', side_effect=RuntimeError('smtp offline'))
     def test_smtp_failure_does_not_rollback_order(self, send):
@@ -172,6 +289,12 @@ class ProductionFlowTests(TestCase):
                 self.assertEqual(response.status_code, 200, response.content)
         order.refresh_from_db()
         self.assertEqual(order.status, 'paid')
+        self.assertTrue(any(
+            'Оплачен' in message.subject
+            and 'client@example.com' in message.to
+            and 'orders@example.com' in message.to
+            for message in mail.outbox
+        ))
         self.assertEqual(self.post(f'/api/orders/{order.pk}/pay/').status_code, 400)
         self.assertEqual(self.post(f'/api/orders/{order.pk}/ship/', token='dealer').status_code, 200)
         response = self.post(f'/api/distributor/orders/{order.pk}/status/', {'status': 'fulfilled'}, 'dealer')

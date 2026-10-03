@@ -2174,9 +2174,15 @@ def adjust_order(request, order_id):
 
             from .services.stock import reserve_product, release_product
             if delta > 0:
-                released = min(delta, item.reserved_quantity)
-                release_product(product, released)
-                item.reserved_quantity -= released
+                # Для onOrder заказанное количество может быть больше реально
+                # зарезервированного остатка. Сначала уменьшаем незарезервированную
+                # часть и возвращаем склад только когда new_qty становится меньше
+                # фактически зарезервированного количества.
+                target_reserved = min(item.reserved_quantity, new_qty)
+                released = item.reserved_quantity - target_reserved
+                if released:
+                    release_product(product, released)
+                item.reserved_quantity = target_reserved
             elif delta < 0:
                 item.reserved_quantity += reserve_product(product, -delta)
             if new_qty == 0:
@@ -5228,9 +5234,16 @@ def manager_clients(request):
             return JsonResponse({'detail': 'Регион обязателен'}, status=400)
 
         try:
-            region = Region.objects.get(id=region_id)
+            region = Region.objects.select_related('distributor').get(
+                id=region_id,
+                is_active=True,
+                distributor__is_active=True,
+            )
         except Region.DoesNotExist:
-            return JsonResponse({'detail': 'Регион не найден'}, status=404)
+            return JsonResponse({'detail': 'Активный регион с дистрибьютором не найден'}, status=404)
+
+        if not is_global and not user.managed_regions.filter(pk=region.pk).exists():
+            return JsonResponse({'detail': 'Доступ к региону запрещён'}, status=403)
 
         if ClientProfile.objects.filter(inn=inn, region=region).exists():
             return JsonResponse(
@@ -5238,14 +5251,14 @@ def manager_clients(request):
                 status=409,
             )
 
-        # Optional: manager may specify a distributor; otherwise auto-assigned from region
-        explicit_distributor = None
+        # Регион — источник истины для дистрибьютора клиента. distributorId
+        # оставляем только для обратной совместимости, но чужого дилера запрещаем.
         distributor_id = data.get('distributorId')
-        if distributor_id:
-            try:
-                explicit_distributor = Distributor.objects.get(id=distributor_id)
-            except Distributor.DoesNotExist:
-                return JsonResponse({'detail': 'Дистрибьютор не найден'}, status=404)
+        if distributor_id and str(distributor_id) != str(region.distributor_id):
+            return JsonResponse(
+                {'detail': 'Дистрибьютор не соответствует выбранному региону'},
+                status=400,
+            )
 
         phone = data.get('phone', '').strip()
         email = data.get('email', '').strip()
@@ -5280,14 +5293,11 @@ def manager_clients(request):
                     city=city,
                     contact_name=contact_name,
                     phone=phone,
-                    manager=user,
+                    manager=region.manager or (user if not is_global else None),
+                    distributor=region.distributor,
                     registration_source='manager',
                     status='new',
                 )
-                # Explicit distributor overrides auto-assign from region
-                if explicit_distributor:
-                    client.distributor = explicit_distributor
-                # save() runs auto-assign logic only when distributor is still None
                 client.save()
         except IntegrityError as exc:
             return JsonResponse({'detail': f'Ошибка: {exc}'}, status=409)
@@ -5425,16 +5435,14 @@ def manager_tasks(request):
     if request.method == 'GET':
         qs = ManagerTask.objects.select_related('client', 'manager')
         # Обычный менеджер видит только свои задачи. Глобальная роль
-        # (админ/суперадмин) заходит на тот же экран, чтобы посмотреть, как он
-        # выглядит, — и раньше получала пустой список: задачи-то заведены на
-        # других менеджеров. Показываем ей все.
+        # (админ/суперадмин) заходит на тот же экран и видит все.
         if not is_global:
             qs = qs.filter(manager=user)
         status_filter = request.GET.get('status')
-        pending_count = qs.filter(status__in=['new', 'under_review']).count()
-        if status_filter == 'pending':
-            qs = qs.filter(status__in=['new', 'under_review'])
-        elif status_filter:
+        if status_filter:
+            valid_statuses = dict(ManagerTask.STATUS_CHOICES)
+            if status_filter not in valid_statuses:
+                return JsonResponse({'detail': 'Некорректный статус задачи'}, status=400)
             qs = qs.filter(status=status_filter)
         return JsonResponse(paginated_response(request, qs, _format_manager_task))
 
@@ -5449,7 +5457,14 @@ def manager_tasks(request):
             return JsonResponse({'detail': 'Текст задачи обязателен'}, status=400)
 
         client_id = data.get('clientId')
-        client = get_object_or_404(ClientProfile, id=client_id)
+        client_qs = _filter_by_manager_scope(
+            user,
+            is_global,
+            ClientProfile.objects.select_related('region'),
+        )
+        client = client_qs.filter(id=client_id).first()
+        if client is None:
+            return JsonResponse({'detail': 'Клиент не найден в доступных регионах'}, status=404)
 
         deadline = None
         deadline_str = data.get('deadline')
