@@ -21,6 +21,7 @@ def sync_client_tier(client, allow_downgrade: bool = False) -> dict:
     """
     from api.models import ClientProfile, client_turnover, grown_partner_status, partner_tier_for_total
 
+    caller_client = client
     client = ClientProfile.objects.select_for_update().get(pk=client.pk)
     turnover = client_turnover(client)
     old = client.partner_status
@@ -31,8 +32,8 @@ def sync_client_tier(client, allow_downgrade: bool = False) -> dict:
         total_purchases=turnover,
         partner_status=new,
     )
-    client.total_purchases = turnover
-    client.partner_status = new
+    client.total_purchases = caller_client.total_purchases = turnover
+    client.partner_status = caller_client.partner_status = new
 
     if new != old:
         logger.info("Ранг клиента %s: %s → %s (оборот %s)", client.pk, old, new, turnover)

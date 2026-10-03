@@ -165,6 +165,8 @@ else:
     # No credentials configured — don't fail, just print to the console.
     EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 
+EMAIL_BACKEND = os.environ.get("EMAIL_BACKEND", EMAIL_BACKEND)
+
 DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", EMAIL_HOST_USER or "no-reply@autoterra.ru")
 
 # Where new-order notification emails are sent (comma-separated for multiple).

@@ -1,4 +1,5 @@
 import decimal
+from unittest import skipUnless
 
 from django.db import connection
 from django.test import TestCase
@@ -35,11 +36,13 @@ class DecimalGuardTests(TestCase):
                 [raw_value, self.profile.id],
             )
 
+    @skipUnless(connection.vendor == "sqlite", "SQLite corruption recovery; PostgreSQL rejects invalid numeric values on write")
     def test_oversized_value_reads_as_zero(self):
         self._poison("99999999999999")  # exceeds max_digits=12 when quantized
         obj = ClientProfile.objects.get(id=self.profile.id)
         self.assertEqual(obj.total_purchases, decimal.Decimal("0.00"))
 
+    @skipUnless(connection.vendor == "sqlite", "SQLite corruption recovery; PostgreSQL rejects invalid numeric values on write")
     def test_infinity_reads_as_zero(self):
         self._poison("Infinity")
         self.assertEqual(

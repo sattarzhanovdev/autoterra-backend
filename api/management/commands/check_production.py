@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
@@ -19,7 +20,10 @@ class Command(BaseCommand):
                 errors.append(label)
 
         check(not settings.DEBUG, 'DEBUG disabled')
-        key = settings.SECRET_KEY
+        try:
+            key = settings.SECRET_KEY
+        except ImproperlyConfigured:
+            key = ""
         check(len(key) >= 50 and len(set(key)) >= 5 and not key.startswith(('django-insecure-', 'dev-')), 'Strong SECRET_KEY configured')
         check(bool(settings.ALLOWED_HOSTS) and '*' not in settings.ALLOWED_HOSTS, 'Explicit ALLOWED_HOSTS configured')
         check(not settings.CORS_ALLOW_ALL_ORIGINS, 'CORS wildcard disabled')
@@ -44,7 +48,7 @@ class Command(BaseCommand):
             check(Region.objects.filter(is_active=True).exists(), 'Active regions exist')
             check(Distributor.objects.filter(is_active=True).exists(), 'Active distributors exist')
             check(not Region.objects.filter(is_active=True).exclude(distributor__is_active=True).exists(), 'Active regions have active distributors')
-            check(not Distributor.objects.filter(is_active=True, user__isnull=True).exists(), 'Active distributors have accounts')
+            check(not Distributor.objects.filter(is_active=True).exclude(user__is_active=True, user__profile__role='distributor').exists(), 'Active distributors have active distributor accounts')
             for region in Region.objects.filter(is_active=True, manager__isnull=True):
                 self.stdout.write(f'[WARNING] Region "{region.name}" has no manager')
         except Exception:

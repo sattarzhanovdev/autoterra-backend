@@ -207,8 +207,8 @@ DEFAULT_PARTNER_TIERS = [
 BASE_PARTNER_TIER = DEFAULT_PARTNER_TIERS[0][0]
 
 # Статусы заказа, при которых деньги уже получены. Такой заказ идёт в оборот
-# клиента и создаёт задачу курьеру. 'accepted' — legacy-статус старых заказов.
-ORDER_STATUSES_PAID = ("paid", "shipped", "fulfilled", "accepted")
+# клиента и создаёт задачу курьеру. Legacy accepted не доказывает оплату.
+ORDER_STATUSES_PAID = ("paid", "shipped", "fulfilled")
 
 
 def partner_tier_ladder():

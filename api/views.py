@@ -996,6 +996,8 @@ def _format_order(order):
         "clientId": str(order.client_id),
         "clientName": order.client.company_name,
         "clientInn": order.client.inn,
+        "clientRegion": order.client.region.name,
+        "storeAddress": order.store.address if order.store else "",
         "distributorId": str(order.distributor_id),
         "storeId": str(order.store_id) if order.store_id else None,
         "storeName": order.store.name if order.store else "Не назначен",
@@ -1911,6 +1913,8 @@ def create_order(request):
             if isinstance(qty, bool) or str(qty) != str(int(qty)) or not 0 < int(qty) <= 1000000:
                 raise ValueError
             quantities[pid] = quantities.get(pid, 0) + int(qty)
+            if quantities[pid] > 1000000:
+                raise ValueError
     except (ValueError, TypeError, KeyError, OverflowError):
         return JsonResponse({"detail": "Количество должно быть положительным целым числом"}, status=400)
 
@@ -2069,7 +2073,7 @@ def confirm_order(request, order_id):
 
     # Остаток уже зарезервирован при создании заказа. Оператор не может
     # принять изменения за клиента.
-    if order.status != "new":
+    if order.status not in ("new", "accepted"):
         return JsonResponse({"detail": "Изменения должен принять клиент"}, status=400)
 
     old_status = order.status
@@ -2122,7 +2126,7 @@ def adjust_order(request, order_id):
     for row in updates:
         try:
             quantity = row.get("quantity")
-            if isinstance(quantity, bool) or str(quantity) != str(int(quantity)) or int(quantity) < 0:
+            if isinstance(quantity, bool) or str(quantity) != str(int(quantity)) or not 0 <= int(quantity) <= 1000000:
                 raise ValueError
             qty_by_item[int(row.get("itemId"))] = int(quantity)
         except (TypeError, ValueError):
@@ -2134,16 +2138,21 @@ def adjust_order(request, order_id):
         try:
             product_id = int(row.get("productId"))
             raw_quantity = row.get("quantity")
-            if isinstance(raw_quantity, bool) or str(raw_quantity) != str(int(raw_quantity)) or int(raw_quantity) <= 0:
+            if isinstance(raw_quantity, bool) or str(raw_quantity) != str(int(raw_quantity)) or not 0 < int(raw_quantity) <= 1000000:
                 raise ValueError
             quantity = int(raw_quantity)
         except (TypeError, ValueError):
             return JsonResponse({"detail": "Некорректные данные новой позиции"}, status=400)
         if quantity > 0:
             qty_by_new_product[product_id] = qty_by_new_product.get(product_id, 0) + quantity
+            if qty_by_new_product[product_id] > 1000000:
+                return JsonResponse({"detail": "Слишком большое количество"}, status=400)
 
     if set(qty_by_item) - set(order.items.values_list('pk', flat=True)):
         return JsonResponse({'detail': 'Позиция не принадлежит заказу'}, status=400)
+    # All writers acquire product rows in the same order to avoid deadlocks.
+    product_ids = set(order.items.values_list('product_id', flat=True)) | set(qty_by_new_product)
+    list(Product.objects.select_for_update(of=('self',)).filter(pk__in=product_ids).order_by('pk'))
     original_snapshot = _items_snapshot(order)
 
     with transaction.atomic():
@@ -2359,6 +2368,7 @@ def _mark_order_paid(order, payment):
     order.status = "paid"
     order.paid_at = timezone.now()
     order.save(update_fields=["status", "paid_at"])
+    AuditLog.objects.create(action='Order paid', model_name='Order', object_id=str(order.pk), changes={'paymentId': str(payment.pk), 'provider': payment.provider})
 
     _notify_operator_order(
         order,
@@ -4305,13 +4315,20 @@ def distributor_stock(request):
     if err:
         return err
     qs = _scope_products(distributor, is_admin)
+    client = None
+    if request.GET.get('clientId'):
+        client = _scope_clients(distributor, is_admin).filter(pk=request.GET['clientId']).first()
+        if client is None:
+            return JsonResponse({'detail': 'Клиент не найден'}, status=404)
+        qs = qs.filter(distributor=client.distributor, is_active=True)
+    categories = list(qs.order_by('category').values_list('category', flat=True).distinct())
     search = (request.GET.get("search") or "").strip()
     if search:
         qs = _search_products(qs, search)
     category = (request.GET.get("category") or "").strip()
     if category:
         qs = qs.filter(category=category)
-    return JsonResponse(paginated_response(request, qs, _format_product))
+    return JsonResponse(paginated_response(request, qs, lambda p: _format_product(p, client), extra={'categories': categories}))
 
 
 @csrf_exempt
@@ -4331,6 +4348,20 @@ def distributor_add_product(request):
     if Product.objects.filter(distributor=distributor, sku=sku).exists():
         return JsonResponse({"detail": f"Товар с артикулом {sku} уже существует"}, status=400)
         
+    price = coerce_decimal(payload.get('price', 0), 12, 2)
+    volume = coerce_decimal(payload.get('volume', 0), 8, 2)
+    raw_quantity = payload.get('quantity', 0)
+    try:
+        quantity = int(raw_quantity)
+        if isinstance(raw_quantity, bool) or str(raw_quantity) != str(quantity) or quantity < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return JsonResponse({'detail': 'Некорректный остаток'}, status=400)
+    if price is None or price < 0 or volume is None or volume < 0:
+        return JsonResponse({'detail': 'Некорректная цена или объём'}, status=400)
+    status = payload.get('status', 'inStock' if quantity > 5 else 'low' if quantity else 'outOfStock')
+    if status not in dict(Product.STOCK_CHOICES):
+        return JsonResponse({'detail': 'Некорректный статус товара'}, status=400)
     product = Product.objects.create(
         distributor=distributor,
         sku=sku,
@@ -4341,11 +4372,15 @@ def distributor_add_product(request):
         # Фото — только ссылки, максимум Product.MAX_IMAGES (лишние отсекаются).
         images=normalize_product_images(payload.get("images")),
         video_url=payload.get("videoUrl") or "",
-        price=_money_value(payload.get("price")),
-        quantity=int(payload.get("quantity", 0)),
-        status=payload.get("status", "inStock")
+        price=price,
+        volume=volume,
+        external_id=payload.get("external_id"),
+        is_active=_bool(payload.get("isActive", True)),
+        quantity=quantity,
+        status=status
     )
     
+    _log_audit(request, "Product created", product)
     return JsonResponse({"status": "ok", "product": _format_product(product)})
 
 
@@ -4378,7 +4413,7 @@ def distributor_stock_upload(request):
                 defaults['price'] = price
             if 'quantity' in raw:
                 quantity = raw['quantity']
-                if isinstance(quantity, bool) or str(quantity) != str(int(quantity)) or int(quantity) < 0:
+                if isinstance(quantity, bool) or str(quantity) != str(int(quantity)) or not 0 <= int(quantity) <= 1000000:
                     raise ValueError('Некорректный остаток')
                 defaults['quantity'] = int(quantity)
             if 'status' in raw:
@@ -4433,6 +4468,7 @@ def distributor_stock_upload_file(request):
 
     with transaction.atomic():
         created, updated = upsert_products(distributor, products)
+        _log_audit(request, "Product import", distributor, {"created": created, "updated": updated, "warnings": len(errors)})
 
     return JsonResponse({
         "status": "ok",
@@ -5004,6 +5040,10 @@ def send_notification(request):
     if not target_user:
         return JsonResponse({"detail": "User not found"}, status=404)
 
+    if profile.role == 'manager' and not ClientProfile.objects.filter(user=target_user, region__manager=user).exists():
+        return JsonResponse({'detail': 'Клиент вне вашей зоны ответственности'}, status=403)
+    if profile.role == 'ai_expert' and not ExpertTicket.objects.filter(client__user=target_user).exists():
+        return JsonResponse({'detail': 'У клиента нет экспертного обращения'}, status=403)
     notification = Notification.objects.create(
         user=target_user,
         title=title,
@@ -5013,7 +5053,11 @@ def send_notification(request):
     )
 
     from api.services.push_notifications import PushNotificationService
-    push_result = PushNotificationService().send(notification)
+    try:
+        push_result = PushNotificationService().send(notification)
+    except Exception:
+        logger.exception('Push delivery failed for notification=%s', notification.pk)
+        push_result = {'sent': 0, 'failed': 1}
 
     return JsonResponse({"status": "ok", "push": push_result})
 
@@ -5122,7 +5166,13 @@ def mark_notifications_read(request):
     user = _current_user(request)
     if user is None:
         return JsonResponse({"detail": "Unauthorized"}, status=401)
-    user.notifications.filter(is_read=False).update(is_read=True)
+    qs = user.notifications.filter(is_read=False)
+    ids = _json(request).get('ids')
+    if ids is not None:
+        if not isinstance(ids, list) or any(not str(value).isdigit() for value in ids):
+            return JsonResponse({'detail': 'Некорректный список уведомлений'}, status=400)
+        qs = qs.filter(pk__in=ids)
+    qs.update(is_read=True)
     return JsonResponse({"ok": True})
 
 

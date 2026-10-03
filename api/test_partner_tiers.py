@@ -144,11 +144,13 @@ class TierSyncTests(TestCase):
         )
 
     def _purchase(self, client, amount):
-        Purchase.objects.create(
+        # Simulate historical/imported data that still needs the explicit recalculation.
+        purchase = Purchase.objects.create(
             client=client, distributor=self.distributor,
             document_number=f"D{client.id}-{amount}", date="2026-01-01",
-            total_amount=Decimal(amount), status="verified",
+            total_amount=Decimal(amount), status="pending_verification",
         )
+        Purchase.objects.filter(pk=purchase.pk).update(status="verified")
 
     def test_new_client_starts_at_base(self):
         client = self._client("c1", "1000000001")
@@ -219,6 +221,8 @@ class RecalcCommandTests(TestCase):
             document_number="D1", date="2026-01-01",
             total_amount=Decimal(600_000), status="verified",
         )
+
+        ClientProfile.objects.filter(pk=self.client_profile.pk).update(partner_status="Базовый")
 
     def _run(self, *args):
         out = StringIO()

@@ -125,6 +125,8 @@ class ColorLabPickupTests(TestCase):
         task = CourierTask.objects.get(color_request_id=created["id"])
 
         courier = User.objects.create_user(username="+79002223344", password="pw")
+        courier.profile.role = "courier"
+        courier.profile.save()
         response = self.http.post(
             f"/api/distributor/delivery-tasks/{task.id}/status/",
             data={"status": "assigned", "courierId": str(courier.id)},

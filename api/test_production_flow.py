@@ -179,3 +179,61 @@ class ProductionFlowTests(TestCase):
         self.customer.refresh_from_db()
         self.assertEqual(client_turnover(self.customer), 700)
         self.assertEqual(self.customer.partner_status, 'Silver')
+
+    def test_expiry_never_cancels_pending_or_paid_orders(self):
+        from .models import Payment
+        self.activate()
+        order = Order.objects.get(pk=self.order(2).json()['order']['id'])
+        Order.objects.filter(pk=order.pk).update(created_at=timezone.now()-timedelta(days=2), status='confirmed')
+        payment = Payment.objects.create(order=order, amount=200, status='pending')
+        call_command('expire_unpaid_orders', stdout=StringIO())
+        order.refresh_from_db()
+        self.assertEqual(order.status, 'confirmed')
+        payment.status = 'succeeded'
+        payment.save()
+        Order.objects.filter(pk=order.pk).update(status='paid')
+        call_command('expire_unpaid_orders', stdout=StringIO())
+        order.refresh_from_db()
+        self.assertEqual(order.status, 'paid')
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.quantity, 8)
+
+    def test_distributor_cannot_read_other_scope(self):
+        self.activate()
+        self.other.user = self.user('other-dealer', 'distributor')
+        self.other.save()
+        order = Order.objects.get(pk=self.order(2).json()['order']['id'])
+        for path in ('orders', 'clients', 'stock'):
+            response = self.client.get(f'/api/distributor/{path}/', HTTP_AUTHORIZATION='Bearer other-dealer')
+            self.assertEqual(response.status_code, 200, response.content)
+            ids = [item['id'] for item in response.json()['results']]
+            own_id = {'orders': order.pk, 'clients': self.customer.pk, 'stock': self.product.pk}[path]
+            self.assertNotIn(str(own_id), ids)
+        self.assertEqual(self.post(f'/api/orders/{order.pk}/confirm/', token='other-dealer').status_code, 404)
+        response = self.client.get(f'/api/distributor/stock/?clientId={self.customer.pk}', HTTP_AUTHORIZATION='Bearer other-dealer')
+        self.assertEqual(response.status_code, 404)
+
+    def test_password_reset_requires_email_challenge(self):
+        payload = {'phone': self.payload['username'], 'inn': self.payload['inn'], 'new_password': 'NewPassword123'}
+        result = self.client.post('/api/auth/password-reset/', payload, content_type='application/json')
+        self.assertEqual(result.json()['status'], 'code_sent')
+        self.customer.user.refresh_from_db()
+        self.assertTrue(self.customer.user.check_password('password123'))
+        code = mail.outbox[-1].body.strip().splitlines()[-1]
+        result = self.client.post('/api/auth/password-reset/', {**payload, 'code': code}, content_type='application/json')
+        self.assertEqual(result.status_code, 200, result.content)
+        self.customer.user.refresh_from_db()
+        self.assertTrue(self.customer.user.check_password('NewPassword123'))
+        self.assertFalse(AuthToken.objects.filter(user=self.customer.user).exists())
+        result = self.client.post('/api/auth/password-reset/', {**payload, 'code': code}, content_type='application/json')
+        self.assertEqual(result.status_code, 400)
+
+    def test_verified_purchase_automatically_upgrades_tier(self):
+        from .models import Purchase, PartnerTier
+        PartnerTier.objects.update_or_create(name='Silver', defaults={'threshold': 500})
+        self.activate()
+        purchase = Purchase.objects.create(client=self.customer, distributor=self.dist, document_number='INV-1', date='2026-10-01', total_amount=700)
+        purchase.status = 'verified'
+        purchase.save(update_fields=['status'])
+        self.customer.refresh_from_db()
+        self.assertEqual(self.customer.partner_status, 'Silver')

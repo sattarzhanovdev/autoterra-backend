@@ -187,7 +187,11 @@ class OrderItemInline(admin.TabularInline):
     model = OrderItem
     extra = 0
     fields = ("product", "sku", "name", "quantity", "price", "brand", "category", "volume")
-    readonly_fields = ("sku", "name", "brand", "category", "volume")
+    readonly_fields = fields
+    can_delete = False
+
+    def has_add_permission(self, request, obj=None):
+        return False
 
 
 class PurchaseItemInline(admin.TabularInline):
@@ -478,7 +482,13 @@ class OrderAdmin(admin.ModelAdmin):
     list_display = ("id", "client", "store", "distributor", "external_id", "status", "created_at")
     list_filter = ("status", "distributor", "store")
     search_fields = ("id", "external_id", "client__company_name", "client__inn", "store__name", "comment", "items__name", "items__sku")
-    readonly_fields = ("created_at", "confirmed_at", "paid_at", "shipped_at")
+    readonly_fields = ("client", "store", "distributor", "status", "stock_restored", "created_at", "confirmed_at", "paid_at", "shipped_at")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
     inlines = (OrderItemInline,)
 
 
@@ -494,7 +504,13 @@ class PaymentAdmin(admin.ModelAdmin):
     list_display = ("id", "order", "provider", "provider_payment_id", "amount", "currency", "status", "created_at", "paid_at")
     list_filter = ("provider", "status")
     search_fields = ("order__id", "provider_payment_id")
-    readonly_fields = ("created_at", "paid_at", "raw_response")
+    readonly_fields = tuple(field.name for field in Payment._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(Purchase)
