@@ -1,6 +1,9 @@
 """Recover delayed webhooks and creation responses lost after a network failure."""
+from datetime import timedelta
+
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from api.models import Order, Payment
@@ -17,9 +20,19 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         if not payments.is_configured():
             raise CommandError("Задайте YOOKASSA_SHOP_ID и YOOKASSA_SECRET_KEY")
-        failed = 0
-        ids = list(Payment.objects.filter(provider="yookassa",
-            status__in=["pending", "waiting_for_capture"]).order_by("created_at")
+        if options["limit"] <= 0:
+            raise CommandError("--limit должен быть положительным")
+        pending = Payment.objects.filter(provider="yookassa", status__in=["pending", "waiting_for_capture"])
+        manual = pending.filter(provider_payment_id="").filter(
+            Q(created_at__lte=timezone.now() - timedelta(hours=23))
+            | Q(idempotence_key="") | Q(raw_response__request__isnull=True)
+        )
+        # Old unknown attempts require an operator. They must not occupy every
+        # slot forever and prevent newer successful payments from being reconciled.
+        failed = manual.count()
+        if failed:
+            self.stderr.write(f"Требуют ручной сверки в ЮKassa: {failed}; новые списания по ним заблокированы")
+        ids = list(pending.exclude(pk__in=manual.values("pk")).order_by("created_at")
             .values_list("pk", flat=True)[:options["limit"]])
         for pk in ids:
             payment = Payment.objects.get(pk=pk)

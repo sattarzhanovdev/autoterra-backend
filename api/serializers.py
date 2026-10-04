@@ -38,6 +38,14 @@ class BaseSerializer:
 
 class RegistrationSerializer(BaseSerializer):
     def is_valid(self):
+        for field in ('username', 'password', 'company_name', 'contact_name', 'store_address', 'email'):
+            if not isinstance(self.data.get(field, ''), str):
+                self.errors[field] = 'Ожидается текстовое значение'
+        region_value = self.data.get('region_id')
+        if region_value is not None and (isinstance(region_value, bool) or not isinstance(region_value, (str, int))):
+            self.errors['region_id'] = 'Регион не найден'
+        if self.errors:
+            return False
         username = str(self.data.get('username') or '').strip()
         password = self.data.get('password')
         inn_raw = self.data.get('inn', '')
@@ -96,6 +104,11 @@ class RegistrationSerializer(BaseSerializer):
 
 class PurchaseSerializer(BaseSerializer):
     def is_valid(self):
+        for field in ('document_number', 'date'):
+            if not isinstance(self.data.get(field, ''), str):
+                self.errors[field] = 'Ожидается текстовое значение'
+        if self.errors:
+            return False
         doc_number = self.data.get('document_number', '').strip()
         date_str = self.data.get('date')
         amount_str = self.data.get('amount')

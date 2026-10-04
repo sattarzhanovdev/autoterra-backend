@@ -23,6 +23,7 @@ import logging
 import ssl
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 import uuid
 from decimal import Decimal, InvalidOperation
 
@@ -144,8 +145,19 @@ def validate_payment(payment, response):
     """Only authenticated provider responses with matching financial data count."""
     try:
         amount = response["amount"]
+        confirmation = response.get("confirmation")
+        if confirmation is not None and not isinstance(confirmation, dict):
+            raise ValueError("Invalid confirmation")
+        url = (confirmation or {}).get("confirmation_url")
+        if url is not None:
+            if not isinstance(url, str) or len(url) > 512:
+                raise ValueError("Invalid confirmation URL")
+            parsed = urlsplit(url)
+            if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+                raise ValueError("Invalid confirmation URL")
         valid = (
-            bool(response["id"])
+            isinstance(response["id"], str)
+            and 0 < len(response["id"]) <= 128
             and (not payment.provider_payment_id or response["id"] == payment.provider_payment_id)
             and Decimal(amount["value"]) == payment.amount
             and amount["currency"] == payment.currency
@@ -154,7 +166,7 @@ def validate_payment(payment, response):
             and response["status"] in {"pending", "waiting_for_capture", "succeeded", "canceled"}
             and (response["status"] != "succeeded" or response.get("paid") is True)
         )
-    except (KeyError, TypeError, InvalidOperation, ValueError):
+    except (KeyError, TypeError, AttributeError, InvalidOperation, ValueError):
         valid = False
     if not valid:
         raise PaymentUncertainError("Ответ ЮKassa не соответствует платежу")

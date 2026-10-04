@@ -6,7 +6,7 @@ from django.contrib.auth.models import User
 from django.db import close_old_connections, connections
 from django.test import Client, TransactionTestCase, override_settings, skipUnlessDBFeature
 
-from .models import AuthToken, ClientProfile, Distributor, Order, OrderItem, Payment, Product, Region
+from .models import AuthToken, BonusTransaction, ClientProfile, Distributor, Order, OrderItem, Payment, Product, Region
 
 
 @skipUnlessDBFeature('has_select_for_update')
@@ -63,3 +63,26 @@ class ConcurrentOrderTests(TransactionTestCase):
         self.assertEqual(Payment.objects.count(), 1)
         self.assertEqual(len({c.kwargs['idempotence_key'] for c in create.call_args_list}), 1)
         self.assertEqual(responses[0][1]['payment']['id'], responses[1][1]['payment']['id'])
+
+    def test_concurrent_bonus_refunds_are_applied_once(self):
+        from .services import bonuses
+
+        order = Order.objects.create(client=self.customer, distributor=self.customer.distributor, status='confirmed')
+        OrderItem.objects.create(order=order, product=self.product, price=100, quantity=2)
+        BonusTransaction.objects.create(client=self.customer, amount=200, kind='manual')
+        bonuses.debit_for_order(self.customer, order, 200)
+        barrier = Barrier(2)
+
+        def refund(_):
+            close_old_connections()
+            try:
+                barrier.wait(timeout=10)
+                return bonuses.refund_for_order(order)
+            finally:
+                connections.close_all()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(refund, range(2)))
+        self.assertEqual(sorted(results), [0, 200])
+        self.assertEqual(bonuses.balance(self.customer), 200)
+        self.assertEqual(BonusTransaction.objects.filter(kind='refund').count(), 1)

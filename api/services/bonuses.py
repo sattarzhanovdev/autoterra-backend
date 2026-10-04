@@ -84,9 +84,11 @@ def refund_for_order(order):
     Без этого отменённый платёж съедал бы бонус: деньги за заказ не пришли, а
     со счёта уже списано.
     """
-    from api.models import BonusTransaction
+    from api.models import BonusTransaction, ClientProfile
 
     with transaction.atomic():
+        # Serialize refunds with debits and other refunds on the same account.
+        ClientProfile.objects.select_for_update().get(pk=order.client_id)
         spent = BonusTransaction.objects.filter(order=order, kind="order").aggregate(
             total=Sum("amount")
         )["total"]

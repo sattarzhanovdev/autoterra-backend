@@ -177,3 +177,57 @@ class PaymentTests(_Base):
             self.assertEqual(self.pay().status_code, 503)
         self.assertEqual(Payment.objects.get(order=self.order).status, "pending")
         self.assertEqual(bonuses.balance(self.client_profile), Decimal(0))
+
+    def test_malformed_provider_response_preserves_attempt_and_bonus(self):
+        self._credit(200)
+        invalid = [None, [], "invalid", self.response(amount="800.00", id=123),
+                   self.response(amount="800.00", confirmation=["broken"]),
+                   self.response(amount="800.00", confirmation={"confirmation_url": "javascript:alert(1)"}),
+                   self.response(amount="800.00", confirmation={"confirmation_url": 123})]
+        for response in invalid:
+            with self.subTest(response=response), patch.object(payments, "create_payment", return_value=response):
+                self.assertEqual(self.pay(useBonus=200).status_code, 503)
+        self.assertEqual(Payment.objects.count(), 1)
+        self.assertEqual(Payment.objects.get().status, "pending")
+        self.assertEqual(bonuses.balance(self.client_profile), Decimal(0))
+
+    def test_refresh_without_confirmation_preserves_payment_link(self):
+        payment = self.pending()
+        payment.confirmation_url = "https://yoomoney.ru/pay/test"
+        payment.save()
+        response = self.response()
+        response.pop("confirmation")
+        _apply_provider_payment(payment.pk, response)
+        payment.refresh_from_db()
+        self.assertEqual(payment.confirmation_url, "https://yoomoney.ru/pay/test")
+
+    def test_terminal_response_clears_payment_link(self):
+        payment = self.pending()
+        _apply_provider_payment(payment.pk, self.response("succeeded"))
+        payment.refresh_from_db()
+        self.assertEqual(payment.confirmation_url, "")
+
+    def test_unrepresentable_order_total_does_not_debit_or_dispatch(self):
+        self._credit(200)
+        self.order.items.update(price=Decimal("9999999999.99"), quantity=2)
+        with patch.object(payments, "create_payment") as create:
+            self.assertEqual(self.pay(useBonus=200).status_code, 400)
+            create.assert_not_called()
+        self.assertFalse(Payment.objects.exists())
+        self.assertEqual(bonuses.balance(self.client_profile), Decimal(200))
+
+    def test_manual_review_attempt_does_not_starve_reconciliation_batch(self):
+        from django.core.management import call_command, CommandError
+        from io import StringIO
+
+        old_order = self._order(100)
+        old = Payment.objects.create(order=old_order, amount=100, idempotence_key="old")
+        Payment.objects.filter(pk=old.pk).update(created_at=timezone.now() - timedelta(days=2))
+        self.pending()
+        with patch.object(payments, "fetch_payment", return_value=self.response("succeeded")):
+            with self.assertRaises(CommandError):
+                call_command("reconcile_payments", limit=1, stdout=StringIO(), stderr=StringIO())
+        self.order.refresh_from_db()
+        old.refresh_from_db()
+        self.assertEqual(self.order.status, "paid")
+        self.assertEqual(old.status, "pending")

@@ -540,7 +540,8 @@ def _limit(request, qs, default_limit=50):
     except ValueError:
         limit = default_limit
         offset = 0
-    limit = min(limit, 100)
+    limit = max(0, min(limit, 100))
+    offset = max(0, offset)
     return qs[offset:offset + limit]
 
 
@@ -704,13 +705,6 @@ def _require_expert_scope(request):
     return user, bool(_is_user_global(user)), None
 
 
-def _scope_courier_tasks(user, is_admin):
-    qs = CourierTask.objects.select_related("client", "assigned_courier", "order", "color_request")
-    if is_admin:
-        return qs
-    return qs.filter(Q(assigned_courier=user) | Q(courier_id=str(user.id)) | Q(courier_id=user.username))
-
-
 def _append_task_history(task, status, user=None, comment=""):
     item = {
         "status": status,
@@ -828,10 +822,12 @@ def _create_attachments(request, related_object, files, description=""):
     content_type = ContentType.objects.get_for_model(related_object)
     uploaded_by = _current_user(request)
     attachments = []
+    files = list(files)
     for file_obj in files:
         error = _upload_error(file_obj)
         if error:
             return attachments, error
+    for file_obj in files:
         if hasattr(file_obj, "seek"):
             file_obj.seek(0)
         attachments.append(
@@ -1420,6 +1416,8 @@ def register(request):
 @require_POST
 def login(request):
     payload = _json(request)
+    if not isinstance(payload.get("phone", ""), str) or not isinstance(payload.get("password", ""), str):
+        return JsonResponse({"detail": "Некорректный логин или пароль"}, status=400)
     login_input = (payload.get("phone") or "").strip()
     password = payload.get("password") or ""
     
@@ -1478,6 +1476,9 @@ def login(request):
 @require_POST
 def password_reset(request):
     payload = _json(request)
+    if any(value is not None and not isinstance(value, str)
+           for value in (payload.get(key) for key in ("phone", "username", "inn", "new_password", "password", "code"))):
+        return JsonResponse({"detail": "Некорректные данные восстановления"}, status=400)
     login_input = (payload.get("phone") or payload.get("username") or "").strip()
     inn = _normalize_inn(payload.get("inn"))
     new_password = payload.get("new_password") or payload.get("password") or ""
@@ -1891,17 +1892,21 @@ def create_order(request):
     payload = _json(request)
     store_id = payload.get("storeId")
     items = payload.get("items") or []
+    if not isinstance(payload.get("comment", ""), str):
+        return JsonResponse({"detail": "Комментарий должен быть текстом"}, status=400)
     
     if not items:
         return JsonResponse({"detail": "Добавьте товары в заказ"}, status=400)
         
     store = None
     if store_id:
+        if isinstance(store_id, bool) or not isinstance(store_id, (str, int)) or not str(store_id).isdigit():
+            return JsonResponse({"detail": "Указанный магазин не найден"}, status=400)
         store = Store.objects.filter(id=store_id, client=client, is_active=True).first()
         if store is None:
             return JsonResponse({"detail": "Указанный магазин не найден"}, status=400)
 
-    if payload.get("deliveryMethod", "courier") not in dict(Order.DELIVERY_CHOICES):
+    if payload.get("deliveryMethod", "courier") not in [value for value, _ in Order.DELIVERY_CHOICES]:
         return JsonResponse({"detail": "Некорректный способ доставки"}, status=400)
     quantities = {}
     try:
@@ -1924,6 +1929,10 @@ def create_order(request):
         ).order_by("pk")}
         if len(products_by_id) != len(quantities):
             return JsonResponse({"detail": "Товар недоступен у вашего дистрибьютора"}, status=400)
+        prices = {pid: price_for_client(client, product) for pid, product in products_by_id.items()}
+        total = coerce_decimal(sum(prices[pid] * qty for pid, qty in quantities.items()), 12, 2)
+        if total is None or total <= 0:
+            return JsonResponse({"detail": "Некорректная сумма заказа"}, status=400)
         for pid, qty in quantities.items():
             product = products_by_id[pid]
             if product.status == "outOfStock" or (product.status != "onOrder" and product.quantity < qty):
@@ -1940,7 +1949,7 @@ def create_order(request):
             OrderItem.objects.create(
                 order=order, product=product, sku=product.sku, name=product.name,
                 category=product.category, brand=product.brand, volume=product.volume,
-                price=price_for_client(client, product), quantity=qty, reserved_quantity=reserved,
+                price=prices[pid], quantity=qty, reserved_quantity=reserved,
             )
         _log_audit(request, "Order created", order)
 
@@ -2117,6 +2126,10 @@ def adjust_order(request, order_id):
     payload = _json(request)
     updates = payload.get("items") or []
     additions = payload.get("newItems") or []
+    if (not isinstance(updates, list) or not isinstance(additions, list)
+            or any(not isinstance(row, dict) for row in updates + additions)
+            or not isinstance(payload.get("reason", ""), str)):
+        return JsonResponse({"detail": "Некорректные данные корректировки"}, status=400)
     reason = (payload.get("reason") or "").strip()
     if not updates and not additions:
         return JsonResponse({"detail": "Передайте позиции для корректировки"}, status=400)
@@ -2129,7 +2142,7 @@ def adjust_order(request, order_id):
             if isinstance(quantity, bool) or str(quantity) != str(int(quantity)) or not 0 <= int(quantity) <= 1000000:
                 raise ValueError
             qty_by_item[int(row.get("itemId"))] = int(quantity)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return JsonResponse({"detail": "Некорректные данные позиции"}, status=400)
 
     # Добавляемые товары: productId -> количество (суммируем дубли в запросе)
@@ -2141,7 +2154,7 @@ def adjust_order(request, order_id):
             if isinstance(raw_quantity, bool) or str(raw_quantity) != str(int(raw_quantity)) or not 0 < int(raw_quantity) <= 1000000:
                 raise ValueError
             quantity = int(raw_quantity)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return JsonResponse({"detail": "Некорректные данные новой позиции"}, status=400)
         if quantity > 0:
             qty_by_new_product[product_id] = qty_by_new_product.get(product_id, 0) + quantity
@@ -2233,6 +2246,12 @@ def adjust_order(request, order_id):
         if not order.items.exists():
             transaction.set_rollback(True)
             return JsonResponse({"detail": "После корректировки в заказе не осталось позиций. Отклоните заказ."}, status=400)
+
+        # Query fresh rows: the prefetched items still contain the old quantities.
+        total = coerce_decimal(sum(item.total for item in OrderItem.objects.filter(order=order)), 12, 2)
+        if total is None or total <= 0:
+            transaction.set_rollback(True)
+            return JsonResponse({"detail": "Некорректная сумма заказа"}, status=400)
 
         old_status = order.status
         order.status = "adjusted"
@@ -2401,7 +2420,8 @@ def _prepare_order_payment(client, order_id, payload):
         return JsonResponse(
             {"detail": "Оплатить можно только подтверждённый заказ"}, status=400
         )
-    if order.total_amount <= 0:
+    total = coerce_decimal(order.total_amount, 12, 2)
+    if total is None or total <= 0:
         return JsonResponse({"detail": "Сумма заказа равна нулю"}, status=400)
 
     # Переиспользуем ещё не оплаченный платёж (не создаём дубли при повторном тапе)
@@ -2477,7 +2497,11 @@ def _apply_provider_payment(payment_id, response):
         return payment
     payment.provider_payment_id = response["id"]
     payment.status = response["status"]
-    payment.confirmation_url = (response.get("confirmation") or {}).get("confirmation_url", "")
+    confirmation_url = (response.get("confirmation") or {}).get("confirmation_url")
+    if confirmation_url:
+        payment.confirmation_url = confirmation_url
+    if payment.status in ("succeeded", "canceled"):
+        payment.confirmation_url = ""
     payment.raw_response = response
     if payment.status == "succeeded":
         payment.paid_at = timezone.now()
@@ -2907,8 +2931,8 @@ def cancel_courier_task(request, task_id):
         return JsonResponse({"detail": "Нельзя отменить заявку, которая уже в работе"}, status=400)
         
     task.status = "cancelled"
-    task.save(update_fields=["status"])
     _append_task_history(task, "cancelled", client.user, "Отменено клиентом")
+    task.save(update_fields=["status", "status_history"])
     
     return JsonResponse({"status": "success"})
 
@@ -2946,9 +2970,14 @@ def courier_task_proof(request, task_id):
     if err:
         return err
     task = client.courier_tasks.filter(id=task_id).first()
-    if task:
-        files = _attachment_files(request)
-        _create_attachments(request, task, files, description="Фото подтверждение")
+    if not task:
+        return JsonResponse({"detail": "Заявка не найдена"}, status=404)
+    files = _attachment_files(request)
+    if not files:
+        return JsonResponse({"detail": "Добавьте файл подтверждения"}, status=400)
+    _, error = _create_attachments(request, task, files, description="Фото подтверждение")
+    if error:
+        return error
     return JsonResponse({"task": _format_courier_task(task)})
 
 
@@ -2968,6 +2997,17 @@ def courier_my_tasks(request):
         qs = qs.filter(status=status_filter)
 
     return JsonResponse(paginated_response(request, qs, _format_courier_task))
+
+
+def _delivery_status_error(task, status):
+    if status and status not in [value for value, _ in CourierTask.STATUS_CHOICES]:
+        return JsonResponse({'detail': 'Некорректный статус'}, status=400)
+    if status and status != task.status and task.status in ('delivered', 'returned', 'cancelled'):
+        return JsonResponse({'detail': 'Заявка уже завершена'}, status=400)
+    if status == 'delivered' and status != task.status and task.order_id and task.order.status != 'shipped':
+        return JsonResponse({'detail': 'Заказ ещё не отправлен'}, status=400)
+    return None
+
 
 @csrf_exempt
 @require_http_methods(["PATCH", "POST"])
@@ -2993,11 +3033,10 @@ def courier_update_task_status(request, task_id):
         if not comment:
             comment = payload.get("courier_comment")
 
-    if status and status not in dict(CourierTask.STATUS_CHOICES):
-        return JsonResponse({'detail': 'Некорректный статус'}, status=400)
-    if status == 'delivered' and task.order_id and task.order.status != 'shipped':
-        return JsonResponse({'detail': 'Заказ ещё не отправлен'}, status=400)
-    if status:
+    error = _delivery_status_error(task, status)
+    if error:
+        return error
+    if status and status != task.status:
         task.status = status
         _append_task_history(task, status, user)
     
@@ -3006,6 +3045,9 @@ def courier_update_task_status(request, task_id):
 
     # Обработка фото-подтверждения
     if "proof_photo" in request.FILES:
+        error = _upload_error(request.FILES["proof_photo"])
+        if error:
+            return error
         task.proof_photo = request.FILES["proof_photo"]
 
     task.save()
@@ -3019,15 +3061,25 @@ def courier_update_task_status(request, task_id):
 @require_POST
 def assign_courier_task(request, task_id):
     user, is_admin, err = _require_courier_scope(request)
+    if err:
+        return err
     if not is_admin:
         return JsonResponse({"detail": "Только администратор может назначать курьеров"}, status=403)
     courier_id = _json(request).get("courierId")
+    if not isinstance(courier_id, (str, int)) or isinstance(courier_id, bool) or not str(courier_id).isdigit():
+        return JsonResponse({"detail": "Курьер не найден"}, status=400)
+    if not User.objects.filter(pk=courier_id, profile__role="courier", is_active=True).exists():
+        return JsonResponse({"detail": "Курьер не найден"}, status=400)
     task = CourierTask.objects.filter(id=task_id).first()
-    if task:
-        task.courier_id = courier_id
-        task.status = "assigned"
-        _append_task_history(task, "assigned", user, f"Назначен курьер {courier_id}")
-        task.save(update_fields=["courier", "status", "status_history"])
+    if not task:
+        return JsonResponse({"detail": "Заявка не найдена"}, status=404)
+    error = _delivery_status_error(task, "assigned")
+    if error:
+        return error
+    task.courier_id = courier_id
+    task.status = "assigned"
+    _append_task_history(task, "assigned", user, f"Назначен курьер {courier_id}")
+    task.save(update_fields=["courier", "status", "status_history"])
     return JsonResponse({"task": _format_courier_task(task)})
 
 
@@ -4221,10 +4273,11 @@ def distributor_update_delivery_status(request, task_id):
     courier_id = payload.get("courierId")
     reason = payload.get("reason")
     
-    if status and status not in dict(CourierTask.STATUS_CHOICES):
-        return JsonResponse({'detail': 'Некорректный статус'}, status=400)
-    if status == 'delivered' and task.order_id and task.order.status != 'shipped':
-        return JsonResponse({'detail': 'Заказ ещё не отправлен'}, status=400)
+    error = _delivery_status_error(task, status)
+    if error:
+        return error
+    if courier_id and (isinstance(courier_id, bool) or not isinstance(courier_id, (str, int)) or not str(courier_id).isdigit()):
+        return JsonResponse({'detail': 'Курьер не найден'}, status=400)
     if courier_id and not User.objects.filter(pk=courier_id, profile__role='courier', is_active=True).exists():
         return JsonResponse({'detail': 'Курьер не найден'}, status=400)
     old_status = task.status
