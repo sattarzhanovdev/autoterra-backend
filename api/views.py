@@ -32,6 +32,7 @@ from .models import (
     ClientProfile,
     ColorRequest,
     CourierTask,
+    CourierPickedItem,
     Distributor,
     ExpertTicket,
     KnowledgeCard,
@@ -1154,12 +1155,23 @@ def _courier_phone(courier):
 def _format_courier_task(item):
     if not item:
         return None
+    order_items = list(item.order.items.all().order_by("pk")) if item.order_id else []
+    picked = {entry.order_item_id: entry for entry in item.picked_items.select_related("courier")}
     return {
         "id": str(item.id),
         "clientId": str(item.client_id),
         "clientName": item.client.company_name,
         "clientInn": item.client.inn,
         "orderId": str(item.order_id) if item.order_id else None,
+        "orderNumber": f"ORD-{item.order_id:05d}" if item.order_id else None,
+        "orderItems": [{
+            "id": str(order_item.pk), "name": order_item.name,
+            "sku": order_item.sku, "quantity": order_item.quantity,
+            "picked": order_item.pk in picked,
+            "pickedAt": picked[order_item.pk].picked_at.isoformat() if order_item.pk in picked else None,
+            "pickedBy": str(picked[order_item.pk].courier_id) if order_item.pk in picked else None,
+        } for order_item in order_items],
+        "allItemsPicked": bool(order_items) and all(order_item.pk in picked for order_item in order_items),
         "colorRequestId": str(item.color_request_id) if item.color_request_id else None,
         "courierId": str(item.courier_id) if item.courier_id else None,
         "courierName": item.courier.get_full_name() or item.courier.username if item.courier else None,
@@ -3009,17 +3021,47 @@ def _delivery_status_error(task, status):
         return JsonResponse({'detail': 'Заявка уже завершена'}, status=400)
     if status == 'delivered' and status != task.status and task.order_id and task.order.status != 'shipped':
         return JsonResponse({'detail': 'Заказ ещё не отправлен'}, status=400)
+    if status == 'in_progress' and status != task.status and task.task_type == 'delivery' and task.order_id:
+        if task.status != 'assigned':
+            return JsonResponse({'detail': 'Доставка ещё не назначена'}, status=409)
+        item_ids = set(task.order.items.values_list('pk', flat=True))
+        picked_ids = set(task.picked_items.filter(order_item_id__in=item_ids).values_list('order_item_id', flat=True))
+        if not item_ids or picked_ids != item_ids:
+            return JsonResponse({'detail': 'Сначала соберите все позиции заказа'}, status=409)
+    if status == 'delivered' and status != task.status and task.task_type == 'delivery' and task.order_id and task.status != 'in_progress':
+        return JsonResponse({'detail': 'Доставка ещё не в пути'}, status=409)
     return None
 
 
 @csrf_exempt
+@require_POST
+@transaction.atomic
+def courier_pick_order_item(request, task_id, item_id):
+    user, is_admin, err = _require_courier_scope(request)
+    if err:
+        return err
+    task = CourierTask.objects.select_for_update().filter(pk=task_id).first()
+    if not task:
+        return JsonResponse({"detail": "Задача не найдена"}, status=404)
+    if task.courier_id != user.pk:
+        return JsonResponse({"detail": "Нет доступа к задаче"}, status=403)
+    if task.task_type != 'delivery' or not task.order_id or task.status != 'assigned':
+        return JsonResponse({"detail": "Сборка этой доставки недоступна"}, status=409)
+    if not task.order.items.filter(pk=item_id).exists():
+        return JsonResponse({"detail": "Позиция заказа не найдена"}, status=404)
+    CourierPickedItem.objects.get_or_create(task=task, order_item_id=item_id, defaults={"courier": user})
+    return JsonResponse({"task": _format_courier_task(task)})
+
+
+@csrf_exempt
 @require_http_methods(["PATCH", "POST"])
+@transaction.atomic
 def courier_update_task_status(request, task_id):
     user, is_admin, err = _require_courier_scope(request)
     if err:
         return err
     
-    task = CourierTask.objects.filter(id=task_id).first()
+    task = CourierTask.objects.select_for_update().filter(id=task_id).first()
     if not task:
         return JsonResponse({"detail": "Задача не найдена"}, status=404)
     
@@ -3054,6 +3096,10 @@ def courier_update_task_status(request, task_id):
         task.proof_photo = request.FILES["proof_photo"]
 
     task.save()
+    if task.status == 'in_progress' and task.order_id and task.order.status == 'paid':
+        task.order.status = 'shipped'
+        task.order.shipped_at = timezone.now()
+        task.order.save(update_fields=['status', 'shipped_at'])
     if task.status == 'delivered' and task.order_id and task.order.status == 'shipped':
         task.order.status = 'fulfilled'
         task.order.save(update_fields=['status'])
@@ -3062,6 +3108,7 @@ def courier_update_task_status(request, task_id):
 
 @csrf_exempt
 @require_POST
+@transaction.atomic
 def assign_courier_task(request, task_id):
     user, is_admin, err = _require_courier_scope(request)
     if err:
@@ -3073,16 +3120,20 @@ def assign_courier_task(request, task_id):
         return JsonResponse({"detail": "Курьер не найден"}, status=400)
     if not User.objects.filter(pk=courier_id, profile__role="courier", is_active=True).exists():
         return JsonResponse({"detail": "Курьер не найден"}, status=400)
-    task = CourierTask.objects.filter(id=task_id).first()
+    task = CourierTask.objects.select_for_update().filter(id=task_id).first()
     if not task:
         return JsonResponse({"detail": "Заявка не найдена"}, status=404)
     error = _delivery_status_error(task, "assigned")
     if error:
         return error
-    task.courier_id = courier_id
-    task.status = "assigned"
-    _append_task_history(task, "assigned", user, f"Назначен курьер {courier_id}")
-    task.save(update_fields=["courier", "status", "status_history"])
+    if task.courier_id != int(courier_id) or task.status != 'assigned':
+        task.courier_id = courier_id
+        task.status = "assigned"
+        _append_task_history(task, "assigned", user, f"Назначен курьер {courier_id}")
+        task.save(update_fields=["courier", "status", "status_history"])
+        if task.order_id and task.order.courier_id != task.courier_id:
+            task.order.courier_id = task.courier_id
+            task.order.save(update_fields=['courier'])
     return JsonResponse({"task": _format_courier_task(task)})
 
 
@@ -3300,7 +3351,9 @@ def manager_dashboard(request):
 
     stats = {
         "totalClients": client_qs.count(),
-        "activeOrders": order_qs.filter(status__in=["new", "accepted"]).count(),
+        "newRegistrations": client_qs.filter(status__in=['new', 'under_review']).count(),
+        "activeOrders": order_qs.filter(status__in=["new", "accepted", "adjusted", "confirmed", "paid", "shipped"]).count(),
+        "totalOrders": order_qs.count(),
         "fulfilledOrders": order_qs.filter(status="fulfilled").count(),
         "totalTurnover": sum((o.total_amount for o in order_qs.filter(status="fulfilled").prefetch_related("items")), start=0),
         "regionalStats": [
@@ -3313,6 +3366,20 @@ def manager_dashboard(request):
     }
     
     return JsonResponse(stats)
+
+
+@require_GET
+def manager_orders(request):
+    user, is_global, err = _require_manager_scope(request)
+    if err:
+        return err
+    qs = _filter_by_manager_scope(user, is_global, Order.objects.select_related('client', 'client__region', 'store', 'distributor').prefetch_related('items'), 'client__region')
+    status = request.GET.get('status')
+    if status == 'active':
+        qs = qs.filter(status__in=['new', 'accepted', 'adjusted', 'confirmed', 'paid', 'shipped'])
+    elif status:
+        qs = qs.filter(status=status)
+    return JsonResponse(paginated_response(request, qs.order_by('-created_at'), _format_order))
 
 
 @csrf_exempt
@@ -4262,12 +4329,13 @@ def distributor_delivery_tasks(request):
 
 @csrf_exempt
 @require_POST
+@transaction.atomic
 def distributor_update_delivery_status(request, task_id):
     distributor, is_admin, err = _require_distributor_scope(request)
     if err:
         return err
     
-    task = _scope_courier_tasks(distributor, is_admin).filter(id=task_id).first()
+    task = _scope_courier_tasks(distributor, is_admin).select_for_update().filter(id=task_id).first()
     if not task:
         return JsonResponse({"detail": "Заявка не найдена"}, status=404)
         
@@ -4284,6 +4352,7 @@ def distributor_update_delivery_status(request, task_id):
     if courier_id and not User.objects.filter(pk=courier_id, profile__role='courier', is_active=True).exists():
         return JsonResponse({'detail': 'Курьер не найден'}, status=400)
     old_status = task.status
+    old_courier_id = task.courier_id
     if status:
         task.status = status
     if courier_id:
@@ -4296,8 +4365,16 @@ def distributor_update_delivery_status(request, task_id):
         # we can log it in history
         pass
 
-    _append_task_history(task, task.status, _current_user(request), f"Обновлено дистрибьютором. Статус: {task.status}, Курьер: {courier_id}")
-    task.save()
+    if task.status != old_status or task.courier_id != old_courier_id:
+        _append_task_history(task, task.status, _current_user(request), f"Обновлено дистрибьютором. Статус: {task.status}, Курьер: {courier_id}")
+        task.save()
+        if task.order_id and task.courier_id and task.order.courier_id != task.courier_id:
+            task.order.courier_id = task.courier_id
+            task.order.save(update_fields=['courier'])
+    if task.status == 'in_progress' and task.order_id and task.order.status == 'paid':
+        task.order.status = 'shipped'
+        task.order.shipped_at = timezone.now()
+        task.order.save(update_fields=['status', 'shipped_at'])
     if task.status == 'delivered' and task.order_id and task.order.status == 'shipped':
         task.order.status = 'fulfilled'
         task.order.save(update_fields=['status'])
@@ -5249,6 +5326,8 @@ def manager_clients(request):
         qs = _filter_by_manager_scope(user, is_global, qs)
 
         status_filter = request.GET.get('status')
+        if not status_filter:
+            qs = qs.exclude(status='archived')
         category_filter = request.GET.get('category')
         region_filter = request.GET.get('region')
         pending_count = qs.filter(status__in=['new', 'under_review']).count()
@@ -5396,8 +5475,21 @@ def manager_client_unified(request, client_id):
     # 6. Referrals
     referrals = [_format_referral(r) for r in _limit(request, client.referrals.all().order_by("-created_at"))]
     
+    paid_orders = client.orders.filter(status__in=['paid', 'shipped', 'fulfilled']).prefetch_related('items')
+    paid_total = sum((order.total_amount for order in paid_orders), start=Decimal('0.00'))
+    verified_total = client.purchases.filter(status='verified').aggregate(total=Sum('total_amount'))['total'] or Decimal('0.00')
+    last_order = client.orders.order_by('-created_at').first()
+
     return JsonResponse({
         "client": profile_data,
+        "stats": {
+            "orderCount": client.orders.count(),
+            "paidOrderCount": paid_orders.count(),
+            "orderTurnover": float(paid_total),
+            "purchaseTurnover": float(verified_total),
+            "averageOrder": float(paid_total / paid_orders.count()) if paid_orders.count() else 0,
+            "lastOrderAt": last_order.created_at.isoformat() if last_order else None,
+        },
         "purchases": purchases,
         "orders": orders,
         "colorRequests": color_requests,
@@ -5406,14 +5498,92 @@ def manager_client_unified(request, client_id):
     })
 
 
+def _manager_scoped_client(request, client_id):
+    user, is_global, err = _require_manager_scope(request)
+    if err:
+        return None, err
+    client = _filter_by_manager_scope(user, is_global, ClientProfile.objects.select_related('user', 'region', 'distributor')).filter(pk=client_id).first()
+    if not client:
+        return None, JsonResponse({'detail': 'Клиент не найден'}, status=404)
+    return client, None
+
+
+@require_GET
+def manager_client_orders(request, client_id):
+    client, err = _manager_scoped_client(request, client_id)
+    if err:
+        return err
+    return JsonResponse(paginated_response(request, client.orders.select_related('store', 'distributor').prefetch_related('items').order_by('-created_at'), _format_order))
+
+
+@require_GET
+def manager_client_purchases(request, client_id):
+    client, err = _manager_scoped_client(request, client_id)
+    if err:
+        return err
+    return JsonResponse(paginated_response(request, client.purchases.prefetch_related('items').order_by('-date', '-pk'), _format_purchase))
+
+
+def _has_client_history(client):
+    # The only disposable dependants are the account's authentication records.
+    # Any business relation, including future models, requires archival.
+    if _attachments_for(client).exists():
+        return True
+    if AuditLog.objects.filter(model_name__in=['ClientProfile', 'Client'], object_id=str(client.pk)).exists():
+        return True
+    for relation in client._meta.related_objects:
+        if relation.related_model._base_manager.filter(**{relation.field.name: client}).exists():
+            return True
+    for relation in client.user._meta.related_objects:
+        if relation.related_model in (ClientProfile, Profile, AuthToken):
+            continue
+        if relation.related_model._base_manager.filter(**{relation.field.name: client.user}).exists():
+            return True
+    return False
+
+
+@csrf_exempt
+@require_http_methods(['DELETE', 'POST'])
+@transaction.atomic
+def manager_client_remove(request, client_id):
+    user, is_global, err = _require_manager_scope(request)
+    if err:
+        return err
+    client = _filter_by_manager_scope(
+        user, is_global,
+        ClientProfile.objects.select_for_update().select_related('user', 'region'),
+    ).filter(pk=client_id).first()
+    if not client:
+        return JsonResponse({'detail': 'Клиент не найден'}, status=404)
+    data = _json(request)
+    if not isinstance(data, dict) or data.get('confirmName') != client.company_name:
+        return JsonResponse({'detail': 'Подтвердите точное название клиента'}, status=400)
+    if request.method == 'DELETE':
+        if _has_client_history(client):
+            return JsonResponse({'detail': 'У клиента есть история. Архивируйте учётную запись.', 'canArchive': True}, status=409)
+        account = client.user
+        account.delete()
+        return JsonResponse({'deleted': True})
+    if client.status != 'archived':
+        client.status = 'archived'
+        client.save(update_fields=['status'])
+    account = client.user
+    if account.is_active:
+        account.is_active = False
+        account.save(update_fields=['is_active'])
+    account.auth_tokens.all().delete()
+    return JsonResponse({'archived': True})
+
+
 @csrf_exempt
 @require_http_methods(['POST', 'PUT', 'PATCH'])
+@transaction.atomic
 def manager_client_status(request, client_id):
     user, is_global, err = _require_manager_scope(request)
     if err:
         return err
 
-    client = get_object_or_404(ClientProfile.objects.select_related('region', 'distributor'), id=client_id)
+    client = get_object_or_404(ClientProfile.objects.select_related('region', 'distributor', 'user').select_for_update(), id=client_id)
 
     managed_regions = _get_manager_regions(user, is_global)
     if managed_regions is not None and client.region not in managed_regions:
@@ -5435,6 +5605,13 @@ def manager_client_status(request, client_id):
         client.distributor = client.region.distributor
 
     client.save(update_fields=['status', 'distributor'])
+    if new_status == 'archived':
+        client.user.is_active = False
+        client.user.save(update_fields=['is_active'])
+        client.user.auth_tokens.all().delete()
+    elif new_status == 'active' and not client.user.is_active:
+        client.user.is_active = True
+        client.user.save(update_fields=['is_active'])
     _log_audit(request, 'Client status changed', client, {'before': old_status, 'after': new_status})
     return JsonResponse({'client': _format_manager_client(client)})
 

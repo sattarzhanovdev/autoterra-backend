@@ -1024,6 +1024,16 @@ class CourierTask(models.Model):
         return f"{self.get_task_type_display()} · {self.address}"
 
 
+class CourierPickedItem(models.Model):
+    task = models.ForeignKey(CourierTask, on_delete=models.CASCADE, related_name="picked_items")
+    order_item = models.ForeignKey(OrderItem, on_delete=models.CASCADE, related_name="courier_confirmations")
+    courier = models.ForeignKey(User, on_delete=models.PROTECT, related_name="picked_order_items")
+    picked_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["task", "order_item"], name="unique_courier_picked_item")]
+
+
 # Signals for CourierTask
 from django.db.models.signals import post_save
 from django.dispatch import receiver
@@ -1641,4 +1651,3 @@ def sync_client_distributor_data(sender, instance, **kwargs):
         instance.purchases.all().update(distributor=instance.distributor)
         # Sync color requests
         instance.color_requests.all().update(assigned_distributor=instance.distributor)
-

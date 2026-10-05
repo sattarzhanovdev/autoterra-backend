@@ -9,7 +9,7 @@
 from django.contrib.auth.models import User
 from django.test import Client, TestCase
 
-from .models import AuthToken, ClientProfile, CourierTask, Distributor, Order, Region, Store
+from .models import AuthToken, ClientProfile, CourierTask, CourierPickedItem, Distributor, Order, OrderItem, Product, Region, Store
 
 
 class OrderDeliveryFlowTests(TestCase):
@@ -118,23 +118,53 @@ class OrderDeliveryFlowTests(TestCase):
         self.assertEqual(task.courier, self.courier)
 
     def test_courier_takes_job_then_finishes(self):
-        order = self._order(status="paid", courier=self.courier)
+        order = self._order(status="paid")
         task = self._task_for(order)
+        self.assertEqual(task.status, 'created')
+        assignment = self.http.post(
+            f'/api/distributor/delivery-tasks/{task.pk}/status/',
+            {'status': 'assigned', 'courierId': str(self.courier.pk)},
+            content_type='application/json',
+            HTTP_AUTHORIZATION=f'Bearer {self.distributor_token.key}',
+        )
+        self.assertEqual(assignment.status_code, 200)
+        task.refresh_from_db()
         self.assertEqual(task.status, "assigned")
+
+        product = Product.objects.create(distributor=self.distributor, sku='P-1', name='Краска', category='Краски', price=100, quantity=10)
+        first = OrderItem.objects.create(order=order, product=product, sku='P-1', name='Краска', price=100, quantity=2)
+        second = OrderItem.objects.create(order=order, product=product, sku='P-2', name='Лак', price=50, quantity=1)
+        auth = {"HTTP_AUTHORIZATION": f"Bearer {self.courier_token.key}"}
+        listed = self.http.get('/api/courier/tasks/', **auth).json()['results'][0]
+        self.assertEqual(listed['orderNumber'], f'ORD-{order.pk:05d}')
+        self.assertEqual([(item['name'], item['sku'], item['quantity']) for item in listed['orderItems']],
+                         [('Краска', 'P-1', 2), ('Лак', 'P-2', 1)])
+
+        status_url = f"/api/courier/tasks/{task.id}/status/"
+        self.assertEqual(self.http.post(status_url, {"status": "in_progress"}, content_type="application/json", **auth).status_code, 409)
+        self.assertEqual(self.http.post(f'/api/courier/tasks/{task.pk}/items/999999/pick/', **auth).status_code, 404)
+        self.assertEqual(self.http.post(f'/api/courier/tasks/{task.pk}/items/{first.pk}/pick/',
+                                        HTTP_AUTHORIZATION=f'Bearer {self.distributor_token.key}').status_code, 403)
+        for item in (first, second):
+            pick_url = f'/api/courier/tasks/{task.pk}/items/{item.pk}/pick/'
+            self.assertEqual(self.http.post(pick_url, **auth).status_code, 200)
+            self.assertEqual(self.http.post(pick_url, **auth).status_code, 200)
+        self.assertEqual(CourierPickedItem.objects.filter(task=task).count(), 2)
+        self.assertTrue(all(entry.courier_id == self.courier.pk and entry.picked_at for entry in task.picked_items.all()))
 
         # «Взяться за работу»
         response = self.http.post(
             f"/api/courier/tasks/{task.id}/status/",
             data={"status": "in_progress"},
             content_type="application/json",
-            HTTP_AUTHORIZATION=f"Bearer {self.courier_token.key}",
+            **auth,
         )
         self.assertEqual(response.status_code, 200, response.content)
         task.refresh_from_db()
         self.assertEqual(task.status, "in_progress")
 
-        order.status = "shipped"
-        order.save(update_fields=["status"])
+        order.refresh_from_db()
+        self.assertEqual(order.status, 'shipped')
 
         # «Завершить доставку»
         response = self.http.post(
@@ -146,6 +176,11 @@ class OrderDeliveryFlowTests(TestCase):
         self.assertEqual(response.status_code, 200, response.content)
         task.refresh_from_db()
         self.assertEqual(task.status, "delivered")
+        order.refresh_from_db()
+        self.assertEqual(order.status, 'fulfilled')
+        self.assertEqual(self.http.post(status_url, {"status": "delivered"}, content_type="application/json", **auth).status_code, 200)
+        task.refresh_from_db()
+        self.assertEqual(len(task.status_history), 4)
 
         # У клиента в истории — все четыре этапа с датами.
         self.assertEqual(
