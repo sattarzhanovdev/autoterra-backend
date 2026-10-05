@@ -21,6 +21,7 @@ from .models import (
     AuthToken,
     BonusTransaction,
     ClientProfile,
+    ClientPriceOverride,
     ColorRequest,
     ContactHistory,
     CourierTask,
@@ -235,6 +236,45 @@ class RegionAdmin(admin.ModelAdmin):
     search_fields = ("code", "name", "distributor__name", "manager__username", "manager__email")
 
 
+class _CentralPricePermissions:
+    """Regional managers edit through the scoped app API, not the global admin."""
+    def _can_manage_prices(self, request):
+        return request.user.is_superuser or getattr(getattr(request.user, 'profile', None), 'role', None) == 'admin'
+
+    def has_view_permission(self, request, obj=None):
+        return self._can_manage_prices(request) and super().has_view_permission(request, obj)
+
+    def has_add_permission(self, request, obj=None):
+        return self._can_manage_prices(request) and request.user.has_perm('api.add_clientpriceoverride')
+
+    def has_change_permission(self, request, obj=None):
+        return self._can_manage_prices(request) and super().has_change_permission(request, obj)
+
+    def has_delete_permission(self, request, obj=None):
+        return self._can_manage_prices(request) and super().has_delete_permission(request, obj)
+
+    @admin.display(description='Базовая цена')
+    def base_price(self, obj):
+        return obj.product.price if obj.product_id else '—'
+
+
+class ClientPriceOverrideInline(_CentralPricePermissions, admin.TabularInline):
+    model = ClientPriceOverride
+    extra = 0
+    autocomplete_fields = ('product',)
+    readonly_fields = ('base_price', 'updated_at')
+
+
+@admin.register(ClientPriceOverride)
+class ClientPriceOverrideAdmin(_CentralPricePermissions, admin.ModelAdmin):
+    list_display = ('client', 'product', 'base_price', 'price', 'is_active', 'updated_at')
+    list_select_related = ('client', 'product')
+    search_fields = ('client__company_name', 'client__inn', 'product__name', 'product__sku')
+    list_filter = ('is_active', 'client__distributor')
+    autocomplete_fields = ('client', 'product')
+    readonly_fields = ('base_price', 'updated_at')
+
+
 @admin.register(ClientProfile)
 class ClientProfileAdmin(admin.ModelAdmin):
     list_display = (
@@ -257,7 +297,7 @@ class ClientProfileAdmin(admin.ModelAdmin):
     list_filter = ("category", "status", "registration_source", "partner_status", "region", "distributor")
     search_fields = ("company_name", "inn", "external_id", "contact_name", "phone", "user__username", "user__email")
     readonly_fields = ("created_at",)
-    inlines = (StoreInline,)
+    inlines = (StoreInline, ClientPriceOverrideInline)
     actions = ("export_xlsx", "export_docx", "export_pdf", "export_csv")
     change_list_template = "admin/api/clientprofile/change_list.html"
 

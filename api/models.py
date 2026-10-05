@@ -537,6 +537,30 @@ class Product(models.Model):
         return f"{self.sku} · {self.name}"
 
 
+class ClientPriceOverride(models.Model):
+    client = models.ForeignKey(ClientProfile, on_delete=models.CASCADE, related_name="price_overrides", verbose_name="Клиент")
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="client_price_overrides", verbose_name="Товар")
+    price = models.DecimalField("Персональная цена", max_digits=12, decimal_places=2, validators=[MinValueValidator(Decimal("0.01"))])
+    is_active = models.BooleanField("Активно", default=True)
+    updated_at = models.DateTimeField("Дата изменения", auto_now=True)
+
+    class Meta:
+        verbose_name = "Персональная цена"
+        verbose_name_plural = "Персональные цены"
+        constraints = [
+            models.UniqueConstraint(fields=("client", "product"), name="unique_client_product_price"),
+            models.CheckConstraint(condition=models.Q(price__gt=0), name="client_price_positive"),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.client_id and self.product_id and self.client.distributor_id != self.product.distributor_id:
+            raise ValidationError({"product": "Товар должен принадлежать дистрибьютору клиента"})
+
+    def __str__(self):
+        return f"{self.client} · {self.product} · {self.price} ₽"
+
+
 class RankDiscount(models.Model):
     """Скидка на категорию товаров для ранга клиента.
 

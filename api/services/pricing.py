@@ -1,8 +1,8 @@
 """Цена товара для конкретного клиента.
 
-Прайс один, но платят по нему по-разному: чем больше клиент закупает, тем
-выше его ранг (ClientProfile.partner_status) и ниже цена. Пороги рангов и
-скидки настраиваются в админке — модели PartnerTier и RankDiscount.
+Активная персональная цена ClientPriceOverride имеет приоритет. Без неё
+работает прежний расчёт по рангу ClientProfile.partner_status: пороги и
+скидки настраиваются через PartnerTier и RankDiscount.
 
 Единственная точка расчёта — ``price_for_client``. И витрина, и оформление
 заказа зовут её, поэтому цена в каталоге и цена в заказе не могут разойтись.
@@ -92,8 +92,26 @@ def apply_discount(price, percent) -> Decimal:
 
 
 def price_for_client(client, product) -> Decimal:
-    """Итоговая цена товара для клиента с учётом его ранга."""
+    """Персональная цена → скидка по рангу → базовая цена."""
+    override = personal_price(client, product)
+    if override is not None:
+        return override
     return apply_discount(product.price, discount_percent(client, product))
+
+
+def personal_price(client, product):
+    """One query per client instance/request, never one query per catalog row."""
+    if client is None or product is None or client.distributor_id != product.distributor_id:
+        return None
+    cache = getattr(client, "_personal_prices", None)
+    if cache is None:
+        from api.models import ClientPriceOverride
+        cache = dict(ClientPriceOverride.objects.filter(
+            client_id=client.pk, is_active=True,
+            product__distributor_id=client.distributor_id,
+        ).values_list("product_id", "price"))
+        client._personal_prices = cache
+    return cache.get(product.pk)
 
 
 def price_details(client, product) -> dict:
@@ -101,9 +119,15 @@ def price_details(client, product) -> dict:
     percent = discount_percent(client, product)
     base = Decimal(str(product.price or 0)).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
     final = apply_discount(product.price, percent)
+    override = personal_price(client, product)
+    if override is not None:
+        final = override
+        percent = Decimal("0")  # Rank discount is not applied on top of an override.
     return {
         "price": final,
         "base_price": base,
         "discount_percent": percent,
-        "has_discount": percent > 0,
+        "has_discount": final < base if override is not None else percent > 0,
+        "personal_price": override,
+        "price_source": "personal" if override is not None else "rank" if percent > 0 else "base",
     }

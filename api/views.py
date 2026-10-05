@@ -30,6 +30,7 @@ from .models import (
     AuthToken,
     AuditLog,
     ClientProfile,
+    ClientPriceOverride,
     ColorRequest,
     CourierTask,
     CourierPickedItem,
@@ -940,6 +941,8 @@ def _format_product(product, client=None):
         payload["basePrice"] = float(details["base_price"])
         payload["discountPercent"] = float(details["discount_percent"])
         payload["hasDiscount"] = details["has_discount"]
+        payload["personalPrice"] = float(details["personal_price"]) if details["personal_price"] is not None else None
+        payload["priceSource"] = details["price_source"]
     return payload
 
 
@@ -2181,6 +2184,8 @@ def adjust_order(request, order_id):
     original_snapshot = _items_snapshot(order)
 
     with transaction.atomic():
+        from .services.stock import reserve_product, release_product
+
         for item in order.items.select_related("product").all():
             if item.id not in qty_by_item:
                 continue
@@ -2197,7 +2202,6 @@ def adjust_order(request, order_id):
                         "detail": f"Недостаточно «{product.name}» на складе. Доступно: {product.quantity}"
                     }, status=400)
 
-            from .services.stock import reserve_product, release_product
             if delta > 0:
                 # Для onOrder заказанное количество может быть больше реально
                 # зарезервированного остатка. Сначала уменьшаем незарезервированную
@@ -6024,3 +6028,101 @@ def _auto_create_ticket(client, question, category):
             status="open",
             risk="medium"
         )
+
+
+def _price_scoped_client(request, client_id, *, write=False):
+    user = _current_user(request)
+    if user is None:
+        return None, False, JsonResponse({'detail': 'Unauthorized'}, status=401)
+    role = _resolve_role(user)
+    can_edit = _is_user_global(user) or role == 'manager'
+    if can_edit:
+        client, error = _manager_scoped_client(request, client_id)
+        return client, True, error
+    if role != 'distributor' or write:
+        return None, False, JsonResponse({'detail': 'Нет доступа к персональным ценам'}, status=403)
+    distributor, is_admin, error = _require_distributor_scope(request)
+    if error:
+        return None, False, error
+    client = _scope_clients(distributor, is_admin).filter(pk=client_id).first()
+    if client is None:
+        return None, False, JsonResponse({'detail': 'Клиент не найден'}, status=404)
+    return client, False, None
+
+
+def _format_client_price(client, product, override=None):
+    from .services.pricing import apply_discount, discount_percent
+    details = price_details(client, product)
+    return {
+        'productId': str(product.pk), 'sku': product.sku, 'name': product.name,
+        'productActive': product.is_active,
+        'basePrice': str(details['base_price']),
+        'rankPrice': str(apply_discount(product.price, discount_percent(client, product))),
+        'price': str(details['price']), 'priceSource': details['price_source'],
+        'overrideId': str(override.pk) if override else None,
+        'personalPrice': str(override.price) if override else None,
+        'isActive': override.is_active if override else False,
+        'updatedAt': override.updated_at.isoformat() if override else None,
+    }
+
+
+@require_GET
+def client_prices(request, client_id):
+    client, can_edit, error = _price_scoped_client(request, client_id)
+    if error:
+        return error
+    qs = Product.objects.filter(distributor_id=client.distributor_id)
+    if request.GET.get('overridesOnly', 'true') == 'true':
+        qs = qs.filter(client_price_overrides__client=client)
+    else:
+        qs = qs.filter(Q(is_active=True) | Q(client_price_overrides__client=client)).distinct()
+    search = request.GET.get('search', '').strip()
+    if search:
+        qs = qs.filter(Q(name__icontains=search) | Q(sku__icontains=search))
+    products, meta = paginate(request, qs.order_by('name', 'pk'))
+    overrides = {entry.product_id: entry for entry in ClientPriceOverride.objects.filter(
+        client=client, product_id__in=[p.pk for p in products])}
+    return JsonResponse({
+        'results': [_format_client_price(client, p, overrides.get(p.pk)) for p in products],
+        'pagination': meta, 'count': meta['count'], 'canEdit': can_edit,
+    })
+
+
+@csrf_exempt
+@require_http_methods(['PUT', 'PATCH', 'DELETE'])
+@transaction.atomic
+def client_price_detail(request, client_id, product_id):
+    client, _, error = _price_scoped_client(request, client_id, write=True)
+    if error:
+        return error
+    # Serialize upserts/deletes for this client, including the first insert.
+    client = ClientProfile.objects.select_for_update(of=('self',)).get(pk=client.pk)
+    product = Product.objects.filter(pk=product_id, distributor_id=client.distributor_id).first()
+    if product is None:
+        return JsonResponse({'detail': 'Товар не найден у дистрибьютора клиента'}, status=404)
+    existing = ClientPriceOverride.objects.filter(client=client, product=product).first()
+    if request.method == 'DELETE':
+        if existing:
+            _log_audit(request, 'Client price deleted', existing, {
+                'clientId': client.pk, 'productId': product.pk, 'price': str(existing.price),
+            })
+            existing.delete()
+        return JsonResponse({'status': 'ok', 'item': _format_client_price(client, product)})
+    payload = _json(request)
+    if not isinstance(payload, dict) or set(payload) - {'price', 'isActive'}:
+        return JsonResponse({'detail': 'Передайте price и/или isActive'}, status=400)
+    raw_price = payload.get('price', existing.price if existing else None)
+    price = coerce_decimal(raw_price, 12, 2)
+    if (isinstance(raw_price, bool) or price is None or price <= 0
+            or price != Decimal(str(raw_price))):
+        return JsonResponse({'detail': 'Цена должна быть больше нуля, до 9 999 999 999,99 ₽, не более двух знаков после запятой'}, status=400)
+    active = payload.get('isActive', existing.is_active if existing else True)
+    if not isinstance(active, bool):
+        return JsonResponse({'detail': 'isActive должен быть true или false'}, status=400)
+    override, created = ClientPriceOverride.objects.update_or_create(
+        client=client, product=product, defaults={'price': price, 'is_active': active})
+    _log_audit(request, 'Client price created' if created else 'Client price updated', override, {
+        'clientId': client.pk, 'productId': product.pk,
+        'oldPrice': str(existing.price) if existing else None, 'price': str(price), 'isActive': active,
+    })
+    return JsonResponse({'item': _format_client_price(client, product, override)}, status=201 if created else 200)
