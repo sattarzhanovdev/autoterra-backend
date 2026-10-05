@@ -7,7 +7,7 @@ from django.test import override_settings
 from django.utils import timezone
 
 from .test_bonus_account import _Base
-from .models import Payment, BonusTransaction
+from .models import Payment, BonusTransaction, OrderItem
 from .services import payments, bonuses
 from .views import _apply_provider_payment
 
@@ -36,6 +36,45 @@ class PaymentTests(_Base):
     def pending(self, amount=1000):
         return Payment.objects.create(order=self.order, amount=amount,
             provider_payment_id="provider-1", idempotence_key="fixed-key")
+
+    @override_settings(YOOKASSA_RECEIPT_EMAIL="receipts@example.com")
+    def test_receipt_uses_client_email_and_product_fields(self):
+        self.client_profile.user.email = "buyer@example.com"
+        self.client_profile.user.save(update_fields=["email"])
+        body = payments.payment_body(self.order, Decimal("1000.00"))
+        self.assertEqual(body["receipt"]["customer"], {"email": "buyer@example.com"})
+        self.assertEqual(body["receipt"]["items"], [{
+            "description": "Краска", "quantity": 1,
+            "amount": {"value": "1000.00", "currency": "RUB"},
+            "vat_code": 7, "payment_mode": "full_prepayment",
+            "payment_subject": "commodity", "measure": "piece",
+        }])
+
+    @override_settings(YOOKASSA_RECEIPT_EMAIL="receipts@example.com")
+    def test_receipt_fallback_and_bonus_split_match_payment_exactly(self):
+        first = self.order.items.get()
+        first.price = Decimal("1.01")
+        first.quantity = 3
+        first.save(update_fields=["price", "quantity"])
+        OrderItem.objects.create(order=self.order, product=self.product, sku="P-2",
+                                 name="Лак", price=Decimal("2.02"), quantity=2)
+        body = payments.payment_body(self.order, Decimal("5.04"))
+        self.assertEqual(body["receipt"]["customer"], {"email": "receipts@example.com"})
+        items = body["receipt"]["items"]
+        self.assertEqual({item["description"] for item in items}, {"Краска", "Лак"})
+        self.assertEqual(sum(item["quantity"] for item in items), 5)
+        self.assertEqual(sum(Decimal(item["amount"]["value"]) * item["quantity"] for item in items),
+                         Decimal(body["amount"]["value"]))
+        self.assertTrue(all(Decimal(item["amount"]["value"]) > 0 for item in items))
+
+    def test_unrepresentable_bonus_payment_rolls_back_bonus(self):
+        self.order.items.update(price=Decimal("1.00"), quantity=2)
+        self._credit(Decimal("1.99"))
+        with patch.object(payments, "create_payment") as create:
+            self.assertEqual(self.pay(useBonus="1.99").status_code, 400)
+            create.assert_not_called()
+        self.assertEqual(bonuses.balance(self.client_profile), Decimal("1.99"))
+        self.assertFalse(Payment.objects.exists())
 
     def webhook(self, event="payment.succeeded"):
         return self.http.post("/api/payments/yookassa/webhook/",
@@ -90,6 +129,10 @@ class PaymentTests(_Base):
             self.assertEqual(self.pay(useBonus=0).status_code, 201)
             self.assertEqual(create.call_args.kwargs["idempotence_key"], first["idempotence_key"])
             self.assertEqual(create.call_args.kwargs["request_body"], first["request_body"])
+            receipt = first["request_body"]["receipt"]
+            self.assertEqual(receipt["items"][0]["amount"]["value"], "800.00")
+            self.assertEqual(sum(Decimal(item["amount"]["value"]) * item["quantity"]
+                                 for item in receipt["items"]), Decimal("800.00"))
         self.assertEqual(Payment.objects.count(), 1)
         self.assertEqual(BonusTransaction.objects.filter(kind="order").count(), 1)
 

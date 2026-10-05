@@ -2562,7 +2562,10 @@ def pay_order(request, order_id):
         return JsonResponse({"detail": "Некорректный запрос"}, status=400)
     # Commit the attempt and key BEFORE making an external request. A timeout,
     # process crash or parallel tap must reuse this exact request, never charge twice.
-    payment = _prepare_order_payment(client, order_id, payload)
+    try:
+        payment = _prepare_order_payment(client, order_id, payload)
+    except pay.PaymentReceiptError as exc:
+        return JsonResponse({"detail": str(exc)}, status=400)
     if isinstance(payment, HttpResponse):
         return payment
     try:

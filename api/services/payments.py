@@ -49,6 +49,10 @@ class PaymentUncertainError(PaymentProviderError):
     """The request may have reached the provider. Keep its idempotence key."""
 
 
+class PaymentReceiptError(ValueError):
+    """The order cannot be represented as a valid itemized receipt."""
+
+
 def is_configured() -> bool:
     return bool(settings.YOOKASSA_SHOP_ID and settings.YOOKASSA_SECRET_KEY)
 
@@ -65,11 +69,56 @@ def _ssl_context():
 
 
 def payment_body(order, amount, description=""):
+    payable = Decimal(amount).quantize(Decimal("0.01"))
+    order_items = list(order.items.order_by("pk"))
+    quantities = [item.quantity for item in order_items]
+    original_cents = [int(item.price * 100) for item in order_items]
+    payable_cents = int(payable * 100)
+    minimum = sum(quantities)
+    original_total = sum(price * quantity for price, quantity in zip(original_cents, quantities))
+    if (not order_items or payable_cents < minimum or payable_cents > original_total
+            or any(price < 1 or quantity < 1 for price, quantity in zip(original_cents, quantities))):
+        raise PaymentReceiptError("Невозможно составить чек из товаров заказа на сумму платежа")
+
+    # Every unit must have a positive price. Allocate the remaining kopecks
+    # proportionally to each line's available value, then split a line into
+    # at most two price tiers when its total is not divisible by quantity.
+    capacities = [(price - 1) * quantity for price, quantity in zip(original_cents, quantities)]
+    extra = payable_cents - minimum
+    capacity_total = sum(capacities)
+    if capacity_total:
+        shares = [divmod(extra * capacity, capacity_total) for capacity in capacities]
+        allocated = [share[0] for share in shares]
+        remainder = extra - sum(allocated)
+        for index in sorted(range(len(shares)), key=lambda i: (-shares[i][1], i))[:remainder]:
+            allocated[index] += 1
+    else:
+        allocated = [0] * len(order_items)
+
+    receipt_items = []
+    for item, quantity, line_extra in zip(order_items, quantities, allocated):
+        unit_cents, higher_count = divmod(quantity + line_extra, quantity)
+        for count, price_cents in ((quantity - higher_count, unit_cents), (higher_count, unit_cents + 1)):
+            if count:
+                receipt_items.append({
+                    "description": item.name,
+                    "quantity": count,
+                    "amount": {"value": f"{Decimal(price_cents) / 100:.2f}", "currency": "RUB"},
+                    "vat_code": 7,
+                    "payment_mode": "full_prepayment",
+                    "payment_subject": "commodity",
+                    "measure": "piece",
+                })
+
+    email = (order.client.user.email or "").strip() or settings.YOOKASSA_RECEIPT_EMAIL.strip()
+    if not email:
+        raise PaymentReceiptError("Не указан email для чека ЮKassa")
     return {
         "amount": {
-            "value": f"{Decimal(amount):.2f}",
+            "value": f"{payable:.2f}",
             "currency": "RUB",
         },
+        "receipt": {"customer": {"email": email}, "items": receipt_items},
         "capture": True,  # одностадийная оплата: списываем сразу
         "confirmation": {
             "type": "redirect",
