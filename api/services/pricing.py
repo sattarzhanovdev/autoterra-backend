@@ -1,8 +1,8 @@
 """Цена товара для конкретного клиента.
 
 Активная персональная цена ClientPriceOverride имеет приоритет. Без неё
-работает прежний расчёт по рангу ClientProfile.partner_status: пороги и
-скидки настраиваются через PartnerTier и RankDiscount.
+применяется персональная скидка клиента, а если она не задана — расчёт
+по рангу ClientProfile.partner_status (PartnerTier и RankDiscount).
 
 Единственная точка расчёта — ``price_for_client``. И витрина, и оформление
 заказа зовут её, поэтому цена в каталоге и цена в заказе не могут разойтись.
@@ -92,11 +92,8 @@ def apply_discount(price, percent) -> Decimal:
 
 
 def price_for_client(client, product) -> Decimal:
-    """Персональная цена → скидка по рангу → базовая цена."""
-    override = personal_price(client, product)
-    if override is not None:
-        return override
-    return apply_discount(product.price, discount_percent(client, product))
+    """Персональная цена → персональная скидка → ранг → базовая цена."""
+    return price_details(client, product)["price"]
 
 
 def personal_price(client, product):
@@ -116,18 +113,19 @@ def personal_price(client, product):
 
 def price_details(client, product) -> dict:
     """Цена + из чего она получилась — для витрины и отладки."""
-    percent = discount_percent(client, product)
+    personal_discount = getattr(client, "personal_discount_percent", None)
+    percent = personal_discount if personal_discount is not None else discount_percent(client, product)
     base = Decimal(str(product.price or 0)).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
     final = apply_discount(product.price, percent)
     override = personal_price(client, product)
     if override is not None:
         final = override
-        percent = Decimal("0")  # Rank discount is not applied on top of an override.
+        percent = Decimal("0")  # Percentage discounts never stack with an override.
     return {
         "price": final,
         "base_price": base,
         "discount_percent": percent,
         "has_discount": final < base if override is not None else percent > 0,
         "personal_price": override,
-        "price_source": "personal" if override is not None else "rank" if percent > 0 else "base",
+        "price_source": "personal" if override is not None else "personal_discount" if personal_discount is not None else "rank" if percent > 0 else "base",
     }

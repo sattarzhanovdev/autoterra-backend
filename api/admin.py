@@ -18,6 +18,7 @@ from .forms import ProductExcelImportForm
 from .services.exports import EXPORTERS as EXPORT_FORMATS, ExportUnavailable, export_clients
 from .models import (
     Attachment,
+    AuditLog,
     AuthToken,
     BonusTransaction,
     ClientProfile,
@@ -300,6 +301,24 @@ class ClientProfileAdmin(admin.ModelAdmin):
     inlines = (StoreInline, ClientPriceOverrideInline)
     actions = ("export_xlsx", "export_docx", "export_pdf", "export_csv")
     change_list_template = "admin/api/clientprofile/change_list.html"
+
+    def get_readonly_fields(self, request, obj=None):
+        role = getattr(getattr(request.user, "profile", None), "role", None)
+        allowed = request.user.is_superuser or role == "admin" or (
+            role == "manager" and obj is not None
+            and request.user.managed_regions.filter(pk=obj.region_id).exists()
+        )
+        return self.readonly_fields if allowed else (*self.readonly_fields, "personal_discount_percent")
+
+    def save_model(self, request, obj, form, change):
+        old = ClientProfile.objects.get(pk=obj.pk).personal_discount_percent if change else None
+        super().save_model(request, obj, form, change)
+        if old != obj.personal_discount_percent:
+            AuditLog.objects.create(user=request.user, action="Client discount updated",
+                model_name="ClientProfile", object_id=str(obj.pk), changes={
+                    "oldPersonalDiscountPercent": str(old) if old is not None else None,
+                    "personalDiscountPercent": str(obj.personal_discount_percent) if obj.personal_discount_percent is not None else None,
+                })
 
     def get_queryset(self, request):
         # Выгрузка читает регион, дистрибьютора и менеджера у каждого клиента —

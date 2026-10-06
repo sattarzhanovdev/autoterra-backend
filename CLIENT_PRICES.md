@@ -1,10 +1,11 @@
 # Персональные цены клиентов
 
-Приоритет: активная ClientPriceOverride → RankDiscount для ранга PartnerTier →
+Приоритет: активная ClientPriceOverride → personal_discount_percent клиента →
+RankDiscount для ранга PartnerTier →
 базовая Product.price. Персональная цена не суммируется со скидкой и может быть
 выше базовой. Допустима положительная сумма до 9 999 999 999,99 ₽ с точностью до
 копейки. Одна запись на пару клиент/товар; товар — от дистрибьютора клиента.
-Отключение или удаление возвращает обычный расчёт по рангу. OrderItem.price
+Отключение или удаление возвращает расчёт по персональной скидке, а без неё — по рангу. OrderItem.price
 фиксируется при создании заказа: изменение персональной цены не переписывает
 существующие заказы. Новые позиции корректировки получают актуальную цену.
 
@@ -22,14 +23,14 @@
   `overridesOnly=false` включает каталог; `search` ищет по названию и артикулу;
   `page`, `pageSize` задают пагинацию. Ответ содержит `results`, `pagination`,
   `count`, `canEdit`. Строка содержит `productId`, `sku`, `name`, `productActive`,
-  `basePrice`, `rankPrice`, `price` (итог), `priceSource` (`personal/rank/base`),
+  `basePrice`, `rankPrice`, `price` (итог), `priceSource` (`personal/personal_discount/rank/base`),
   `personalPrice`, `overrideId`, `isActive`, `updatedAt`. Денежные поля — строки
   с десятичной точкой; персональная цена и overrideId могут быть null.
 - `PUT` / `PATCH /api/clients/{clientId}/prices/{productId}/` — создать/изменить:
   `{"price":"650.25","isActive":true}`. PATCH поддерживает изменение только
   активности существующей записи. Возвращается `item`, код 201/200.
 - `DELETE /api/clients/{clientId}/prices/{productId}/` — удалить; повтор безопасен.
-  Возвращается `item` с ценой по рангу/базовой и `status: ok`.
+  Возвращается `item` с пересчитанной итоговой ценой и `status: ok`.
 
 Менеджер читает/изменяет клиентов своих регионов, admin — всех клиентов.
 Дистрибьютор читает только своих, запись запрещена. Клиент, курьер и эксперт
@@ -44,7 +45,7 @@
 
 ## Установка
 
-1. Обновить серверный код, включая миграцию 0051_client_price_override.
+1. Обновить серверный код, включая миграции 0051_client_price_override и 0052_client_personal_discount.
 2. Выполнить `.venv/bin/python manage.py migrate`, затем
    `.venv/bin/python manage.py check` и перезапустить backend.
 3. Собрать и установить обновлённое Flutter-приложение. Ранее собранный APK
@@ -53,3 +54,37 @@
 
 Тесты функции: `manage.py test api.test_client_prices api.test_rank_discounts`
 и `flutter test test/personal_prices_test.dart` в соответствующих проектах.
+
+
+## Персональная скидка на ассортимент
+
+В карточке клиента manager/admin поле «Персональная скидка, %».
+Дистрибьютор видит текущее значение без кнопки изменения.
+Процент применяется к базовой цене каждого товара; скидки не суммируются.
+Например, 1000 ₽ при 20% превращается в 800 ₽, при 15% — в 850 ₽.
+
+- `null` — не задана, действует прежняя логика RankDiscount/PartnerTier.
+- `0` — явно заданная персональная скидка 0%, скидка по рангу не применяется.
+- `100` — бесплатные позиции. После подтверждения заказ с нулевой суммой
+  завершается без обращения к платёжному провайдеру (Payment.provider=discount).
+- Активная персональная цена конкретного товара по-прежнему важнее процента.
+- Диапазон 0–100 включительно, максимум два знака после запятой.
+  Округление итоговой цены — до копейки, ROUND_HALF_UP.
+
+`GET /api/clients/{clientId}/discount/` возвращает
+`{"clientId":"1","personalDiscountPercent":"20.00","canEdit":true}`.
+
+`PATCH /api/clients/{clientId}/discount/` принимает
+`{"personalDiscountPercent":"15.00"}`; для возврата к рангу передайте null.
+Права совпадают с персональными ценами: manager — только свои регионы,
+admin — все, distributor — только чтение своих клиентов.
+AuditLog фиксирует автора, старое и новое значение, включая сброс.
+Изменение через Django admin также записывается в AuditLog.
+GET карточки клиента включает nullable personalDiscountPercent.
+Каталог передаёт применённый процент в discountPercent, источник — personal_discount.
+
+Миграция 0052 оставляет поле null у всех существующих клиентов; данные
+ClientPriceOverride, RankDiscount, PartnerTier и цены заказов не изменяет.
+
+Дополнительные тесты: `manage.py test api.test_client_discount`,
+`flutter test test/client_discount_test.dart test/personal_prices_test.dart`.

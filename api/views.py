@@ -871,6 +871,7 @@ def _format_client(client):
         "distributorName": client.distributor.name if client.distributor else "",
         "status": client.status,
         "partnerStatus": client.partner_status,
+        "personalDiscountPercent": str(client.personal_discount_percent) if client.personal_discount_percent is not None else None,
         "referralCode": client.referral_code,
         "totalPurchases": float(
             Purchase.objects
@@ -1946,7 +1947,7 @@ def create_order(request):
             return JsonResponse({"detail": "Товар недоступен у вашего дистрибьютора"}, status=400)
         prices = {pid: price_for_client(client, product) for pid, product in products_by_id.items()}
         total = coerce_decimal(sum(prices[pid] * qty for pid, qty in quantities.items()), 12, 2)
-        if total is None or total <= 0:
+        if total is None or total < 0:
             return JsonResponse({"detail": "Некорректная сумма заказа"}, status=400)
         for pid, qty in quantities.items():
             product = products_by_id[pid]
@@ -2265,7 +2266,7 @@ def adjust_order(request, order_id):
 
         # Query fresh rows: the prefetched items still contain the old quantities.
         total = coerce_decimal(sum(item.total for item in OrderItem.objects.filter(order=order)), 12, 2)
-        if total is None or total <= 0:
+        if total is None or total < 0:
             transaction.set_rollback(True)
             return JsonResponse({"detail": "Некорректная сумма заказа"}, status=400)
 
@@ -2437,8 +2438,8 @@ def _prepare_order_payment(client, order_id, payload):
             {"detail": "Оплатить можно только подтверждённый заказ"}, status=400
         )
     total = coerce_decimal(order.total_amount, 12, 2)
-    if total is None or total <= 0:
-        return JsonResponse({"detail": "Сумма заказа равна нулю"}, status=400)
+    if total is None or total < 0 or (total == 0 and not order.items.exists()):
+        return JsonResponse({"detail": "Некорректная сумма или пустой заказ"}, status=400)
 
     # Переиспользуем ещё не оплаченный платёж (не создаём дубли при повторном тапе)
     existing = order.payments.filter(status__in=["pending", "waiting_for_capture"]).first()
@@ -2464,14 +2465,14 @@ def _prepare_order_payment(client, order_id, payload):
     applied_bonus = bonuses.debit_for_order(client, order, requested_bonus)
     payable = (Decimal(order.total_amount) - applied_bonus).quantize(Decimal("0.01"))
 
-    # Бонус покрыл заказ целиком — платить нечего, в ЮKassa идти незачем.
+    # Бонус или скидка покрыли заказ целиком — внешний платёж не нужен.
     if payable <= 0:
         payment = Payment.objects.create(
             order=order,
             amount=Decimal("0.00"),
             currency="RUB",
             status="succeeded",
-            provider="bonus",
+            provider="discount" if total == 0 else "bonus",
             paid_at=timezone.now(),
         )
         _mark_order_paid(order, payment)
@@ -4339,7 +4340,7 @@ def distributor_update_delivery_status(request, task_id):
     if err:
         return err
     
-    task = _scope_courier_tasks(distributor, is_admin).select_for_update().filter(id=task_id).first()
+    task = _scope_courier_tasks(distributor, is_admin).select_for_update(of=("self",)).filter(id=task_id).first()
     if not task:
         return JsonResponse({"detail": "Заявка не найдена"}, status=404)
         
@@ -5587,7 +5588,7 @@ def manager_client_status(request, client_id):
     if err:
         return err
 
-    client = get_object_or_404(ClientProfile.objects.select_related('region', 'distributor', 'user').select_for_update(), id=client_id)
+    client = get_object_or_404(ClientProfile.objects.select_related('region', 'distributor', 'user').select_for_update(of=("self",)), id=client_id)
 
     managed_regions = _get_manager_regions(user, is_global)
     if managed_regions is not None and client.region not in managed_regions:
@@ -6126,3 +6127,42 @@ def client_price_detail(request, client_id, product_id):
         'oldPrice': str(existing.price) if existing else None, 'price': str(price), 'isActive': active,
     })
     return JsonResponse({'item': _format_client_price(client, product, override)}, status=201 if created else 200)
+
+
+@csrf_exempt
+@require_http_methods(["GET", "PATCH"])
+@transaction.atomic
+def client_discount(request, client_id):
+    client, can_edit, error = _price_scoped_client(
+        request, client_id, write=request.method == "PATCH")
+    if error:
+        return error
+    if request.method == "PATCH":
+        payload = _json(request)
+        if not isinstance(payload, dict) or set(payload) != {"personalDiscountPercent"}:
+            return JsonResponse({"detail": "Передайте personalDiscountPercent"}, status=400)
+        raw = payload["personalDiscountPercent"]
+        value = None if raw is None else coerce_decimal(raw, 5, 2)
+        if raw is not None and (
+            isinstance(raw, bool) or value is None or not 0 <= value <= 100
+            or value != Decimal(str(raw))
+        ):
+            return JsonResponse({"detail": "Скидка должна быть от 0 до 100%, не более двух знаков после запятой"}, status=400)
+        client = ClientProfile.objects.select_for_update(of=("self",)).get(pk=client.pk)
+        # Recheck regional permissions after acquiring the client row lock.
+        _, _, error = _price_scoped_client(request, client_id, write=True)
+        if error:
+            return error
+        old = client.personal_discount_percent
+        if old != value:
+            client.personal_discount_percent = value
+            client.save(update_fields=["personal_discount_percent"])
+            _log_audit(request, "Client discount updated", client, {
+                "oldPersonalDiscountPercent": str(old) if old is not None else None,
+                "personalDiscountPercent": str(value) if value is not None else None,
+            })
+    return JsonResponse({
+        "clientId": str(client.pk),
+        "personalDiscountPercent": str(client.personal_discount_percent) if client.personal_discount_percent is not None else None,
+        "canEdit": can_edit,
+    })

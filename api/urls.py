@@ -67,6 +67,7 @@ urlpatterns = [
     # Выгрузка списка клиентов в файл: доступна дистрибьютору, менеджеру
     # региона и главному менеджеру — каждому в своём объёме.
     path("clients/export/", views.export_clients_file),
+    path("clients/<int:client_id>/discount/", views.client_discount),
     path("clients/<int:client_id>/prices/", views.client_prices),
     path("clients/<int:client_id>/prices/<int:product_id>/", views.client_price_detail),
     path("distributor/purchases/", views.distributor_purchases),

@@ -348,6 +348,12 @@ class ClientProfile(models.Model):
         default=BASE_PARTNER_TIER,
         help_text="Присваивается автоматически по обороту. Менеджер может выставить вручную.",
     )
+    personal_discount_percent = models.DecimalField(
+        "Персональная скидка, %", max_digits=5, decimal_places=2,
+        null=True, blank=True,
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
+        help_text="Не задана — скидка по рангу; 0 — явно без скидки по рангу.",
+    )
     # Личный код для приглашений. По нему новый сервис при регистрации
     # связывается с пригласившим — см. Referral и эндпоинт /register.
     referral_code = models.CharField(
@@ -368,6 +374,11 @@ class ClientProfile(models.Model):
         ordering = ("company_name",)
         constraints = [
             models.UniqueConstraint(fields=("inn", "region"), name="unique_client_inn_region"),
+            models.CheckConstraint(
+                condition=models.Q(personal_discount_percent__isnull=True) |
+                    models.Q(personal_discount_percent__gte=0, personal_discount_percent__lte=100),
+                name="client_personal_discount_range",
+            ),
         ]
 
     def __str__(self):
