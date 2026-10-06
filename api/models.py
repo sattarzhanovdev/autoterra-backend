@@ -207,7 +207,7 @@ DEFAULT_PARTNER_TIERS = [
 BASE_PARTNER_TIER = DEFAULT_PARTNER_TIERS[0][0]
 
 # Статусы заказа, при которых деньги уже получены. Такой заказ идёт в оборот
-# клиента и создаёт задачу курьеру. Legacy accepted не доказывает оплату.
+# клиента. Для наличных дополнительно проверяется paid_at. Legacy accepted не доказывает оплату.
 ORDER_STATUSES_PAID = ("paid", "shipped", "fulfilled")
 
 
@@ -264,6 +264,7 @@ def client_turnover(client):
     orders = (
         OrderItem.objects
         .filter(order__client=client, order__status__in=ORDER_STATUSES_PAID)
+        .exclude(order__payment_method="cash", order__paid_at__isnull=True)
         .aggregate(
             total=models.Sum(
                 models.F("price") * models.F("quantity"),
@@ -348,6 +349,7 @@ class ClientProfile(models.Model):
         default=BASE_PARTNER_TIER,
         help_text="Присваивается автоматически по обороту. Менеджер может выставить вручную.",
     )
+    cash_payment_allowed = models.BooleanField("Разрешить оплату наличными курьеру", default=False)
     personal_discount_percent = models.DecimalField(
         "Персональная скидка, %", max_digits=5, decimal_places=2,
         null=True, blank=True,
@@ -671,6 +673,10 @@ class Order(models.Model):
     store = models.ForeignKey(Store, on_delete=models.SET_NULL, related_name="orders", verbose_name="Где забрать", null=True, blank=True)
     distributor = models.ForeignKey(Distributor, on_delete=models.PROTECT, related_name="orders", verbose_name="Дистрибьютор")
     delivery_method = models.CharField("Способ получения", max_length=32, choices=DELIVERY_CHOICES, default="courier")
+    payment_method = models.CharField("Способ оплаты", max_length=16,
+        choices=[("online", "Онлайн"), ("cash", "Наличными курьеру")], default="online")
+    cash_collected_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="cash_collected_orders", verbose_name="Наличные получил")
     external_id = models.CharField("Внешний ID (1C)", max_length=128, blank=True, null=True, db_index=True)
     comment = models.TextField("Комментарий", blank=True)
     status = models.CharField("Статус", max_length=32, choices=STATUS_CHOICES, default="new")
@@ -702,6 +708,10 @@ class Order(models.Model):
         """True if new_status is a valid next state from the current status."""
         if new_status == self.status:
             return False
+        if new_status == "fulfilled" and self.payment_method == "cash" and self.paid_at is None:
+            return False
+        if self.status == "confirmed" and new_status == "shipped" and self.payment_method == "cash":
+            return True
         return new_status in self.STATUS_TRANSITIONS.get(self.status, set())
 
     def __str__(self):
@@ -765,7 +775,7 @@ class OrderAdjustment(models.Model):
 
 
 class Payment(models.Model):
-    """Платёж по заказу через YooKassa (ЮKassa / YooMoney для бизнеса)."""
+    """Платёж по заказу: YooKassa, бонусы или подтверждённые курьером наличные."""
 
     STATUS_CHOICES = [
         ("pending", "Ожидает оплаты"),
@@ -1080,7 +1090,7 @@ def _task_history_entry(status, comment=""):
     return {"status": status, "at": timezone.now().isoformat(), "by": None, "comment": comment}
 
 
-# Доставка создаётся ровно тогда, когда деньги получены.
+# Онлайн-заказ идёт в сборку после оплаты; наличный — после подтверждения.
 ORDER_STATUSES_WITH_DELIVERY = ORDER_STATUSES_PAID
 
 
@@ -1088,7 +1098,7 @@ ORDER_STATUSES_WITH_DELIVERY = ORDER_STATUSES_PAID
 def manage_order_courier_task(sender, instance, created, **kwargs):
     if kwargs.get("raw"):
         return
-    """Создаёт задачу курьеру для оплаченного заказа с курьерской доставкой.
+    """Создаёт доставку после онлайн-оплаты или подтверждения наличного заказа.
 
     Раньше триггером был только 'accepted' — legacy-статус: заказы, идущие
     современным путём (new → confirmed → paid → shipped), доставку не получали
@@ -1099,7 +1109,12 @@ def manage_order_courier_task(sender, instance, created, **kwargs):
     """
     if instance.delivery_method != "courier":
         return
-    if instance.status not in ORDER_STATUSES_WITH_DELIVERY:
+    if instance.status in ("cancelled", "rejected"):
+        instance.courier_tasks.exclude(status__in=("delivered", "cancelled", "returned")).update(status="cancelled")
+        return
+    if instance.status not in ORDER_STATUSES_WITH_DELIVERY and not (
+        instance.status == "confirmed" and instance.payment_method == "cash"
+    ):
         return
 
     address = instance.store.address if instance.store_id else instance.client.city
@@ -1112,7 +1127,7 @@ def manage_order_courier_task(sender, instance, created, **kwargs):
             timezone.get_current_timezone(),
         )
 
-    history = [_task_history_entry("created", f"Заказ ORD-{instance.id:05d} оплачен")]
+    history = [_task_history_entry("created", f"Заказ ORD-{instance.id:05d}: наличные при доставке" if instance.payment_method == "cash" else f"Заказ ORD-{instance.id:05d} оплачен")]
     if instance.courier_id:
         history.append(_task_history_entry("assigned", "Курьер назначен на заказ"))
 

@@ -70,7 +70,7 @@ def _last_activity(client):
         .aggregate(last=Max("date"))["last"]
     )
     order = (
-        Order.objects.filter(client=client, status__in=ORDER_STATUSES_PAID)
+        Order.objects.filter(client=client, status__in=ORDER_STATUSES_PAID).exclude(payment_method="cash", paid_at__isnull=True)
         .aggregate(last=Max("created_at"))["last"]
     )
     dates = []
@@ -304,7 +304,7 @@ def low_activity_regions(days=REGION_SILENCE_DAYS):
         ).exists()
         has_orders = Order.objects.filter(
             client__region=region, status__in=ORDER_STATUSES_PAID, created_at__gte=threshold
-        ).exists()
+        ).exclude(payment_method="cash", paid_at__isnull=True).exists()
         if has_purchases or has_orders:
             continue
 

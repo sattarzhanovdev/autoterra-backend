@@ -870,6 +870,7 @@ def _format_client(client):
         "address": "; ".join(client.stores.values_list("address", flat=True)),
         "distributorName": client.distributor.name if client.distributor else "",
         "status": client.status,
+        "cashPaymentAllowed": client.cash_payment_allowed,
         "partnerStatus": client.partner_status,
         "personalDiscountPercent": str(client.personal_discount_percent) if client.personal_discount_percent is not None else None,
         "referralCode": client.referral_code,
@@ -1007,6 +1008,12 @@ def _format_order(order):
         "totalAmount": float(order.total_amount),
         "status": order.status,
         "deliveryMethod": order.delivery_method,
+        "paymentMethod": order.payment_method,
+        "cashCollected": order.payment_method == "cash" and order.paid_at is not None,
+        "cashCollectedBy": str(order.cash_collected_by_id) if order.cash_collected_by_id else None,
+        "canChooseCash": order.client.cash_payment_allowed and order.delivery_method == "courier"
+            and order.status == "confirmed" and order.payment_method == "online" and order.total_amount > 0,
+
         "comment": order.comment,
         "rejectionReason": order.rejection_reason or None,
         "courierId": str(order.courier_id) if order.courier_id else None,
@@ -1017,7 +1024,7 @@ def _format_order(order):
         "paidAt": order.paid_at.isoformat() if order.paid_at else None,
         "shippedAt": order.shipped_at.isoformat() if order.shipped_at else None,
         # Клиент может нажать «Оплатить» только для этих статусов
-        "isPayable": order.status in Order.PAYABLE_STATUSES,
+        "isPayable": order.status in Order.PAYABLE_STATUSES and order.payment_method == "online",
         # Сколько бонусов можно бросить в этот заказ — экран оплаты показывает
         # это до нажатия «Оплатить».
         "bonusAvailable": float(bonus_balance(order.client)),
@@ -1168,6 +1175,9 @@ def _format_courier_task(item):
         "clientInn": item.client.inn,
         "orderId": str(item.order_id) if item.order_id else None,
         "orderNumber": f"ORD-{item.order_id:05d}" if item.order_id else None,
+        "paymentMethod": item.order.payment_method if item.order_id else "online",
+        "cashAmount": float(item.order.total_amount) if item.order_id and item.order.payment_method == "cash" else 0,
+        "cashCollected": bool(item.order_id and item.order.payment_method == "cash" and item.order.paid_at),
         "orderItems": [{
             "id": str(order_item.pk), "name": order_item.name,
             "sku": order_item.sku, "quantity": order_item.quantity,
@@ -1924,6 +1934,11 @@ def create_order(request):
 
     if payload.get("deliveryMethod", "courier") not in [value for value, _ in Order.DELIVERY_CHOICES]:
         return JsonResponse({"detail": "Некорректный способ доставки"}, status=400)
+    payment_method = payload.get("paymentMethod", "online")
+    if payment_method not in ("online", "cash"):
+        return JsonResponse({"detail": "Некорректный способ оплаты"}, status=400)
+    if payment_method == "cash" and payload.get("deliveryMethod", "courier") != "courier":
+        return JsonResponse({"detail": "Наличные доступны при курьерской доставке"}, status=400)
     quantities = {}
     try:
         if not isinstance(items, list):
@@ -1940,6 +1955,10 @@ def create_order(request):
         return JsonResponse({"detail": "Количество должно быть положительным целым числом"}, status=400)
 
     with transaction.atomic():
+        if payment_method == "cash":
+            client = ClientProfile.objects.select_for_update(of=("self",)).get(pk=client.pk)
+            if not client.cash_payment_allowed:
+                return JsonResponse({"detail": "Оплата наличными не разрешена для этого клиента"}, status=403)
         products_by_id = {p.pk: p for p in Product.objects.select_for_update(of=("self",)).filter(
             pk__in=quantities, distributor=client.distributor, is_active=True,
         ).order_by("pk")}
@@ -1956,6 +1975,7 @@ def create_order(request):
         order = Order.objects.create(
             client=client, store=store, distributor=client.distributor,
             delivery_method=payload.get("deliveryMethod", "courier"),
+            payment_method=payment_method,
             comment=(payload.get("comment") or "").strip(),
         )
         from .services.stock import reserve_product
@@ -1967,7 +1987,7 @@ def create_order(request):
                 category=product.category, brand=product.brand, volume=product.volume,
                 price=prices[pid], quantity=qty, reserved_quantity=reserved,
             )
-        _log_audit(request, "Order created", order)
+        _log_audit(request, "Order created", order, {"paymentMethod": order.payment_method})
 
     _notify_operator_order(order, f"Новый заказ ORD-{order.pk:05d}", f"{client.company_name} оформила заказ на {order.total_amount} ₽")
     _send_order_email(order)
@@ -2107,7 +2127,7 @@ def confirm_order(request, order_id):
     order.save(update_fields=["status", "confirmed_at"])
 
     _log_audit(request, f"Order confirm: {old_status} -> confirmed", order)
-    _notify_client_order(order, "Заказ подтверждён", f"Заказ ORD-{order.id:05d} подтверждён. Сумма: {order.total_amount} ₽. Можно оплатить.")
+    _notify_client_order(order, "Заказ подтверждён", f"Заказ ORD-{order.id:05d} подтверждён. Сумма: {order.total_amount} ₽. " + ("Оплата наличными при доставке. Заказ передан в сборку." if order.payment_method == "cash" else "Можно оплатить."))
     _send_order_status_email(order, old_status, "confirmed", recipients=_client_email_list(order))
     return JsonResponse({"order": _format_order(order)})
 
@@ -2433,6 +2453,8 @@ def _prepare_order_payment(client, order_id, payload):
     order = client.orders.select_for_update(of=("self",)).filter(id=order_id).first()
     if not order:
         return JsonResponse({"detail": "Заказ не найден"}, status=404)
+    if order.payment_method == "cash":
+        return JsonResponse({"detail": "Выбрана оплата наличными курьеру"}, status=409)
     if order.status not in Order.PAYABLE_STATUSES:
         return JsonResponse(
             {"detail": "Оплатить можно только подтверждённый заказ"}, status=400
@@ -2947,6 +2969,8 @@ def cancel_courier_task(request, task_id):
     if not task:
         return JsonResponse({"detail": "Заявка не найдена"}, status=404)
         
+    if task.order_id:
+        return JsonResponse({"detail": "Изменяйте доставку через связанный заказ"}, status=409)
     if task.status != "created":
         return JsonResponse({"detail": "Нельзя отменить заявку, которая уже в работе"}, status=400)
         
@@ -2968,6 +2992,8 @@ def update_courier_task(request, task_id):
     if not task:
         return JsonResponse({"detail": "Заявка не найдена"}, status=404)
         
+    if task.order_id:
+        return JsonResponse({"detail": "Изменяйте доставку через связанный заказ"}, status=409)
     if task.status != "created":
         return JsonResponse({"detail": "Нельзя изменить заявку, которая уже в работе"}, status=400)
         
@@ -3020,6 +3046,10 @@ def courier_my_tasks(request):
 
 
 def _delivery_status_error(task, status):
+    if task.order_id and task.order.status in ("cancelled", "rejected"):
+        return JsonResponse({"detail": "Заказ отменён"}, status=409)
+    if status == "delivered" and task.order_id and task.order.payment_method == "cash" and not task.order.paid_at:
+        return JsonResponse({"detail": "Сначала подтвердите получение наличных"}, status=409)
     if status and status not in [value for value, _ in CourierTask.STATUS_CHOICES]:
         return JsonResponse({'detail': 'Некорректный статус'}, status=400)
     if status and status != task.status and task.status in ('delivered', 'returned', 'cancelled'):
@@ -3045,7 +3075,7 @@ def courier_pick_order_item(request, task_id, item_id):
     user, is_admin, err = _require_courier_scope(request)
     if err:
         return err
-    task = CourierTask.objects.select_for_update().filter(pk=task_id).first()
+    task = _locked_delivery_task(CourierTask.objects.all(), task_id)
     if not task:
         return JsonResponse({"detail": "Задача не найдена"}, status=404)
     if task.courier_id != user.pk:
@@ -3066,7 +3096,7 @@ def courier_update_task_status(request, task_id):
     if err:
         return err
     
-    task = CourierTask.objects.select_for_update().filter(id=task_id).first()
+    task = _locked_delivery_task(CourierTask.objects.all(), task_id)
     if not task:
         return JsonResponse({"detail": "Задача не найдена"}, status=404)
     
@@ -3101,7 +3131,7 @@ def courier_update_task_status(request, task_id):
         task.proof_photo = request.FILES["proof_photo"]
 
     task.save()
-    if task.status == 'in_progress' and task.order_id and task.order.status == 'paid':
+    if task.status == 'in_progress' and task.order_id and task.order.can_transition_to('shipped'):
         task.order.status = 'shipped'
         task.order.shipped_at = timezone.now()
         task.order.save(update_fields=['status', 'shipped_at'])
@@ -3125,7 +3155,7 @@ def assign_courier_task(request, task_id):
         return JsonResponse({"detail": "Курьер не найден"}, status=400)
     if not User.objects.filter(pk=courier_id, profile__role="courier", is_active=True).exists():
         return JsonResponse({"detail": "Курьер не найден"}, status=400)
-    task = CourierTask.objects.select_for_update().filter(id=task_id).first()
+    task = _locked_delivery_task(CourierTask.objects.all(), task_id)
     if not task:
         return JsonResponse({"detail": "Заявка не найдена"}, status=404)
     error = _delivery_status_error(task, "assigned")
@@ -3964,7 +3994,7 @@ def admin_analytics(request):
                 return JsonResponse({'detail': 'Некорректный период'}, status=400)
             purchase_qs = purchase_qs.filter(**{f'date__{lookup}': value})
             order_qs = order_qs.filter(**{f'created_at__date__{lookup}': value})
-    paid_orders = order_qs.filter(status__in=['paid', 'shipped', 'fulfilled'])
+    paid_orders = order_qs.filter(status__in=['paid', 'shipped', 'fulfilled']).exclude(payment_method='cash', paid_at__isnull=True)
     paid_turnover = OrderItem.objects.filter(order__in=paid_orders).aggregate(total=Sum(F('price') * F('quantity')))['total'] or 0
     verified_turnover = purchase_qs.filter(status='verified').aggregate(total=Sum('total_amount'))['total'] or 0
     total_clients = client_qs.count()
@@ -4340,7 +4370,7 @@ def distributor_update_delivery_status(request, task_id):
     if err:
         return err
     
-    task = _scope_courier_tasks(distributor, is_admin).select_for_update(of=("self",)).filter(id=task_id).first()
+    task = _locked_delivery_task(_scope_courier_tasks(distributor, is_admin), task_id)
     if not task:
         return JsonResponse({"detail": "Заявка не найдена"}, status=404)
         
@@ -4376,7 +4406,7 @@ def distributor_update_delivery_status(request, task_id):
         if task.order_id and task.courier_id and task.order.courier_id != task.courier_id:
             task.order.courier_id = task.courier_id
             task.order.save(update_fields=['courier'])
-    if task.status == 'in_progress' and task.order_id and task.order.status == 'paid':
+    if task.status == 'in_progress' and task.order_id and task.order.can_transition_to('shipped'):
         task.order.status = 'shipped'
         task.order.shipped_at = timezone.now()
         task.order.save(update_fields=['status', 'shipped_at'])
@@ -4631,7 +4661,7 @@ def distributor_reports(request):
     orders = _scope_orders(distributor, is_admin)
     clients = _scope_clients(distributor, is_admin)
     products = _scope_products(distributor, is_admin)
-    paid = orders.filter(status__in=['paid', 'shipped', 'fulfilled'])
+    paid = orders.filter(status__in=['paid', 'shipped', 'fulfilled']).exclude(payment_method='cash', paid_at__isnull=True)
     turnover = OrderItem.objects.filter(order__in=paid).aggregate(total=Sum(F('price') * F('quantity')))['total'] or 0
     return JsonResponse({
         'clients': clients.count(), 'orders': orders.count(),
@@ -5480,7 +5510,7 @@ def manager_client_unified(request, client_id):
     # 6. Referrals
     referrals = [_format_referral(r) for r in _limit(request, client.referrals.all().order_by("-created_at"))]
     
-    paid_orders = client.orders.filter(status__in=['paid', 'shipped', 'fulfilled']).prefetch_related('items')
+    paid_orders = client.orders.filter(status__in=['paid', 'shipped', 'fulfilled']).exclude(payment_method='cash', paid_at__isnull=True).prefetch_related('items')
     paid_total = sum((order.total_amount for order in paid_orders), start=Decimal('0.00'))
     verified_total = client.purchases.filter(status='verified').aggregate(total=Sum('total_amount'))['total'] or Decimal('0.00')
     last_order = client.orders.order_by('-created_at').first()
@@ -6166,3 +6196,109 @@ def client_discount(request, client_id):
         "personalDiscountPercent": str(client.personal_discount_percent) if client.personal_discount_percent is not None else None,
         "canEdit": can_edit,
     })
+
+
+def _locked_delivery_task(queryset, task_id):
+    order_id = queryset.filter(pk=task_id).values_list("order_id", flat=True).first()
+    if order_id:
+        Order.objects.select_for_update(of=("self",)).get(pk=order_id)
+    return queryset.select_for_update(of=("self",)).filter(pk=task_id).first()
+
+
+@csrf_exempt
+@require_http_methods(["GET", "PATCH"])
+@transaction.atomic
+def client_cash_permission(request, client_id):
+    distributor, is_admin, error = _require_distributor_scope(request)
+    if error:
+        return error
+    client = _scope_clients(distributor, is_admin).select_for_update(of=("self",)).filter(pk=client_id).first()
+    if client is None:
+        return JsonResponse({"detail": "Клиент не найден"}, status=404)
+    if request.method == "PATCH":
+        payload = _json(request)
+        if not isinstance(payload, dict) or set(payload) != {"cashPaymentAllowed"} or not isinstance(payload["cashPaymentAllowed"], bool):
+            return JsonResponse({"detail": "Передайте cashPaymentAllowed: true или false"}, status=400)
+        old = client.cash_payment_allowed
+        client.cash_payment_allowed = payload["cashPaymentAllowed"]
+        if old != client.cash_payment_allowed:
+            client.save(update_fields=["cash_payment_allowed"])
+            _log_audit(request, "Client cash permission updated", client, {
+                "oldCashPaymentAllowed": old, "cashPaymentAllowed": client.cash_payment_allowed,
+            })
+    return JsonResponse({"cashPaymentAllowed": client.cash_payment_allowed, "canEdit": True})
+
+
+@csrf_exempt
+@require_POST
+@transaction.atomic
+def choose_order_cash(request, order_id):
+    user = _current_user(request)
+    if user is None:
+        return JsonResponse({"detail": "Unauthorized"}, status=401)
+    if _resolve_role(user) == "client":
+        client, error = _require_client(request)
+        if error:
+            return error
+        queryset = client.orders
+    else:
+        distributor, is_admin, error = _require_distributor_scope(request)
+        if error:
+            return error
+        queryset = _scope_orders(distributor, is_admin)
+    order = queryset.select_for_update(of=("self",)).filter(pk=order_id).first()
+    if not order:
+        return JsonResponse({"detail": "Заказ не найден"}, status=404)
+    if order.payment_method == "cash":
+        return JsonResponse({"order": _format_order(order)})
+    client = ClientProfile.objects.select_for_update(of=("self",)).get(pk=order.client_id)
+    if not client.cash_payment_allowed:
+        return JsonResponse({"detail": "Оплата наличными не разрешена для этого клиента"}, status=403)
+    if order.status != "confirmed" or order.delivery_method != "courier" or order.total_amount <= 0:
+        return JsonResponse({"detail": "Наличные доступны для подтверждённого заказа с курьерской доставкой"}, status=409)
+    if order.payments.filter(status__in=["pending", "waiting_for_capture", "succeeded"]).exists() or _bonus_applied(order) > 0:
+        return JsonResponse({"detail": "По заказу уже начата онлайн-оплата. Завершите или отмените платёж перед выбором наличных."}, status=409)
+    order.payment_method = "cash"
+    order.save(update_fields=["payment_method"])
+    _log_audit(request, "Order cash selected", order, {"paymentMethod": "cash"})
+    _notify_operator_order(order, "Оплата наличными", f"Заказ ORD-{order.id:05d} можно собирать. Получить {order.total_amount} ₽ при доставке.")
+    return JsonResponse({"order": _format_order(order)})
+
+
+@csrf_exempt
+@require_POST
+@transaction.atomic
+def courier_collect_cash(request, task_id):
+    user, _, error = _require_courier_scope(request)
+    if error:
+        return error
+    task = _locked_delivery_task(CourierTask.objects.all(), task_id)
+    if not task:
+        return JsonResponse({"detail": "Задача не найдена"}, status=404)
+    # Only the assigned driver can attest to receiving physical money.
+    if task.courier_id != user.pk or _resolve_role(user) != "courier":
+        return JsonResponse({"detail": "Наличные подтверждает назначенный водитель"}, status=403)
+    if not task.order_id or task.task_type != "delivery":
+        return JsonResponse({"detail": "Это не доставка заказа"}, status=409)
+    order = task.order
+    if order.payment_method != "cash":
+        return JsonResponse({"detail": "В заказе не выбрана оплата наличными"}, status=409)
+    if order.paid_at:
+        return JsonResponse({"task": _format_courier_task(task)})
+    if task.status != "in_progress" or order.status != "shipped":
+        return JsonResponse({"detail": "Получение наличных доступно только во время доставки"}, status=409)
+    if order.payments.filter(status__in=["pending", "waiting_for_capture", "succeeded"]).exists():
+        return JsonResponse({"detail": "По заказу уже зарегистрирован платёж"}, status=409)
+    received_at = timezone.now()
+    payment = Payment.objects.create(order=order, provider="cash", status="succeeded",
+        amount=order.total_amount, currency="RUB", paid_at=received_at)
+    order.paid_at = received_at
+    order.cash_collected_by = user
+    order.save(update_fields=["paid_at", "cash_collected_by"])
+    _log_audit(request, "Order cash collected", order, {
+        "amount": str(payment.amount), "paymentId": str(payment.pk), "courierId": str(user.pk),
+    })
+    sync_client_tier(order.client)
+    _notify_client_order(order, "Наличные получены", f"Водитель подтвердил получение {payment.amount} ₽ за заказ ORD-{order.pk:05d}.")
+    _notify_operator_order(order, "Наличные получены", f"Водитель {user.get_full_name() or user.username} получил {payment.amount} ₽ за заказ ORD-{order.pk:05d}.")
+    return JsonResponse({"task": _format_courier_task(task)})

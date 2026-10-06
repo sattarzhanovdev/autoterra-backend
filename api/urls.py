@@ -3,6 +3,9 @@ from django.urls import path
 from . import schema, views
 
 urlpatterns = [
+    path("clients/<int:client_id>/cash-permission/", views.client_cash_permission),
+    path("orders/<int:order_id>/cash/", views.choose_order_cash),
+    path("courier/tasks/<int:task_id>/collect-cash/", views.courier_collect_cash),
     path("docs/", schema.swagger_ui),
     path("schema/", schema.openapi_schema),
     path("health/", views.health),

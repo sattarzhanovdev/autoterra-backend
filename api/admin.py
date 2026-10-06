@@ -308,11 +308,22 @@ class ClientProfileAdmin(admin.ModelAdmin):
             role == "manager" and obj is not None
             and request.user.managed_regions.filter(pk=obj.region_id).exists()
         )
-        return self.readonly_fields if allowed else (*self.readonly_fields, "personal_discount_percent")
+        fields = list(self.readonly_fields if allowed else (*self.readonly_fields, "personal_discount_percent"))
+        cash_allowed = request.user.is_superuser or role == "admin" or (
+            role == "distributor" and obj is not None and obj.distributor and obj.distributor.user_id == request.user.pk
+        )
+        if not cash_allowed:
+            fields.append("cash_payment_allowed")
+        return tuple(fields)
 
     def save_model(self, request, obj, form, change):
+        old_cash = ClientProfile.objects.get(pk=obj.pk).cash_payment_allowed if change else False
         old = ClientProfile.objects.get(pk=obj.pk).personal_discount_percent if change else None
         super().save_model(request, obj, form, change)
+        if old_cash != obj.cash_payment_allowed:
+            AuditLog.objects.create(user=request.user, action="Client cash permission updated",
+                model_name="ClientProfile", object_id=str(obj.pk), changes={
+                    "oldCashPaymentAllowed": old_cash, "cashPaymentAllowed": obj.cash_payment_allowed})
         if old != obj.personal_discount_percent:
             AuditLog.objects.create(user=request.user, action="Client discount updated",
                 model_name="ClientProfile", object_id=str(obj.pk), changes={
@@ -541,7 +552,7 @@ class OrderAdmin(admin.ModelAdmin):
     list_display = ("id", "client", "store", "distributor", "external_id", "status", "created_at")
     list_filter = ("status", "distributor", "store")
     search_fields = ("id", "external_id", "client__company_name", "client__inn", "store__name", "comment", "items__name", "items__sku")
-    readonly_fields = ("client", "store", "distributor", "status", "stock_restored", "created_at", "confirmed_at", "paid_at", "shipped_at")
+    readonly_fields = ("payment_method", "cash_collected_by", "client", "store", "distributor", "status", "stock_restored", "created_at", "confirmed_at", "paid_at", "shipped_at")
 
     def has_add_permission(self, request):
         return False

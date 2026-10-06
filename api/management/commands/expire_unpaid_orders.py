@@ -26,7 +26,7 @@ class Command(BaseCommand):
             with transaction.atomic():
                 order = Order.objects.select_for_update().get(pk=pk)
                 since = order.confirmed_at or order.created_at
-                if order.status not in ('new', 'confirmed') or since >= cutoff:
+                if order.status not in ('new', 'confirmed') or since >= cutoff or (order.status == 'confirmed' and order.payment_method == 'cash'):
                     continue
                 if order.payments.filter(status__in=['pending', 'waiting_for_capture', 'succeeded']).exists():
                     continue
