@@ -1701,3 +1701,33 @@ def sync_client_distributor_data(sender, instance, **kwargs):
         instance.purchases.all().update(distributor=instance.distributor)
         # Sync color requests
         instance.color_requests.all().update(assigned_distributor=instance.distributor)
+
+
+class YooKassaRegistryImport(models.Model):
+    """Audit trail of internal statement imports; never changes a payment."""
+    uploaded_by = models.ForeignKey(User, on_delete=models.PROTECT)
+    distributor = models.ForeignKey(Distributor, null=True, blank=True, on_delete=models.PROTECT)
+    filename = models.CharField(max_length=255)
+    file_hash = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+    imported_count = models.PositiveIntegerField(default=0)
+    duplicate_count = models.PositiveIntegerField(default=0)
+
+
+class YooKassaRegistryOperation(models.Model):
+    registry_import = models.ForeignKey(YooKassaRegistryImport, on_delete=models.PROTECT, related_name='operations')
+    # Globally unique payment/refund event prevents overlapping statements doubling totals.
+    event_key = models.CharField(max_length=160, unique=True)
+    kind = models.CharField(max_length=16, choices=[('payment', 'Платёж'), ('refund', 'Возврат')])
+    provider_payment_id = models.CharField(max_length=128, blank=True, db_index=True)
+    provider_refund_id = models.CharField(max_length=128, blank=True)
+    order_id_hint = models.PositiveBigIntegerField(null=True, blank=True)
+    payment = models.ForeignKey(Payment, null=True, blank=True, on_delete=models.PROTECT, related_name='registry_operations')
+    # Unidentified rows belong only to the importing distributor (or admin).
+    distributor = models.ForeignKey(Distributor, null=True, blank=True, on_delete=models.PROTECT)
+    occurred_at = models.DateTimeField(db_index=True)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    fee = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    net = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    currency = models.CharField(max_length=8, default='RUB')
+    fingerprint = models.CharField(max_length=64)

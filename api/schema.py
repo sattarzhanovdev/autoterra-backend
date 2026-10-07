@@ -303,6 +303,36 @@ PATHS = {
     },
 }
 
+FINANCE_PARAMETERS = [
+    {"name": name, "in": "query", "schema": schema}
+    for name, schema in (("date_from", {"type": "string", "format": "date"}),
+                         ("date_to", {"type": "string", "format": "date"}),
+                         ("distributor_id", {"type": "integer"}))
+]
+PATHS.update({
+    "/finance/yookassa/": {"get": _secured({
+        "tags": ["Finance"], "summary": "Внутренний учет ЮKassa: админ или свой дистрибьютор",
+        "parameters": FINANCE_PARAMETERS + [{"name": "page", "in": "query", "schema": {"type": "integer", "minimum": 1}}],
+        "responses": {"200": _ok({"type": "object", "properties": {
+            "summary": {"type": "object"}, "operations": {"type": "array", "items": {"type": "object"}},
+            "discrepancies": {"type": "array", "items": {"type": "object"}}}}), "400": _error("Некорректные фильтры")},
+    })},
+    "/finance/yookassa/import/": {"post": _secured({
+        "tags": ["Finance"], "summary": "Импорт реестров платежей и возвратов CSV/XLSX",
+        "requestBody": {"required": True, "content": {"multipart/form-data": {"schema": {
+            "type": "object", "required": ["file"], "properties": {
+                "file": {"type": "string", "format": "binary"}, "distributor_id": {"type": "integer"}}}}}},
+        "responses": {"201": _created({"type": "object"}), "400": _error("Некорректный реестр или конфликт повтора"),
+                      "409": _error("Параллельный импорт: повторите запрос")},
+    })},
+    "/finance/yookassa/export/": {"get": _secured({
+        "tags": ["Finance"], "summary": "Excel для бухгалтерии: весь выбранный период",
+        "parameters": FINANCE_PARAMETERS,
+        "responses": {"200": {"description": "Excel: Итоги, Операции, Расхождения", "content": {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {"schema": {"type": "string", "format": "binary"}}}}},
+    })},
+})
+
 def _schema(request):
     server_url = request.build_absolute_uri("/api").rstrip("/")
     return {

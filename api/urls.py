@@ -1,8 +1,11 @@
 from django.urls import path
 
-from . import schema, views
+from . import finance_views, schema, views
 
 urlpatterns = [
+    path("finance/yookassa/", finance_views.report),
+    path("finance/yookassa/import/", finance_views.registry_import),
+    path("finance/yookassa/export/", finance_views.export),
     path("clients/<int:client_id>/cash-permission/", views.client_cash_permission),
     path("orders/<int:order_id>/cash/", views.choose_order_cash),
     path("courier/tasks/<int:task_id>/collect-cash/", views.courier_collect_cash),
