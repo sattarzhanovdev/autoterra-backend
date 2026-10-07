@@ -57,7 +57,7 @@ class ProductSearchTests(TestCase):
     def test_elasticsearch_results_keep_relevance_order(self):
         hits = {"hits": {"hits": [{"_id": str(self.lacquer.id)}, {"_id": str(self.primer.id)}]}}
         with patch.object(search, "_request", return_value=hits):
-            result = search.search_products(self._all(), "покрытие")
+            result = search.search_products(self._all(), "л")
         self.assertEqual([p.sku for p in result], ["LAC-200", "PRM-100"])
 
     @override_settings(ELASTICSEARCH_URL="http://es:9200")
@@ -66,7 +66,7 @@ class ProductSearchTests(TestCase):
         hits = {"hits": {"hits": [{"_id": str(self.lacquer.id)}, {"_id": str(self.primer.id)}]}}
         base = Product.objects.filter(brand="Novol")
         with patch.object(search, "_request", return_value=hits):
-            result = search.search_products(base, "покрытие")
+            result = search.search_products(base, "л")
         self.assertEqual([p.sku for p in result], ["LAC-200"])
 
     @override_settings(ELASTICSEARCH_URL="http://es:9200")
@@ -107,3 +107,89 @@ class ProductSearchTests(TestCase):
             with self.subTest(query=query):
                 result = search.search_products(self._all(), query)
                 self.assertEqual([p.sku for p in result], ["LAC-200"])
+
+
+class ProductSynonymSearchTests(TestCase):
+    def setUp(self):
+        self.dist = Distributor.objects.create(name="Первый", inn="111")
+        self.other = Distributor.objects.create(name="Второй", inn="222")
+        self.product = Product.objects.create(distributor=self.dist, sku="FILM-1",
+            name="Защитная пленка", brand="СмЕшАнНЫй БРЁНД", category="Укрывные материалы",
+            synonyms=" укрывной материал; пленка; защитная плёнка; ПЛЁНКА; ; ",
+            price=450, quantity=12, images=["https://example.com/a.jpg"])
+        self.foreign = Product.objects.create(distributor=self.other, sku="FILM-1",
+            name="Чужой товар", synonyms=["укрывной материал"], category="Другая")
+
+    def test_full_partial_case_and_yo_matches_same_product(self):
+        for query in ("укрывной материал", "УКРЫВНОЙ", "пленка", "ПЛЁНКА",
+                      "защитная плёнка", "ЗАЩИТНАЯ ПЛЕНКА", "териал", "film-1",
+                      "смешанный бренД", "укрывные"):
+            with self.subTest(query=query):
+                qs = Product.objects.filter(distributor=self.dist)
+                self.assertEqual(list(search.search_products(qs, query)), [self.product])
+        self.assertEqual(self.product.synonyms, ["укрывной материал", "пленка", "защитная плёнка"])
+        self.assertEqual(Product.objects.count(), 2)
+
+    def test_synonyms_replace_and_partial_save_keeps_other_persisted_fields(self):
+        self.product.name = "Не сохранено"
+        self.product.synonyms = ["маскировочная пленка"]
+        self.product.save(update_fields=["synonyms"])
+        qs = Product.objects.filter(distributor=self.dist)
+        self.assertEqual(search.search_products(qs, "маскировочная").count(), 1)
+        self.assertEqual(search.search_products(qs, "укрывной материал").count(), 0)
+        self.assertEqual(search.search_products(qs, "защитная").count(), 1)
+        self.product.synonyms = []
+        self.product.save(update_fields=["synonyms"])
+        self.assertEqual(search.search_products(qs, "маскировочная").count(), 0)
+
+    def test_bulk_paths_rebuild_search_data(self):
+        product = Product(distributor=self.dist, sku="BULK", name="ЛёГкИй", category="Другое", synonyms=["Прозрачный"])
+        Product.objects.bulk_create([product])
+        qs = Product.objects.filter(sku="BULK")
+        self.assertEqual(search.search_products(qs, "легкий").count(), 1)
+        qs.update(name="ТоНкИй")
+        self.assertEqual(search.search_products(qs, "тонкий").count(), 1)
+        product.synonyms = ["Новый вариант"]
+        Product.objects.bulk_update([product], ["synonyms"])
+        self.assertEqual(search.search_products(qs, "новый вариант").count(), 1)
+        self.assertEqual(search.search_products(qs, "прозрачный").count(), 0)
+
+    def test_bulk_conflict_preserves_untouched_search_fields(self):
+        Product.objects.bulk_create([
+            Product(distributor=self.dist, sku="FILM-1", name="Другое",
+                category="Другое", synonyms=["маскировочная пленка"])
+        ], update_conflicts=True, unique_fields=["distributor", "sku"], update_fields=["synonyms"])
+        qs = Product.objects.filter(distributor=self.dist)
+        self.assertEqual(search.search_products(qs, "защитная пленка").count(), 1)
+        self.assertEqual(search.search_products(qs, "маскировочная").count(), 1)
+        self.assertEqual(search.search_products(qs, "другое").count(), 0)
+
+    @override_settings(ELASTICSEARCH_URL="http://es:9200")
+    def test_stale_es_cannot_hide_or_add_matches(self):
+        qs = Product.objects.filter(distributor=self.dist)
+        for hits in ([], [{"_id": str(self.foreign.pk)}]):
+            with patch.object(search, "_request", return_value={"hits": {"hits": hits}}):
+                self.assertEqual(list(search.search_products(qs, "укрывной материал")), [self.product])
+
+    def test_admin_form_accepts_semicolon_and_uses_shared_search(self):
+        from .admin import ProductAdminForm, ProductAdmin
+        from django.contrib.admin.sites import AdminSite
+        from django.test import RequestFactory
+        form = ProductAdminForm(instance=self.product)
+        self.assertEqual(form.initial["synonyms"], "; ".join(self.product.synonyms))
+        admin = ProductAdmin(Product, AdminSite())
+        result, duplicates = admin.get_search_results(RequestFactory().get("/"),
+            Product.objects.filter(distributor=self.dist), "ПЛЁНКА")
+        self.assertEqual(list(result), [self.product])
+        self.assertFalse(duplicates)
+        import json
+        from django.forms.models import model_to_dict
+        data = model_to_dict(self.product)
+        data["images"] = json.dumps(data["images"])
+        data["synonyms"] = " маскировочная пленка; МАСКИРОВОЧНАЯ ПЛЁНКА; "
+        form = ProductAdminForm(data=data, instance=self.product)
+        self.assertTrue(form.is_valid(), form.errors)
+        form.save()
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.synonyms, ["маскировочная пленка"])
+        self.assertEqual(search.search_products(Product.objects.filter(pk=self.product.pk), "маскировочная").count(), 1)

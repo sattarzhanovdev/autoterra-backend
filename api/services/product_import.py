@@ -25,6 +25,7 @@ from decimal import Decimal, InvalidOperation
 from openpyxl import load_workbook
 
 from api.models import MAX_PRODUCT_IMAGES, normalize_product_images
+from api.services.product_names import normalize_product_synonyms
 
 
 # Каноническое имя поля -> набор допустимых заголовков (в нижнем регистре).
@@ -36,6 +37,7 @@ _HEADER_SYNONYMS = {
     "category": ["категория продавца", "категория", "category"],
     "brand": ["бренд", "brand", "производитель"],
     "description": ["описание", "description"],
+    "synonyms": ["синонимы", "альтернативные названия", "synonyms"],
     "images": ["фото", "фотографии", "images", "изображения"],
     "video_url": ["видео", "video"],
     "color": ["цвет", "color"],
@@ -227,6 +229,10 @@ def parse_products_workbook(file_obj):
             "_has_quantity": has_quantity,
             "_has_status": has_status,
         }
+        if "synonyms" in mapping:
+            product["synonyms"] = normalize_product_synonyms(_norm(_cell(row, mapping, "synonyms")))
+        if "images" not in mapping:
+            product.pop("images")
         if has_price:
             product["price"] = _money(_cell(row, mapping, "price", 0))
         if has_quantity:
@@ -245,7 +251,7 @@ def parse_products_workbook(file_obj):
 # Каноническое имя поля -> имя поля модели Product (совпадают, кроме служебных).
 _MODEL_FIELDS = (
     "sku", "name", "wb_article", "group_name", "category", "brand", "description",
-    "color", "barcode", "images", "video_url", "volume", "weight",
+    "color", "barcode", "images", "synonyms", "video_url", "volume", "weight",
     "package_height", "package_length", "package_width", "tnved", "vat_rate",
 )
 

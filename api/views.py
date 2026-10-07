@@ -916,6 +916,7 @@ def _format_product(product, client=None):
         "wbArticle": product.wb_article or None,
         "groupName": product.group_name or None,
         "name": product.name,
+        "synonyms": product.synonyms,
         "category": product.category,
         "brand": product.brand,
         "description": product.description or None,
@@ -4536,6 +4537,11 @@ def distributor_add_product(request):
     status = payload.get('status', 'inStock' if quantity > 5 else 'low' if quantity else 'outOfStock')
     if status not in dict(Product.STOCK_CHOICES):
         return JsonResponse({'detail': 'Некорректный статус товара'}, status=400)
+    from api.services.product_names import normalize_product_synonyms
+    try:
+        synonyms = normalize_product_synonyms(payload.get("synonyms"))
+    except ValueError as exc:
+        return JsonResponse({"detail": str(exc)}, status=400)
     product = Product.objects.create(
         distributor=distributor,
         sku=sku,
@@ -4543,6 +4549,7 @@ def distributor_add_product(request):
         category=payload.get("category", "Общее"),
         brand=payload.get("brand", "AutoTerra"),
         description=payload.get("description", ""),
+        synonyms=synonyms,
         # Фото — только ссылки, максимум Product.MAX_IMAGES (лишние отсекаются).
         images=normalize_product_images(payload.get("images")),
         video_url=payload.get("videoUrl") or "",
@@ -4594,6 +4601,9 @@ def distributor_stock_upload(request):
                 if raw['status'] not in dict(Product.STOCK_CHOICES):
                     raise ValueError('Некорректный статус')
                 defaults['status'] = raw['status']
+            if 'synonyms' in raw:
+                from api.services.product_names import normalize_product_synonyms
+                defaults['synonyms'] = normalize_product_synonyms(raw['synonyms'])
             if 'images' in raw:
                 defaults['images'] = normalize_product_images(raw['images'])
             if 'videoUrl' in raw:
@@ -6109,7 +6119,7 @@ def client_prices(request, client_id):
         qs = qs.filter(Q(is_active=True) | Q(client_price_overrides__client=client)).distinct()
     search = request.GET.get('search', '').strip()
     if search:
-        qs = qs.filter(Q(name__icontains=search) | Q(sku__icontains=search))
+        qs = _search_products(qs, search)
     products, meta = paginate(request, qs.order_by('name', 'pk'))
     overrides = {entry.product_id: entry for entry in ClientPriceOverride.objects.filter(
         client=client, product_id__in=[p.pk for p in products])}

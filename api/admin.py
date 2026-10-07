@@ -117,6 +117,7 @@ PRODUCT_TEMPLATE_HEADERS = [
     "Остаток",
     "Статус",
     "Фото",
+    "Синонимы",
 ]
 
 PRODUCT_TEMPLATE_EXAMPLE = [
@@ -129,6 +130,7 @@ PRODUCT_TEMPLATE_EXAMPLE = [
     12,
     "В наличии",
     "https://example.com/photo/1.jpg;https://example.com/photo/2.jpg",
+    "левая дверь; передняя дверь",
 ]
 
 
@@ -407,13 +409,35 @@ class StoreAdmin(admin.ModelAdmin):
     readonly_fields = ("created_at",)
 
 
+class ProductAdminForm(forms.ModelForm):
+    synonyms = forms.CharField(label="Синонимы", required=False,
+        widget=forms.Textarea(attrs={"rows": 3}), help_text="Альтернативные названия через «;»")
+
+    class Meta:
+        model = Product
+        fields = "__all__"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.initial["synonyms"] = "; ".join(self.instance.synonyms or [])
+
+    def clean_synonyms(self):
+        from api.services.product_names import normalize_product_synonyms
+        return normalize_product_synonyms(self.cleaned_data["synonyms"])
+
+
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
+    form = ProductAdminForm
     change_list_template = "admin/api/product/change_list.html"
     list_display = ("id", "sku", "external_id", "name", "category", "brand", "distributor", "quantity", "status", "price", "photo_preview")
     list_filter = ("status", "category", "brand", "distributor")
     search_fields = ("sku", "external_id", "name", "category", "brand", "distributor__name")
     readonly_fields = ("updated_at", "photo_preview")
+
+    def get_search_results(self, request, queryset, search_term):
+        from api.services.search import search_products
+        return search_products(queryset, search_term), False
 
     @admin.display(description="Фото")
     def photo_preview(self, obj):
@@ -471,12 +495,13 @@ class ProductAdmin(admin.ModelAdmin):
             "G": 14,
             "H": 18,
             "I": 60,  # «Фото» — ссылки через ';', до 15 шт.
+            "J": 60,  # «Синонимы»
         }
         for column, width in widths.items():
             sheet.column_dimensions[column].width = width
 
         sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = "A1:I2"
+        sheet.auto_filter.ref = "A1:J2"
         for row in sheet.iter_rows(min_row=2, max_row=2):
             for cell in row:
                 cell.alignment = Alignment(vertical="top")

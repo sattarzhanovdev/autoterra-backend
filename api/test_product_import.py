@@ -194,3 +194,67 @@ class ProductImagesModelTests(TestCase):
             normalize_product_images(["http://a/1.jpg", "http://a/1.jpg"]),
             ["http://a/1.jpg"],
         )
+
+
+class ProductSynonymImportTests(TestCase):
+    setUp = StockUploadFileEndpointTests.setUp
+    _upload = StockUploadFileEndpointTests._upload
+
+    def workbook(self, synonyms=None, include=True):
+        wb = Workbook()
+        ws = wb.active
+        ws.append(["Артикул", "Название"] + (["Синонимы"] if include else []))
+        ws.append(["FILM", "Защитная пленка"] + ([synonyms] if include else []))
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        buf.name = "price.xlsx"
+        return buf
+
+    def test_import_replaces_preserves_and_clears_without_duplicates(self):
+        from .services.search import search_products
+        from .models import ClientPriceOverride, ClientProfile
+        from decimal import Decimal
+        product = Product.objects.create(distributor=self.distributor, sku="FILM", name="Пленка",
+            category="Материалы", price=999, quantity=7, images=["https://example.com/a.jpg"])
+        other = Distributor.objects.create(name="Other", inn="555")
+        foreign = Product.objects.create(distributor=other, sku="FILM", name="Чужой", category="Материалы", synonyms=["чужой"])
+        client = ClientProfile.objects.create(user=User.objects.create_user(username="buyer"),
+            distributor=self.distributor, region=Region.objects.filter(distributor=self.distributor).first(), inn="1234567890", company_name="Buyer", city="Москва", contact_name="Buyer", phone="123")
+        override = ClientPriceOverride.objects.create(client=client, product=product, price=500)
+        for value, include, expected in (
+            ("укрывной материал; пленка; защитная плёнка", True, ["укрывной материал", "пленка", "защитная плёнка"]),
+            (None, False, ["укрывной материал", "пленка", "защитная плёнка"]),
+            ("маскировочная пленка", True, ["маскировочная пленка"]),
+            (None, True, []),
+        ):
+            response = self._upload(self.workbook(value, include))
+            self.assertEqual(response.status_code, 200, response.content)
+            self.assertEqual(response.json()["updated"], 1)
+            product.refresh_from_db()
+            self.assertEqual(product.synonyms, expected)
+            self.assertEqual(product.price, Decimal("999"))
+            self.assertEqual(product.quantity, 7)
+            self.assertEqual(product.images, ["https://example.com/a.jpg"])
+            self.assertEqual(ClientPriceOverride.objects.get(pk=override.pk).price, Decimal("500"))
+        foreign.refresh_from_db()
+        self.assertEqual(foreign.synonyms, ["чужой"])
+        self.assertEqual(Product.objects.count(), 2)
+        self.assertEqual(search_products(Product.objects.filter(distributor=self.distributor), "маскировочная").count(), 0)
+
+    def test_json_upload_and_catalog_share_synonyms(self):
+        auth = {"HTTP_AUTHORIZATION": f"Bearer {self.token.key}"}
+        response = self.http.post("/api/distributor/stock/upload/", {"items": [
+            {"sku": "FILM", "name": "Защитная пленка", "synonyms": "укрывной материал; пленка"}
+        ]}, content_type="application/json", **auth)
+        self.assertEqual(response.status_code, 200, response.content)
+        response = self.http.get("/api/distributor/stock/", {"search": "УКРЫВНОЙ"}, **auth)
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["results"][0]["synonyms"], ["укрывной материал", "пленка"])
+
+    def test_api_rejects_malformed_synonyms(self):
+        response = self.http.post("/api/distributor/stock/upload/", {"items": [
+            {"sku": "BAD", "synonyms": {"bad": "value"}}
+        ]}, content_type="application/json", HTTP_AUTHORIZATION=f"Bearer {self.token.key}")
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(Product.objects.filter(sku="BAD").exists())

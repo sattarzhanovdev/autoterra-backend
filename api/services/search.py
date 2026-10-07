@@ -1,14 +1,8 @@
-"""Поиск по товарам.
+"""Shared product substring search with optional Elasticsearch ranking.
 
-Один вход — :func:`search_products` — за которым либо Elasticsearch, либо
-поиск средствами БД. Выбор делается по настройке ``ELASTICSEARCH_URL``:
-пока она пуста, всё работает как раньше, и разворачивать ES не обязательно.
-
-Функция всегда возвращает **QuerySet**, а не список: дальше идёт постраничная
-выдача, сортировка и подсчёт, которым нужен ленивый запрос. Elasticsearch в
-этой схеме отвечает только на вопрос «какие id подходят», а сами записи
-по-прежнему читаются из БД — так выдача не разъезжается с актуальными
-остатками и ценами.
+Membership is always determined by normalized database data, so pagination,
+distributor isolation and partial synonym matching do not depend on ES refresh.
+Prices and stock continue to be read from the supplied QuerySet.
 """
 
 from __future__ import annotations
@@ -19,15 +13,14 @@ import urllib.error
 import urllib.request
 
 from django.conf import settings
-from django.db.models import Case, Q, When
+from django.db.models import Case, When
 
 logger = logging.getLogger(__name__)
 
 #: Поля, по которым ищем, и их вес в Elasticsearch.
-_SEARCH_FIELDS = ["name^3", "sku^2", "brand", "category", "description"]
+_SEARCH_FIELDS = ["name^3", "synonyms^3", "sku^2", "brand", "category"]
 
-#: Потолок совпадений от ES: больше страницы всё равно не показываем,
-#: а тянуть десятки тысяч id незачем.
+#: ES ranks up to this many hits; remaining database matches stay visible.
 _MAX_HITS = 1000
 
 
@@ -46,53 +39,26 @@ def search_products(queryset, query: str):
     настроен, но недоступен, откатываемся на поиск в БД: выдача товаров важнее,
     чем строгое использование ES.
     """
-    query = (query or "").strip()
+    from api.services.product_names import normalize_search_text
+    query = normalize_search_text(query)
     if not query:
         return queryset
-
+    matches = _database_search(queryset, query)
+    # The database defines membership, including partial matches and all tenants.
+    # ES is an optional ranking aid; stale/limited hits cannot hide matches.
     if is_elasticsearch_enabled():
         try:
             ids = _elasticsearch_ids(query)
-        except Exception as exc:  # noqa: BLE001 — любой сбой ES не должен ронять выдачу
+            if ids:
+                ordering = Case(*[When(id=pk, then=position) for position, pk in enumerate(ids)], default=len(ids))
+                return matches.order_by(ordering, "category", "name", "pk")
+        except Exception as exc:
             logger.warning("Elasticsearch недоступен, откат на поиск в БД: %s", exc)
-        else:
-            if ids is not None:
-                # Сохраняем порядок релевантности, полученный от ES.
-                ordering = Case(
-                    *[When(id=pk, then=position) for position, pk in enumerate(ids)]
-                )
-                return queryset.filter(id__in=ids).order_by(ordering)
-
-    return _database_search(queryset, query)
-
-
-def _case_variants(query: str) -> list[str]:
-    """Варианты написания запроса для регистронезависимого поиска.
-
-    ``icontains`` разворачивается в SQL ``LIKE``, а он в SQLite игнорирует
-    регистр только для латиницы: запрос «грунт» не найдёт «Грунт акриловый».
-    Регистр приводим на стороне Python — там Unicode обрабатывается верно, — и
-    ищем по нескольким вариантам сразу. На PostgreSQL ``ILIKE`` справляется сам,
-    и лишние варианты просто ничего не добавляют.
-    """
-    variants = {query, query.lower(), query.upper(), query.capitalize()}
-    return [value for value in variants if value]
+    return matches
 
 
 def _database_search(queryset, query: str):
-    """Поиск средствами БД — подстрока без учёта регистра.
-
-    Работает на SQLite и PostgreSQL одинаково и не требует расширений.
-    """
-    condition = Q()
-    for variant in _case_variants(query):
-        condition |= (
-            Q(name__contains=variant)
-            | Q(sku__contains=variant)
-            | Q(brand__contains=variant)
-            | Q(category__contains=variant)
-        )
-    return queryset.filter(condition)
+    return queryset.filter(search_text__contains=query)
 
 
 def _elasticsearch_ids(query: str):
@@ -147,6 +113,7 @@ def product_document(product) -> dict:
     return {
         "sku": product.sku,
         "name": product.name,
+        "synonyms": product.synonyms,
         "category": product.category,
         "brand": product.brand,
         "description": product.description or "",
@@ -245,6 +212,7 @@ def ensure_index() -> bool:
             "properties": {
                 "sku": {"type": "keyword"},
                 "name": {"type": "text", "analyzer": "ru"},
+                "synonyms": {"type": "text", "analyzer": "ru"},
                 "category": {"type": "text", "analyzer": "ru"},
                 "brand": {"type": "text", "analyzer": "ru"},
                 "description": {"type": "text", "analyzer": "ru"},

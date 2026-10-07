@@ -486,7 +486,58 @@ def validate_product_images(value):
             raise ValidationError(f"Фото: ссылка должна начинаться с http:// или https:// — {url[:60]}")
 
 
+class ProductQuerySet(models.QuerySet):
+    SEARCH_FIELDS = {"name", "sku", "brand", "category", "synonyms"}
+
+    def bulk_create(self, objs, **kwargs):
+        from api.services.product_names import normalize_product_synonyms, product_search_text
+        objs = list(objs)
+        for obj in objs:
+            obj.synonyms = normalize_product_synonyms(obj.synonyms)
+            obj.search_text = product_search_text(obj)
+        from django.db import transaction
+        with transaction.atomic(using=self.db):
+            result = super().bulk_create(objs, **kwargs)
+            if kwargs.get("update_conflicts"):
+                # Conflict updates may leave some search fields untouched.
+                # Rebuild from the persisted rows, not incoming partial values.
+                for obj in result:
+                    target = self.model.objects.using(self.db).filter(
+                        distributor_id=obj.distributor_id, sku=obj.sku)
+                    stored = target.get()
+                    super(ProductQuerySet, target).update(search_text=product_search_text(stored))
+            return result
+
+    def update(self, **kwargs):
+        if not self.SEARCH_FIELDS.intersection(kwargs):
+            return super().update(**kwargs)
+        from api.services.product_names import normalize_product_synonyms, product_search_text
+        from django.db import transaction
+        if "synonyms" in kwargs and not hasattr(kwargs["synonyms"], "resolve_expression"):
+            kwargs["synonyms"] = normalize_product_synonyms(kwargs["synonyms"])
+        with transaction.atomic(using=self.db):
+            ids = list(self.select_for_update(of=("self",)).values_list("pk", flat=True))
+            target = self.model.objects.using(self.db).filter(pk__in=ids)
+            count = super(ProductQuerySet, target).update(**kwargs)
+            for obj in target.iterator(chunk_size=500):
+                super(ProductQuerySet, self.model.objects.using(self.db).filter(pk=obj.pk)).update(
+                    search_text=product_search_text(obj))
+        return count
+
+    def bulk_update(self, objs, fields, **kwargs):
+        if set(fields) & self.SEARCH_FIELDS:
+            # Django bulk_update uses CASE expressions in update(); update() above
+            # rebuilds search_text from the resulting persisted fields.
+            if "synonyms" in fields:
+                from api.services.product_names import normalize_product_synonyms
+                objs = list(objs)
+                for obj in objs:
+                    obj.synonyms = normalize_product_synonyms(obj.synonyms)
+        return super().bulk_update(objs, fields, **kwargs)
+
+
 class Product(models.Model):
+    objects = ProductQuerySet.as_manager()
     MAX_IMAGES = MAX_PRODUCT_IMAGES
 
     STOCK_CHOICES = [
@@ -507,6 +558,9 @@ class Product(models.Model):
     wb_article = models.CharField("Артикул WB", max_length=64, blank=True, db_index=True)
     group_name = models.CharField("Группа", max_length=128, blank=True)
     name = models.CharField("Название", max_length=255)
+    synonyms = models.JSONField("Синонимы", default=list, blank=True,
+        help_text='Список альтернативных названий, например ["пленка", "укрывной материал"]. В Excel — через «;».')
+    search_text = models.TextField(default="", editable=False)
     category = models.CharField("Категория", max_length=128)
     brand = models.CharField("Бренд", max_length=128, default="AutoTerra")
     description = models.TextField("Описание", blank=True)
@@ -543,7 +597,21 @@ class Product(models.Model):
     def save(self, *args, **kwargs):
         # Нормализуем фото на любом пути записи: импорт Excel, API, админка,
         # синхронизация с 1С. В БД всегда лежит чистый список ссылок ≤ 15.
+        from api.services.product_names import normalize_product_synonyms, product_search_text
         self.images = normalize_product_images(self.images)
+        self.synonyms = normalize_product_synonyms(self.synonyms)
+        fields = kwargs.get("update_fields")
+        if fields is None or set(fields) & {"name", "sku", "brand", "category", "synonyms"}:
+            if fields is not None:
+                # Partial saves must index persisted values of untouched fields.
+                stored = type(self).objects.get(pk=self.pk)
+                for field in ("name", "sku", "brand", "category", "synonyms"):
+                    if field in fields:
+                        setattr(stored, field, getattr(self, field))
+                self.search_text = product_search_text(stored)
+                kwargs["update_fields"] = set(fields) | {"search_text"}
+            else:
+                self.search_text = product_search_text(self)
         super().save(*args, **kwargs)
 
     def __str__(self):

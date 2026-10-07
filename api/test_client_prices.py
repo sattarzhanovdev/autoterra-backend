@@ -42,6 +42,17 @@ class ClientPriceTests(_Base):
     def fresh_client(self):
         return type(self.client_profile).objects.get(pk=self.client_profile.pk)
 
+    def test_synonym_search_uses_same_catalog_and_price_scope(self):
+        self.product.synonyms = ["укрывной материал", "защитная плёнка"]
+        self.product.save(update_fields=["synonyms"])
+        self.save_price("650.25")
+        for query in ("УКРЫВНОЙ", "защитная пленка", "ПЛЁНКА"):
+            response = self.http.get(self.list_url, {"search": query}, **self.auth())
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(len(response.json()["results"]), 1)
+            self.assertEqual(response.json()["results"][0]["productId"], str(self.product.pk))
+            self.assertEqual(response.json()["results"][0]["price"], "650.25")
+
     def test_override_precedes_rank_and_can_exceed_base(self):
         for price in ('650.25', '1200.00'):
             self.assertIn(self.save_price(price).status_code, (200, 201))
