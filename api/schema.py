@@ -83,6 +83,7 @@ SCHEMAS = {
             "inn": {"type": "string", "example": "222122004503"},
             "region_id": {"type": "string", "example": "1"},
             "company_name": {"type": "string", "example": "СТО АвтоМастер"},
+            "category": {"type": "string", "enum": ["a", "b", "c", "s"], "default": "b", "description": "s — магазин"},
             "contact_name": {"type": "string", "example": "Иван"},
         },
     },
@@ -133,7 +134,7 @@ SCHEMAS = {
             "id": {"type": "string", "example": "1"},
             "inn": {"type": "string", "example": "222122004503"},
             "name": {"type": "string", "example": "Кузовной сервис Бишкек"},
-            "category": {"type": "string", "enum": ["a", "b", "c"], "example": "b"},
+            "category": {"type": "string", "enum": ["a", "b", "c", "s"], "example": "b"},
             "region": {"type": "string", "example": "Бишкек"},
             "city": {"type": "string", "example": "Бишкек"},
             "contact": {"type": "string", "example": "Даниел"},
@@ -142,6 +143,7 @@ SCHEMAS = {
             "managerId": {"type": "string", "nullable": True},
             "status": {"type": "string", "example": "active"},
             "partnerStatus": {"type": "string", "example": "Silver"},
+            "markupPercent": {"type": "string", "nullable": True, "example": "30.00"},
             "totalPurchases": {"type": "number", "example": 128500.0},
             "createdAt": {"type": "string", "format": "date-time"},
         },
@@ -239,7 +241,20 @@ SCHEMAS = {
     },
 }
 
+SCHEMAS["ShopMarkup"] = {
+    "type": "object",
+    "properties": {"clientId": {"type": "string"}, "markupPercent": {"type": "string", "example": "30.00"}},
+}
+
 PATHS = {
+    "/me/markup/": {
+        "get": _secured({"tags": ["Client"], "summary": "Своя информационная наценка (только магазин)",
+            "responses": {"200": _ok(_ref("ShopMarkup"))}}),
+        "patch": _secured({"tags": ["Client"], "summary": "Сохранить свою наценку; цена закупки не меняется",
+            "requestBody": _body({"type": "object", "required": ["markupPercent"], "additionalProperties": False,
+                "properties": {"markupPercent": {"type": "string", "description": "0–9999.99, до двух десятичных знаков"}}}, "Наценка магазина"),
+            "responses": {"200": _ok(_ref("ShopMarkup")), "400": _error("Некорректная наценка")}}),
+    },
     "/health/": {
         "get": {
             "tags": ["System"],

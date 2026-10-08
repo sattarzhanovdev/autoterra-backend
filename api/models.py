@@ -288,6 +288,7 @@ class ClientProfile(models.Model):
         ("a", "A · Дилерский салон"),
         ("b", "B · Автосервис с кузовным цехом"),
         ("c", "C · Гаражный сервис"),
+        ("s", "Магазин"),
     ]
     STATUS_CHOICES = [
         ("new", "Новый"),
@@ -348,6 +349,11 @@ class ClientProfile(models.Model):
         max_length=32,
         default=BASE_PARTNER_TIER,
         help_text="Присваивается автоматически по обороту. Менеджер может выставить вручную.",
+    )
+    markup_percent = models.DecimalField(
+        "Наценка магазина, %", max_digits=6, decimal_places=2, default=Decimal("0"),
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("9999.99"))],
+        help_text="Информационная цена продажи; не влияет на закупку и оплату.",
     )
     cash_payment_allowed = models.BooleanField("Разрешить оплату наличными курьеру", default=False)
     personal_discount_percent = models.DecimalField(

@@ -560,7 +560,7 @@ def _normalize_inn(inn):
 
 def _normalize_category(category):
     value = (category or "b").strip().lower()
-    return value if value in {"a", "b", "c"} else "b"
+    return value if value in {"a", "b", "c", "s"} else "b"
 
 
 def _find_region(value):
@@ -870,6 +870,7 @@ def _format_client(client):
         "address": "; ".join(client.stores.values_list("address", flat=True)),
         "distributorName": client.distributor.name if client.distributor else "",
         "status": client.status,
+        "markupPercent": str(client.markup_percent) if client.category == "s" else None,
         "cashPaymentAllowed": client.cash_payment_allowed,
         "partnerStatus": client.partner_status,
         "personalDiscountPercent": str(client.personal_discount_percent) if client.personal_discount_percent is not None else None,
@@ -946,6 +947,11 @@ def _format_product(product, client=None):
         payload["hasDiscount"] = details["has_discount"]
         payload["personalPrice"] = float(details["personal_price"]) if details["personal_price"] is not None else None
         payload["priceSource"] = details["price_source"]
+        if client.category == "s":
+            # Flutter calculates the informational sale price from this final
+            # purchase price. Never replace price used by orders/payments.
+            payload["markupPercent"] = str(client.markup_percent)
+            payload["markupClientId"] = str(client.pk)
     return payload
 
 
@@ -1384,6 +1390,7 @@ def register(request):
                 user=user,
                 inn=inn,
                 company_name=company_name,
+                category=validated_data["category"],
                 region=region,
                 status=status,
                 phone=username,
@@ -1789,6 +1796,26 @@ def store_detail(request, store_id):
         return JsonResponse({"ok": True})
 
     return JsonResponse({"detail": "Method not allowed"}, status=405)
+
+
+@csrf_exempt
+@require_http_methods(["GET", "PATCH"])
+def my_markup(request):
+    client, err = _require_client(request)
+    if err:
+        return err
+    if client.category != "s":
+        return JsonResponse({"detail": "Наценка доступна только клиенту-магазину"}, status=403)
+    if request.method == "PATCH":
+        payload = _json(request)
+        if not isinstance(payload, dict) or set(payload) != {"markupPercent"}:
+            return JsonResponse({"detail": "Передайте только markupPercent"}, status=400)
+        value = coerce_decimal(payload["markupPercent"], max_digits=6, decimal_places=2)
+        if value is None or value < 0 or value != Decimal(str(payload["markupPercent"])):
+            return JsonResponse({"detail": "Наценка должна быть от 0 до 9999.99%"}, status=400)
+        client.markup_percent = value
+        client.save(update_fields=["markup_percent"])
+    return JsonResponse({"clientId": str(client.pk), "markupPercent": str(client.markup_percent)})
 
 
 @require_GET

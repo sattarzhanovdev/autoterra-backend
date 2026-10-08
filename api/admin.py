@@ -299,7 +299,7 @@ class ClientProfileAdmin(admin.ModelAdmin):
     )
     list_filter = ("category", "status", "registration_source", "partner_status", "region", "distributor")
     search_fields = ("company_name", "inn", "external_id", "contact_name", "phone", "user__username", "user__email")
-    readonly_fields = ("created_at",)
+    readonly_fields = ("created_at", "markup_percent")
     inlines = (StoreInline, ClientPriceOverrideInline)
     actions = ("export_xlsx", "export_docx", "export_pdf", "export_csv")
     change_list_template = "admin/api/clientprofile/change_list.html"

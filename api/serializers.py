@@ -57,6 +57,10 @@ class RegistrationSerializer(BaseSerializer):
         contact_name = self.data.get('contact_name', '').strip()
         store_address = self.data.get('store_address', '').strip()
 
+        category = self.data.get('category', 'b')
+        if not isinstance(category, str) or category not in dict(ClientProfile.CATEGORY_CHOICES):
+            self.errors['category'] = 'Выберите тип бизнеса'
+
         email = str(self.data.get('email') or '').strip()
         try:
             validate_email(email)
@@ -91,6 +95,7 @@ class RegistrationSerializer(BaseSerializer):
             return False
 
         self.validated_data = {
+            'category': category,
             'email': email,
             'username': username,
             'password': password,

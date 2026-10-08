@@ -24,6 +24,7 @@ urlpatterns = [
     path("dashboard/", views.dashboard),
     path("stores/", views.stores),
     path("stores/<int:store_id>/", views.store_detail),
+    path("me/markup/", views.my_markup),
     path("products/", views.products),
     path("order-config/", views.order_config),
     path("orders/", views.orders),
