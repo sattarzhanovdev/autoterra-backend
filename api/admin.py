@@ -231,12 +231,50 @@ class DistributorAdmin(admin.ModelAdmin):
     search_fields = ("name", "inn", "external_id", "phone", "email", "user__username", "user__email")
     inlines = (ProductInline,)
 
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        role = getattr(getattr(request.user, "profile", None), "role", None)
+        if request.user.is_superuser or role == "admin":
+            return qs
+        return qs.filter(user=request.user) if role == "distributor" else qs.none()
+
+    def get_readonly_fields(self, request, obj=None):
+        role = getattr(getattr(request.user, "profile", None), "role", None)
+        if request.user.is_superuser or role == "admin":
+            return ()
+        return ("inn", "regions", "user", "external_id", "is_active")
+
+    def has_add_permission(self, request):
+        role = getattr(getattr(request.user, "profile", None), "role", None)
+        return bool(request.user.is_superuser or role == "admin") and super().has_add_permission(request)
+
+
 
 @admin.register(Region)
 class RegionAdmin(admin.ModelAdmin):
     list_display = ("id", "code", "name", "distributor", "manager", "is_active")
     list_filter = ("is_active", "distributor")
     search_fields = ("code", "name", "distributor__name", "manager__username", "manager__email")
+
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        role = getattr(getattr(request.user, "profile", None), "role", None)
+        if request.user.is_superuser or role == "admin":
+            return qs
+        if role == "distributor":
+            return qs.filter(distributor__user=request.user)
+        return qs.filter(manager=request.user) if role == "manager" else qs.none()
+
+    def has_change_permission(self, request, obj=None):
+        role = getattr(getattr(request.user, "profile", None), "role", None)
+        return bool(request.user.is_superuser or role == "admin") and super().has_change_permission(request, obj)
+
+    def has_add_permission(self, request):
+        return self.has_change_permission(request) and super().has_add_permission(request)
+
+    def has_delete_permission(self, request, obj=None):
+        return self.has_change_permission(request, obj) and super().has_delete_permission(request, obj)
+
 
 
 class _CentralPricePermissions:
@@ -307,10 +345,15 @@ class ClientProfileAdmin(admin.ModelAdmin):
     def get_readonly_fields(self, request, obj=None):
         role = getattr(getattr(request.user, "profile", None), "role", None)
         allowed = request.user.is_superuser or role == "admin" or (
-            role == "manager" and obj is not None
-            and request.user.managed_regions.filter(pk=obj.region_id).exists()
+            role == "distributor" and obj is not None and obj.distributor
+            and obj.distributor.user_id == request.user.pk
         )
-        fields = list(self.readonly_fields if allowed else (*self.readonly_fields, "personal_discount_percent"))
+        fields = list(self.readonly_fields)
+        if role == "distributor" and not request.user.is_superuser:
+            editable = {"personal_discount_percent", "status", "category", "cash_payment_allowed"} if allowed else set()
+            return tuple(field.name for field in self.model._meta.fields if field.name not in editable)
+        if not allowed:
+            fields.extend(["personal_discount_percent", "status", "category"])
         cash_allowed = request.user.is_superuser or role == "admin" or (
             role == "distributor" and obj is not None and obj.distributor and obj.distributor.user_id == request.user.pk
         )
@@ -319,9 +362,18 @@ class ClientProfileAdmin(admin.ModelAdmin):
         return tuple(fields)
 
     def save_model(self, request, obj, form, change):
-        old_cash = ClientProfile.objects.get(pk=obj.pk).cash_payment_allowed if change else False
-        old = ClientProfile.objects.get(pk=obj.pk).personal_discount_percent if change else None
+        previous = ClientProfile.objects.get(pk=obj.pk) if change else None
+        old_cash = previous.cash_payment_allowed if previous else False
+        old = previous.personal_discount_percent if previous else None
         super().save_model(request, obj, form, change)
+        from .services.client_profiles import synchronize_client_access
+        synchronize_client_access(obj)
+        if previous:
+            for field in ("status", "category"):
+                if getattr(previous, field) != getattr(obj, field):
+                    AuditLog.objects.create(user=request.user, action=f"Client {field} changed",
+                        model_name="ClientProfile", object_id=str(obj.pk), changes={
+                            "before": getattr(previous, field), "after": getattr(obj, field)})
         if old_cash != obj.cash_payment_allowed:
             AuditLog.objects.create(user=request.user, action="Client cash permission updated",
                 model_name="ClientProfile", object_id=str(obj.pk), changes={
@@ -334,12 +386,15 @@ class ClientProfileAdmin(admin.ModelAdmin):
                 })
 
     def get_queryset(self, request):
-        # Выгрузка читает регион, дистрибьютора и менеджера у каждого клиента —
-        # без select_related это N+1 на весь список.
-        return (
-            super().get_queryset(request)
-            .select_related("user", "region", "distributor", "manager")
-        )
+        qs = super().get_queryset(request).select_related("user", "region", "distributor", "manager")
+        role = getattr(getattr(request.user, "profile", None), "role", None)
+        if request.user.is_superuser or role == "admin":
+            return qs
+        if role == "distributor":
+            return qs.filter(distributor__user=request.user)
+        if role == "manager":
+            return qs.filter(region__manager=request.user)
+        return qs.none()
 
     # ── Выгрузка ─────────────────────────────────────────────────────────────
 

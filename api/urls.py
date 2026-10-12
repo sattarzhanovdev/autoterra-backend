@@ -3,6 +3,10 @@ from django.urls import path
 from . import finance_views, schema, views
 
 urlpatterns = [
+    path("orders/<int:replace_order_id>/replace/", views.create_order),
+    path("products/quote/", views.product_quote),
+    path("clients/<int:client_id>/settings/", views.client_settings),
+    path("distributor/profile/", views.distributor_profile),
     path("finance/yookassa/", finance_views.report),
     path("finance/yookassa/import/", finance_views.registry_import),
     path("finance/yookassa/export/", finance_views.export),

@@ -8,6 +8,7 @@ class ProductSynonymMigrationTests(TransactionTestCase):
         before = [('api', '0054_yookassa_finance')]
         after = [('api', '0055_product_synonyms')]
         executor = MigrationExecutor(connection)
+        latest = executor.loader.graph.leaf_nodes()
         executor.migrate(before)
         try:
             old_apps = executor.loader.project_state(before).apps
@@ -32,4 +33,4 @@ class ProductSynonymMigrationTests(TransactionTestCase):
                 self.assertEqual(product.quantity, 9)
                 self.assertEqual(product.images, ['https://example.com/a.jpg'])
         finally:
-            MigrationExecutor(connection).migrate(after)
+            MigrationExecutor(connection).migrate(latest)

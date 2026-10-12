@@ -1,4 +1,5 @@
 import json
+import re
 import logging
 import secrets
 import ssl
@@ -1421,9 +1422,10 @@ def register(request):
             "detail": "Ошибка уникальности данных: возможно, ИНН или телефон были зарегистрированы только что другим пользователем.",
             "code": "integrity_error"
         }, status=409)
-    except Exception as e:
+    except Exception:
+        logger.exception("Registration failed")
         return JsonResponse({
-            "detail": f"Внутренняя ошибка сервера при регистрации: {str(e)}",
+            "detail": "Не удалось завершить регистрацию. Попробуйте позднее или обратитесь в поддержку.",
             "code": "server_error"
         }, status=500)
 
@@ -1854,6 +1856,19 @@ def products(request):
 
 
 @require_GET
+def product_quote(request):
+    """Fresh prices/stock for visible products and the cart, in one scoped query."""
+    client, error = _require_client(request)
+    if error:
+        return error
+    raw = request.GET.get("ids", "").split(",")
+    if len(raw) > 200 or any(not value.isdigit() or len(value) > 18 for value in raw):
+        return JsonResponse({"detail": "Укажите от 1 до 200 ID товаров"}, status=400)
+    products = Product.objects.filter(pk__in=raw, distributor=client.distributor, is_active=True).order_by("pk")
+    return JsonResponse({"results": [_format_product(p, client) for p in products]})
+
+
+@require_GET
 def order_config(request):
     client, err = _require_client(request)
     if err:
@@ -1939,11 +1954,13 @@ def order_detail(request, order_id):
 
 @csrf_exempt
 @require_POST
-def create_order(request):
+def create_order(request, replace_order_id=None):
     client, err = _require_client(request)
     if err:
         return err
     payload = _json(request)
+    if not isinstance(payload, dict):
+        return JsonResponse({"detail": "Передайте JSON-объект"}, status=400)
     store_id = payload.get("storeId")
     items = payload.get("items") or []
     if not isinstance(payload.get("comment", ""), str):
@@ -1972,6 +1989,8 @@ def create_order(request):
         if not isinstance(items, list):
             raise ValueError
         for raw in items:
+            if isinstance(raw["productId"], bool) or not str(raw["productId"]).isdigit():
+                raise ValueError
             pid = int(raw["productId"])
             qty = raw["quantity"]
             if isinstance(qty, bool) or str(qty) != str(int(qty)) or not 0 < int(qty) <= 1000000:
@@ -1983,22 +2002,44 @@ def create_order(request):
         return JsonResponse({"detail": "Количество должно быть положительным целым числом"}, status=400)
 
     with transaction.atomic():
-        if payment_method == "cash":
-            client = ClientProfile.objects.select_for_update(of=("self",)).get(pk=client.pk)
-            if not client.cash_payment_allowed:
-                return JsonResponse({"detail": "Оплата наличными не разрешена для этого клиента"}, status=403)
+        replaced = None
+        if replace_order_id is not None:
+            replaced = client.orders.select_for_update(of=("self",)).filter(pk=replace_order_id).first()
+            if replaced is None:
+                return JsonResponse({"detail": "Заказ не найден"}, status=404)
+            if replaced.payments.filter(status__in=["pending", "waiting_for_capture"]).exists():
+                return JsonResponse({"detail": "Дождитесь завершения платежа"}, status=409)
+            if not replaced.can_transition_to("cancelled"):
+                return JsonResponse({"detail": "Нельзя изменить заказ на текущем этапе"}, status=400)
+        # The same client lock is used by discount/override updates: online and
+        # cash orders both read current pricing and access permissions.
+        client = ClientProfile.objects.select_for_update(of=("self",)).select_related("distributor", "user").get(pk=client.pk)
+        if client.status != "active" or not client.user.is_active or not client.distributor_id or not client.distributor.is_active:
+            return JsonResponse({"detail": "Доступ клиента ограничен", "code": "account_not_active", "status": client.status}, status=403)
+        if payment_method == "cash" and not client.cash_payment_allowed:
+            return JsonResponse({"detail": "Оплата наличными не разрешена для этого клиента"}, status=403)
+        if replaced:
+            # Restoration and replacement share one transaction. A failed new
+            # order leaves the old order and its reservations intact.
+            _restore_order_stock(replaced)
+            replaced.status = "cancelled"
+            replaced.rejection_reason = "Заменён клиентом"
+            replaced.save(update_fields=["status", "rejection_reason"])
         products_by_id = {p.pk: p for p in Product.objects.select_for_update(of=("self",)).filter(
             pk__in=quantities, distributor=client.distributor, is_active=True,
         ).order_by("pk")}
         if len(products_by_id) != len(quantities):
+            transaction.set_rollback(True)
             return JsonResponse({"detail": "Товар недоступен у вашего дистрибьютора"}, status=400)
         prices = {pid: price_for_client(client, product) for pid, product in products_by_id.items()}
         total = coerce_decimal(sum(prices[pid] * qty for pid, qty in quantities.items()), 12, 2)
         if total is None or total < 0:
+            transaction.set_rollback(True)
             return JsonResponse({"detail": "Некорректная сумма заказа"}, status=400)
         for pid, qty in quantities.items():
             product = products_by_id[pid]
             if product.status == "outOfStock" or (product.status != "onOrder" and product.quantity < qty):
+                transaction.set_rollback(True)
                 return JsonResponse({"detail": f"Недостаточно товара '{product.name}'. Доступно: {product.quantity}"}, status=400)
         order = Order.objects.create(
             client=client, store=store, distributor=client.distributor,
@@ -2016,6 +2057,8 @@ def create_order(request):
                 price=prices[pid], quantity=qty, reserved_quantity=reserved,
             )
         _log_audit(request, "Order created", order, {"paymentMethod": order.payment_method})
+        if replaced:
+            _log_audit(request, "Order replaced", replaced, {"replacementOrderId": order.pk})
 
     _notify_operator_order(order, f"Новый заказ ORD-{order.pk:05d}", f"{client.company_name} оформила заказ на {order.total_amount} ₽")
     _send_order_email(order)
@@ -5234,7 +5277,7 @@ def register_device_token(request):
 def send_notification(request):
     user = _current_user(request)
     profile = getattr(user, "profile", None)
-    if not profile or profile.role not in ["admin", "manager", "ai_expert"]:
+    if not profile or profile.role not in ["admin", "manager", "ai_expert", "distributor"]:
         return JsonResponse({"detail": "Forbidden"}, status=403)
 
     payload = _json(request)
@@ -5251,6 +5294,12 @@ def send_notification(request):
     if not target_user:
         return JsonResponse({"detail": "User not found"}, status=404)
 
+    if profile.role == "distributor":
+        distributor, _, error = _require_distributor_scope(request)
+        if error:
+            return error
+        if not _scope_clients(distributor, False).filter(user=target_user).exists():
+            return JsonResponse({"detail": "Клиент другого дистрибьютора"}, status=403)
     if profile.role == 'manager' and not ClientProfile.objects.filter(user=target_user, region__manager=user).exists():
         return JsonResponse({'detail': 'Клиент вне вашей зоны ответственности'}, status=403)
     if profile.role == 'ai_expert' and not ExpertTicket.objects.filter(client__user=target_user).exists():
@@ -5518,17 +5567,14 @@ def manager_clients(request):
 
 @require_GET
 def manager_client_unified(request, client_id):
-    user, is_global, err = _require_manager_scope(request)
+    user = _current_user(request)
+    if user and _resolve_role(user) == "distributor":
+        client, _, err = _client_settings_scope(request, client_id)
+    else:
+        client, err = _manager_scoped_client(request, client_id)
     if err:
         return err
-    
-    client = get_object_or_404(ClientProfile, id=client_id)
-    
-    # Check scope
-    managed_regions = _get_manager_regions(user, is_global)
-    if managed_regions is not None and client.region not in managed_regions:
-        return JsonResponse({"detail": "Доступ запрещен (вне вашей зоны ответственности)"}, status=403)
-    
+
     # 1. Profile
     profile_data = _format_client(client)
     
@@ -5632,18 +5678,13 @@ def manager_client_remove(request, client_id):
         return JsonResponse({'detail': 'Подтвердите точное название клиента'}, status=400)
     if request.method == 'DELETE':
         if _has_client_history(client):
-            return JsonResponse({'detail': 'У клиента есть история. Архивируйте учётную запись.', 'canArchive': True}, status=409)
+            return JsonResponse({'detail': 'У клиента есть история. Архивируйте учётную запись.', 'canArchive': bool(is_global)}, status=409)
         account = client.user
         account.delete()
         return JsonResponse({'deleted': True})
-    if client.status != 'archived':
-        client.status = 'archived'
-        client.save(update_fields=['status'])
-    account = client.user
-    if account.is_active:
-        account.is_active = False
-        account.save(update_fields=['is_active'])
-    account.auth_tokens.all().delete()
+    if not is_global:
+        return JsonResponse({'detail': 'Архивировать клиента может дистрибьютор или администратор'}, status=403)
+    _apply_client_status(request, client, 'archived')
     return JsonResponse({'archived': True})
 
 
@@ -5651,41 +5692,18 @@ def manager_client_remove(request, client_id):
 @require_http_methods(['POST', 'PUT', 'PATCH'])
 @transaction.atomic
 def manager_client_status(request, client_id):
-    user, is_global, err = _require_manager_scope(request)
-    if err:
-        return err
-
-    client = get_object_or_404(ClientProfile.objects.select_related('region', 'distributor', 'user').select_for_update(of=("self",)), id=client_id)
-
-    managed_regions = _get_manager_regions(user, is_global)
-    if managed_regions is not None and client.region not in managed_regions:
-        return JsonResponse({'detail': 'Доступ запрещён'}, status=403)
-
-    try:
-        data = json.loads(request.body)
-    except json.JSONDecodeError:
-        return JsonResponse({'detail': 'Invalid JSON'}, status=400)
-
-    new_status = data.get('status')
-    valid_statuses = [s[0] for s in ClientProfile.STATUS_CHOICES]
-    if new_status not in valid_statuses:
-        return JsonResponse({'detail': f'Недопустимый статус. Допустимые: {valid_statuses}'}, status=400)
-
-    old_status = client.status
-    client.status = new_status
-    if new_status == 'active' and not client.distributor and client.region and client.region.distributor:
-        client.distributor = client.region.distributor
-
-    client.save(update_fields=['status', 'distributor'])
-    if new_status == 'archived':
-        client.user.is_active = False
-        client.user.save(update_fields=['is_active'])
-        client.user.auth_tokens.all().delete()
-    elif new_status == 'active' and not client.user.is_active:
-        client.user.is_active = True
-        client.user.save(update_fields=['is_active'])
-    _log_audit(request, 'Client status changed', client, {'before': old_status, 'after': new_status})
-    return JsonResponse({'client': _format_manager_client(client)})
+    client, _, error = _client_settings_scope(request, client_id, write=True)
+    if error:
+        return error
+    client = ClientProfile.objects.select_for_update(of=("self",)).select_related("user", "region", "distributor").get(pk=client.pk)
+    _, _, error = _client_settings_scope(request, client_id, write=True)
+    if error:
+        return error
+    data = _json(request)
+    if not isinstance(data, dict) or set(data) != {"status"} or (not isinstance(data["status"], str) or data["status"] not in dict(ClientProfile.STATUS_CHOICES)):
+        return JsonResponse({"detail": "Недопустимый статус"}, status=400)
+    _apply_client_status(request, client, data["status"])
+    return JsonResponse({"client": _format_manager_client(client)})
 
 
 @csrf_exempt
@@ -6118,6 +6136,116 @@ def _price_scoped_client(request, client_id, *, write=False):
     return client, False, None
 
 
+
+def _client_settings_scope(request, client_id, *, write=False):
+    """Discount and business settings: distributor owner or global admin only.
+
+    Managers retain scoped read access to discounts, but cannot change them.
+    Personal product prices keep their separate, existing permissions.
+    """
+    user = _current_user(request)
+    if user and _resolve_role(user) == "manager" and not _is_user_global(user):
+        if write:
+            return None, False, JsonResponse({"detail": "Изменение доступно дистрибьютору и администратору"}, status=403)
+        client, error = _manager_scoped_client(request, client_id)
+        return client, False, error
+    distributor, is_admin, error = _require_distributor_scope(request)
+    if error:
+        return None, False, error
+    client = _scope_clients(distributor, is_admin).filter(pk=client_id).first()
+    if client is None:
+        return None, False, JsonResponse({"detail": "Клиент не найден"}, status=404)
+    return client, True, None
+
+
+def _apply_client_status(request, client, status):
+    old = client.status
+    client.status = status
+    if status == "active" and not client.distributor_id and client.region.distributor_id:
+        client.distributor = client.region.distributor
+    client.save(update_fields=["status", "distributor"])
+    from .services.client_profiles import synchronize_client_access
+    synchronize_client_access(client)
+    if old != status:
+        _log_audit(request, "Client status changed", client, {"before": old, "after": status})
+
+
+@csrf_exempt
+@require_http_methods(["GET", "PATCH"])
+@transaction.atomic
+def client_settings(request, client_id):
+    client, can_edit, error = _client_settings_scope(request, client_id, write=request.method == "PATCH")
+    if error:
+        return error
+    if request.method == "PATCH":
+        payload = _json(request)
+        if not isinstance(payload, dict) or not payload or set(payload) - {"status", "category"}:
+            return JsonResponse({"detail": "Передайте status и/или category"}, status=400)
+        for field, choices in (("status", ClientProfile.STATUS_CHOICES), ("category", ClientProfile.CATEGORY_CHOICES)):
+            if field in payload and (not isinstance(payload[field], str) or payload[field] not in dict(choices)):
+                return JsonResponse({"detail": f"Недопустимое значение {field}"}, status=400)
+        client = ClientProfile.objects.select_for_update(of=("self",)).select_related("user", "region", "distributor").get(pk=client.pk)
+        _, _, error = _client_settings_scope(request, client_id, write=True)
+        if error:
+            return error
+        if "category" in payload:
+            old = client.category
+            client.category = payload["category"]
+            client.save(update_fields=["category"])
+            if old != client.category:
+                _log_audit(request, "Client category changed", client, {"before": old, "after": client.category})
+        if "status" in payload:
+            _apply_client_status(request, client, payload["status"])
+    return JsonResponse({
+        "client": _format_client(client), "canEdit": can_edit,
+        "statuses": [{"value": v, "label": label} for v, label in ClientProfile.STATUS_CHOICES],
+        "categories": [{"value": v, "label": label} for v, label in ClientProfile.CATEGORY_CHOICES],
+    })
+
+
+@csrf_exempt
+@require_http_methods(["GET", "PATCH"])
+@transaction.atomic
+def distributor_profile(request):
+    distributor, is_admin, error = _require_distributor_scope(request)
+    if error:
+        return error
+    if is_admin:
+        distributor_id = request.GET.get("distributorId", "")
+        if not distributor_id.isdigit() or len(distributor_id) > 18:
+            return JsonResponse({"detail": "Укажите ID дистрибьютора"}, status=400)
+        distributor = Distributor.objects.filter(pk=distributor_id).first()
+    if distributor is None:
+        return JsonResponse({"detail": "Укажите дистрибьютора"}, status=404)
+    if request.method == "PATCH":
+        from django.core.exceptions import ValidationError
+        payload = _json(request)
+        if not isinstance(payload, dict) or not payload or set(payload) - {"name", "email", "phone"}:
+            return JsonResponse({"detail": "Можно изменить только название, email и телефон. ИНН и регионы меняет администратор в панели управления."}, status=400)
+        owner_id = distributor.user_id
+        distributor = Distributor.objects.select_for_update().get(pk=distributor.pk)
+        if not is_admin and (distributor.user_id != owner_id or not distributor.is_active):
+            return JsonResponse({"detail": "Дистрибьютор не найден"}, status=404)
+        changes = {}
+        for field, raw in payload.items():
+            if not isinstance(raw, str) or not raw.strip():
+                return JsonResponse({"detail": f"Поле {field} обязательно"}, status=400)
+            value = raw.strip()
+            if field == "phone" and (not re.fullmatch(r"[+0-9()\s-]+", value) or not 7 <= sum(c.isdigit() for c in value) <= 15):
+                return JsonResponse({"detail": "Введите телефон: от 7 до 15 цифр"}, status=400)
+            changes[field] = {"before": getattr(distributor, field), "after": value}
+            setattr(distributor, field, value)
+        try:
+            distributor.full_clean()
+        except ValidationError as exc:
+            return JsonResponse({"detail": "; ".join(exc.messages)}, status=400)
+        distributor.save(update_fields=list(payload))
+        if "email" in payload and distributor.user_id:
+            User.objects.filter(pk=distributor.user_id).update(email=distributor.email)
+        _log_audit(request, "Distributor profile updated", distributor, changes)
+    return JsonResponse({"distributor": _format_distributor(distributor)})
+
+
 def _format_client_price(client, product, override=None):
     from .services.pricing import apply_discount, discount_percent
     details = price_details(client, product)
@@ -6200,7 +6328,7 @@ def client_price_detail(request, client_id, product_id):
 @require_http_methods(["GET", "PATCH"])
 @transaction.atomic
 def client_discount(request, client_id):
-    client, can_edit, error = _price_scoped_client(
+    client, can_edit, error = _client_settings_scope(
         request, client_id, write=request.method == "PATCH")
     if error:
         return error
@@ -6217,7 +6345,7 @@ def client_discount(request, client_id):
             return JsonResponse({"detail": "Скидка должна быть от 0 до 100%, не более двух знаков после запятой"}, status=400)
         client = ClientProfile.objects.select_for_update(of=("self",)).get(pk=client.pk)
         # Recheck regional permissions after acquiring the client row lock.
-        _, _, error = _price_scoped_client(request, client_id, write=True)
+        _, _, error = _client_settings_scope(request, client_id, write=True)
         if error:
             return error
         old = client.personal_discount_percent

@@ -7,10 +7,10 @@ from .services.pricing import price_details, price_for_client
 from .test_bonus_account import _Base
 
 
-class ClientDiscountTests(_Base):
+class _ClientDiscountBase(_Base):
     def setUp(self):
         super().setUp()
-        for role in ("manager", "admin", "distributor", "courier"):
+        for role in ("manager", "admin", "distributor", "courier", "ai_expert"):
             user = User.objects.create_user(username=role)
             user.profile.role = role
             user.profile.save()
@@ -29,7 +29,7 @@ class ClientDiscountTests(_Base):
     def auth(self, key="manager"):
         return {"HTTP_AUTHORIZATION": f"Bearer {key}"}
 
-    def set_discount(self, value, key="manager"):
+    def set_discount(self, value, key="distributor"):
         return self.http.patch(self.url, {"personalDiscountPercent": value},
                                content_type="application/json", **self.auth(key))
 
@@ -41,6 +41,8 @@ class ClientDiscountTests(_Base):
             {"productId": self.product.pk, "quantity": 2, "price": "0.01"}]},
             content_type="application/json", **self.auth(self.token))
 
+
+class ClientDiscountTests(_ClientDiscountBase):
     def test_twenty_and_fifteen_percent_catalog_and_server_order_prices(self):
         for percent, price in (("20", 800), ("15", 850)):
             with self.subTest(percent=percent):
@@ -92,21 +94,21 @@ class ClientDiscountTests(_Base):
     def test_manager_cannot_access_other_region_admin_can(self):
         self.region.manager = None
         self.region.save()
-        self.assertEqual(self.set_discount("20").status_code, 404)
+        self.assertEqual(self.set_discount("20", "manager").status_code, 403)
         self.assertEqual(self.http.get(self.url, **self.auth()).status_code, 404)
         self.assertEqual(self.set_discount("20", "admin").status_code, 200)
         self.assertEqual(self.fresh().personal_discount_percent, 20)
 
-    def test_distributor_read_only_and_unrelated_roles_denied(self):
+    def test_distributor_can_edit_and_unrelated_roles_denied(self):
         self.set_discount("15")
         result = self.http.get(self.url, **self.auth("distributor"))
         self.assertEqual(result.status_code, 200)
         self.assertEqual(result.json()["personalDiscountPercent"], "15.00")
-        self.assertFalse(result.json()["canEdit"])
-        self.assertEqual(self.set_discount("20", "distributor").status_code, 403)
+        self.assertTrue(result.json()["canEdit"])
+        self.assertEqual(self.set_discount("15", "distributor").status_code, 200)
         stock = self.http.get("/api/distributor/stock/", {"clientId": self.client_profile.pk}, **self.auth("distributor"))
         self.assertEqual(stock.json()["results"][0]["price"], 850)
-        for key in (self.token, "courier"):
+        for key in (self.token, "courier", "manager", "ai_expert"):
             self.assertEqual(self.set_discount("20", key).status_code, 403)
         self.assertEqual(self.http.get(self.url).status_code, 401)
 
@@ -132,7 +134,7 @@ class ClientDiscountTests(_Base):
         self.set_discount(None)
         logs = list(AuditLog.objects.filter(action="Client discount updated").order_by("pk"))
         self.assertEqual(len(logs), 3)
-        self.assertEqual(logs[1].user.username, "manager")
+        self.assertEqual(logs[1].user.username, "distributor")
         self.assertEqual(logs[1].changes, {"oldPersonalDiscountPercent": "20.00", "personalDiscountPercent": "15.00"})
         self.assertIsNone(logs[2].changes["personalDiscountPercent"])
 
@@ -164,9 +166,9 @@ class ClientDiscountTests(_Base):
         model_admin = ClientProfileAdmin(ClientProfile, admin.site)
         request = RequestFactory().get("/")
         request.user = User.objects.get(username="distributor")
-        self.assertIn("personal_discount_percent", model_admin.get_readonly_fields(request, self.fresh()))
-        request.user = User.objects.get(username="manager")
         self.assertNotIn("personal_discount_percent", model_admin.get_readonly_fields(request, self.fresh()))
+        request.user = User.objects.get(username="manager")
+        self.assertIn("personal_discount_percent", model_admin.get_readonly_fields(request, self.fresh()))
         self.region.manager = None
         self.region.save()
         self.assertIn("personal_discount_percent", model_admin.get_readonly_fields(request, self.fresh()))

@@ -62,9 +62,12 @@ class ManagerClientLifecycleTests(_Base):
         response = self.http.delete(path, {'confirmName': self.client_profile.company_name},
                                     content_type='application/json', **self.auth)
         self.assertEqual(response.status_code, 409)
-        self.assertTrue(response.json()['canArchive'])
+        self.assertFalse(response.json()['canArchive'])
+        self.assertEqual(self.http.post(path, {'confirmName': self.client_profile.company_name}, content_type='application/json', **self.auth).status_code, 403)
+        admin = User.objects.create_superuser('archive-admin', password='pw')
+        AuthToken.objects.create(user=admin, key='archive-admin')
         self.assertEqual(self.http.post(path, {'confirmName': self.client_profile.company_name},
-                                        content_type='application/json', **self.auth).status_code, 200)
+                                        content_type='application/json', HTTP_AUTHORIZATION='Bearer archive-admin').status_code, 200)
         self.client_profile.refresh_from_db()
         self.assertEqual(self.client_profile.status, 'archived')
         self.client_profile.user.refresh_from_db()

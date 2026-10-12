@@ -45,7 +45,7 @@ class ProductionFlowTests(TestCase):
 
     def activate(self):
         with self.captureOnCommitCallbacks(execute=True):
-            response = self.post(f'/api/manager/clients/{self.customer.pk}/status/', {'status': 'active'}, 'manager')
+            response = self.post(f'/api/manager/clients/{self.customer.pk}/status/', {'status': 'active'}, 'dealer')
         self.assertEqual(response.status_code, 200, response.content)
 
     def order(self, qty=7, product=None):
