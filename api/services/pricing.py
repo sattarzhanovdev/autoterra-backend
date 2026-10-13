@@ -1,7 +1,8 @@
 """Цена товара для конкретного клиента.
 
 Активная персональная цена ClientPriceOverride имеет приоритет. Без неё
-применяется персональная скидка клиента, а если она не задана — расчёт
+применяется скидка клиента по бренду, затем общая персональная скидка,
+а если они не заданы — расчёт
 по рангу ClientProfile.partner_status (PartnerTier и RankDiscount).
 
 Единственная точка расчёта — ``price_for_client``. И витрина, и оформление
@@ -92,7 +93,7 @@ def apply_discount(price, percent) -> Decimal:
 
 
 def price_for_client(client, product) -> Decimal:
-    """Персональная цена → персональная скидка → ранг → базовая цена."""
+    """Персональная цена → бренд → общая скидка → ранг → базовая цена."""
     return price_details(client, product)["price"]
 
 
@@ -111,10 +112,24 @@ def personal_price(client, product):
     return cache.get(product.pk)
 
 
+
+def brand_discount_percent(client, product):
+    if client is None or product is None or client.distributor_id != product.distributor_id:
+        return None
+    from .product_names import normalize_brand
+    cache = getattr(client, "_brand_discounts", None)
+    if cache is None:
+        from api.models import ClientBrandDiscount
+        cache = dict(ClientBrandDiscount.objects.filter(client_id=client.pk).values_list("brand", "percent"))
+        client._brand_discounts = cache
+    return cache.get(normalize_brand(product.brand))
+
+
 def price_details(client, product) -> dict:
     """Цена + из чего она получилась — для витрины и отладки."""
     personal_discount = getattr(client, "personal_discount_percent", None)
-    percent = personal_discount if personal_discount is not None else discount_percent(client, product)
+    brand_discount = brand_discount_percent(client, product)
+    percent = brand_discount if brand_discount is not None else personal_discount if personal_discount is not None else discount_percent(client, product)
     base = Decimal(str(product.price or 0)).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
     final = apply_discount(product.price, percent)
     override = personal_price(client, product)
@@ -127,5 +142,5 @@ def price_details(client, product) -> dict:
         "discount_percent": percent,
         "has_discount": final < base if override is not None else percent > 0,
         "personal_price": override,
-        "price_source": "personal" if override is not None else "personal_discount" if personal_discount is not None else "rank" if percent > 0 else "base",
+        "price_source": "personal" if override is not None else "brand_discount" if brand_discount is not None else "personal_discount" if personal_discount is not None else "rank" if percent > 0 else "base",
     }

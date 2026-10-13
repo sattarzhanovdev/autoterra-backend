@@ -26,3 +26,9 @@ def product_search_text(product):
     return "\n".join(normalize_search_text(value) for value in (
         product.name, product.sku, product.brand, product.category, *product.synonyms,
     ))
+
+
+def normalize_brand(value):
+    """Canonical identity, independent of price-list casing and whitespace."""
+    import unicodedata
+    return " ".join(unicodedata.normalize("NFKC", str(value or "")).casefold().split())

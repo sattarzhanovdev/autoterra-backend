@@ -624,6 +624,39 @@ class Product(models.Model):
         return f"{self.sku} · {self.name}"
 
 
+class ClientBrandDiscount(models.Model):
+    client = models.ForeignKey(ClientProfile, on_delete=models.CASCADE, related_name="brand_discounts", verbose_name="Клиент")
+    brand = models.CharField("Бренд", max_length=128, help_text="Регистр и лишние пробелы не учитываются")
+    percent = models.DecimalField("Скидка, %", max_digits=5, decimal_places=2,
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))])
+    updated_at = models.DateTimeField("Дата изменения", auto_now=True)
+
+    class Meta:
+        verbose_name = "Скидка клиента по бренду"
+        verbose_name_plural = "Скидки клиентов по брендам"
+        ordering = ("brand",)
+        constraints = [
+            models.UniqueConstraint(fields=("client", "brand"), name="unique_client_brand_discount"),
+            models.CheckConstraint(condition=models.Q(percent__gte=0, percent__lte=100), name="client_brand_discount_range"),
+        ]
+
+    def clean(self):
+        from .services.product_names import normalize_brand
+        super().clean()
+        self.brand = normalize_brand(self.brand)
+        if not self.brand:
+            raise ValidationError({"brand": "Укажите бренд"})
+
+    def save(self, *args, **kwargs):
+        from .services.product_names import normalize_brand
+        self.brand = normalize_brand(self.brand)
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.client} · {self.brand} · {self.percent}%"
+
+
 class ClientPriceOverride(models.Model):
     client = models.ForeignKey(ClientProfile, on_delete=models.CASCADE, related_name="price_overrides", verbose_name="Клиент")
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="client_price_overrides", verbose_name="Товар")

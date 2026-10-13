@@ -213,6 +213,7 @@ def parse_products_workbook(file_obj):
             "group_name": _norm(_cell(row, mapping, "group_name")),
             "category": _norm(_cell(row, mapping, "category")) or "Без категории",
             "brand": _norm(_cell(row, mapping, "brand")) or "AutoTerra",
+            "_has_brand": "brand" in mapping and bool(_norm(_cell(row, mapping, "brand"))),
             "description": _norm(_cell(row, mapping, "description")),
             "color": _norm(_cell(row, mapping, "color")),
             "barcode": _norm(_cell(row, mapping, "barcode")),
@@ -271,6 +272,8 @@ def upsert_products(distributor, products):
         defaults = {field: item[field] for field in _MODEL_FIELDS if field != "sku" and field in item}
 
         existing = Product.objects.filter(distributor=distributor, sku=item["sku"]).first()
+        if existing is not None and not item.get("_has_brand", "brand" in item):
+            defaults.pop("brand", None)
 
         if item.get("_has_price"):
             defaults["price"] = item["price"]

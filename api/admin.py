@@ -23,6 +23,7 @@ from .models import (
     BonusTransaction,
     ClientProfile,
     ClientPriceOverride,
+    ClientBrandDiscount,
     ColorRequest,
     ContactHistory,
     CourierTask,
@@ -187,6 +188,27 @@ class ProductInline(admin.TabularInline):
     fields = ("sku", "name", "category", "brand", "volume", "price", "quantity", "status")
 
 
+
+class ClientBrandDiscountInline(admin.TabularInline):
+    model = ClientBrandDiscount
+    extra = 0
+    fields = ("brand", "percent")
+
+    def _allowed(self, request, obj):
+        role = getattr(getattr(request.user, "profile", None), "role", None)
+        return request.user.is_superuser or role == "admin" or (
+            role == "distributor" and obj and obj.distributor and obj.distributor.is_active and obj.distributor.user_id == request.user.pk)
+
+    def has_add_permission(self, request, obj=None):
+        return bool(self._allowed(request, obj)) and super().has_add_permission(request, obj)
+
+    def has_change_permission(self, request, obj=None):
+        return bool(self._allowed(request, obj)) and super().has_change_permission(request, obj)
+
+    def has_delete_permission(self, request, obj=None):
+        return bool(self._allowed(request, obj)) and super().has_delete_permission(request, obj)
+
+
 class OrderItemInline(admin.TabularInline):
     model = OrderItem
     extra = 0
@@ -338,7 +360,7 @@ class ClientProfileAdmin(admin.ModelAdmin):
     list_filter = ("category", "status", "registration_source", "partner_status", "region", "distributor")
     search_fields = ("company_name", "inn", "external_id", "contact_name", "phone", "user__username", "user__email")
     readonly_fields = ("created_at", "markup_percent")
-    inlines = (StoreInline, ClientPriceOverrideInline)
+    inlines = (StoreInline, ClientPriceOverrideInline, ClientBrandDiscountInline)
     actions = ("export_xlsx", "export_docx", "export_pdf", "export_csv")
     change_list_template = "admin/api/clientprofile/change_list.html"
 

@@ -3,6 +3,7 @@ from django.urls import path
 from . import finance_views, schema, views
 
 urlpatterns = [
+    path("clients/<int:client_id>/brand-discounts/", views.client_brand_discounts),
     path("orders/<int:replace_order_id>/replace/", views.create_order),
     path("products/quote/", views.product_quote),
     path("clients/<int:client_id>/settings/", views.client_settings),

@@ -32,6 +32,7 @@ from .models import (
     AuditLog,
     ClientProfile,
     ClientPriceOverride,
+    ClientBrandDiscount,
     ColorRequest,
     CourierTask,
     CourierPickedItem,
@@ -6255,6 +6256,7 @@ def _format_client_price(client, product, override=None):
         'basePrice': str(details['base_price']),
         'rankPrice': str(apply_discount(product.price, discount_percent(client, product))),
         'price': str(details['price']), 'priceSource': details['price_source'],
+        'discountPercent': str(details['discount_percent']),
         'overrideId': str(override.pk) if override else None,
         'personalPrice': str(override.price) if override else None,
         'isActive': override.is_active if override else False,
@@ -6467,3 +6469,66 @@ def courier_collect_cash(request, task_id):
     _notify_client_order(order, "Наличные получены", f"Водитель подтвердил получение {payment.amount} ₽ за заказ ORD-{order.pk:05d}.")
     _notify_operator_order(order, "Наличные получены", f"Водитель {user.get_full_name() or user.username} получил {payment.amount} ₽ за заказ ORD-{order.pk:05d}.")
     return JsonResponse({"task": _format_courier_task(task)})
+
+
+@csrf_exempt
+@require_http_methods(["GET", "PATCH", "DELETE"])
+@transaction.atomic
+def client_brand_discounts(request, client_id):
+    client, can_edit, error = _client_settings_scope(request, client_id, write=request.method != "GET")
+    if error:
+        return error
+    from .services.product_names import normalize_brand
+    if request.method != "GET":
+        client = ClientProfile.objects.select_for_update(of=("self",)).get(pk=client.pk)
+        _, _, error = _client_settings_scope(request, client_id, write=True)
+        if error:
+            return error
+    existing = {rule.brand: rule for rule in ClientBrandDiscount.objects.filter(client=client)}
+    labels = {}
+    for raw in Product.objects.filter(distributor_id=client.distributor_id, is_active=True).order_by("brand").values_list("brand", flat=True).distinct():
+        key = normalize_brand(raw)
+        if key:
+            labels.setdefault(key, " ".join(raw.split()))
+    payload = _json(request) if request.method != "GET" else None
+    if request.method == "DELETE":
+        if not isinstance(payload, dict) or set(payload) != {"brand"} or not isinstance(payload["brand"], str):
+            return JsonResponse({"detail": "Передайте brand"}, status=400)
+        key = normalize_brand(payload["brand"])
+        if not key or len(key) > 128:
+            return JsonResponse({"detail": "Укажите корректный бренд"}, status=400)
+        rule = existing.get(key)
+        if rule:
+            _log_audit(request, "Client brand discount deleted", rule, {"clientId": client.pk, "brand": key, "percent": str(rule.percent)})
+            rule.delete()
+        return JsonResponse({"status": "ok"})
+    if request.method == "PATCH":
+        if not isinstance(payload, dict) or set(payload) != {"discounts"} or not isinstance(payload["discounts"], list) or not 1 <= len(payload["discounts"]) <= 200:
+            return JsonResponse({"detail": "Передайте discounts: от 1 до 200 скидок"}, status=400)
+        updates = {}
+        for item in payload["discounts"]:
+            if not isinstance(item, dict) or set(item) != {"brand", "percent"} or not isinstance(item["brand"], str):
+                return JsonResponse({"detail": "Укажите brand и percent для каждой скидки"}, status=400)
+            key = normalize_brand(item["brand"])
+            raw = item["percent"]
+            value = coerce_decimal(raw, 5, 2)
+            if isinstance(raw, bool) or value is None or not 0 <= value <= 100 or value != Decimal(str(raw)):
+                return JsonResponse({"detail": "Скидка: от 0 до 100%, до двух знаков после запятой"}, status=400)
+            if not key or len(key) > 128 or key not in labels and key not in existing:
+                return JsonResponse({"detail": "Бренд не найден в ассортименте дистрибьютора клиента"}, status=400)
+            if key in updates:
+                return JsonResponse({"detail": "Бренд повторяется в запросе"}, status=400)
+            updates[key] = value
+        for key, value in updates.items():
+            old = existing.get(key)
+            rule, created = ClientBrandDiscount.objects.update_or_create(client=client, brand=key, defaults={"percent": value})
+            _log_audit(request, "Client brand discount updated", rule, {"clientId": client.pk, "brand": key,
+                "oldPercent": str(old.percent) if old else None, "percent": str(value)})
+        return JsonResponse({"status": "ok", "updated": len(updates)})
+    search = normalize_brand(request.GET.get("search", ""))
+    rows = [{"brand": key, "label": labels.get(key, key), "available": key in labels,
+        "percent": str(existing[key].percent) if key in existing else None}
+        for key in sorted(set(labels) | set(existing)) if search in key]
+    if request.GET.get("discountsOnly") == "true":
+        rows = [row for row in rows if row["percent"] is not None]
+    return JsonResponse(paginated_response(request, rows, lambda row: row, extra={"canEdit": can_edit}))
