@@ -7,6 +7,7 @@ class ApiConfig(AppConfig):
     verbose_name = "Данные платформы"
 
     def ready(self) -> None:
+        import api.services.knowledge_documents  # noqa: F401 — private file cleanup
         import api.signals  # noqa: F401 — registers all signal handlers
         from django.db import connection
         if connection.vendor == "sqlite":

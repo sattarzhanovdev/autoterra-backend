@@ -5904,72 +5904,30 @@ def ai_chat(request):
     if not user:
         return JsonResponse({"detail": "Unauthorized"}, status=401)
     
-    profile = getattr(user, "profile", None)
-    is_expert_user = profile and profile.role in ["admin", "manager", "ai_expert"]
+    is_expert_user = _resolve_role(user) in ["admin", "manager", "ai_expert"]
     
     payload = _json(request)
-    question = (payload.get("message") or "").strip()
+    message = payload.get("message", "")
+    if not isinstance(message, str):
+        return JsonResponse({"detail": "message должен быть строкой."}, status=400)
+    question = message.strip()
     
     query_words = _normalize_words(question)
     if not query_words:
-        return JsonResponse({"answer": "Пожалуйста, введите ваш вопрос.", "suggestEscalation": False})
+        return JsonResponse({"answer": "Пожалуйста, введите ваш вопрос.", "suggestEscalation": False, "sources": []})
 
-    # 1. Fetch approved cards
-    cards = KnowledgeCard.objects.filter(status="approved")
-    
-    # 2. Ranking
-    ranked = []
-    for card in cards:
-        score = _score_card(query_words, card)
-        if score > 0.1: # Minimum threshold to even consider
-            ranked.append((score, card))
-    
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    
-    # 3. Decision making
-    CONFIDENCE_THRESHOLD = 0.5
-    best_score = ranked[0][0] if ranked else 0
-    card = ranked[0][1] if ranked else None
-
-    # Guardrails: Forbidden topics if not in KB
-    dangerous_keywords = ["пропорции", "смешивание", "гарантия", "совместимость", "срок годности", "разбавление"]
-    is_query_dangerous = any(kw in question.lower() for kw in dangerous_keywords)
-
-    if card and best_score >= CONFIDENCE_THRESHOLD:
-        solution_lower = card.solution.lower()
-        # If user asks for specifics but KB doesn't have them explicitly
-        if is_query_dangerous and not any(kw in solution_lower for kw in dangerous_keywords) and not is_expert_user:
-            answer = (f"В базе знаний найдена информация по теме '{card.title or card.problem}', но в ней отсутствуют точные технические параметры (пропорции/гарантии). "
-                      "Во избежание нарушения технологии, я не могу дать совет. Рекомендую создать обращение к эксперту.")
-            return JsonResponse({
-                "answer": answer, 
-                "sourceId": str(card.id), 
-                "suggestEscalation": True
-            })
-        
-        answer = f"На основе утверждённой базы знаний ({card.category}):\n\n{card.solution}"
-        if card.restrictions:
-            answer += f"\n\nВАЖНО: {card.restrictions}"
-        
-        return JsonResponse({
-            "answer": answer,
-            "sourceId": str(card.id),
-            "suggestEscalation": False
-        })
-
-    # If it's an expert, maybe we give them a "best guess" or allow them to see what the AI would say?
-    # For now, if no match, we still suggest escalation for clients, but for experts we might give a hint.
-    if is_expert_user:
-        return JsonResponse({
-            "answer": "В базе знаний точного совпадения не найдено. Как эксперт, вы можете создать новую карточку знаний или ответить на тикет вручную.",
-            "suggestEscalation": False
-        })
-
-    # 4. Low confidence or No Match for clients
-    return JsonResponse({
-        "answer": "Недостаточно данных в базе знаний для точного ответа. Перевожу на эксперта. Пожалуйста, создайте тикет с описанием проблемы и фото.",
-        "suggestEscalation": True
-    })
+    from .services.knowledge_retrieval import retrieve, grounded_answer
+    if len(question) > 4000:
+        return JsonResponse({"detail": "Вопрос слишком длинный (максимум 4000 символов)."}, status=400)
+    contexts = retrieve(question)
+    answer, insufficient = grounded_answer(question, contexts)
+    sources = [item['source'] for item in contexts]
+    result = {"answer": answer, "sources": sources,
+              "suggestEscalation": insufficient and not is_expert_user}
+    first_card = next((source for source in sources if source['type'] == 'card'), None)
+    if first_card:
+        result['sourceId'] = first_card['id']
+    return JsonResponse(result)
 
 
 @csrf_exempt

@@ -1838,3 +1838,35 @@ class YooKassaRegistryOperation(models.Model):
     net = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     currency = models.CharField(max_length=8, default='RUB')
     fingerprint = models.CharField(max_length=64)
+
+
+class KnowledgeDocument(models.Model):
+    title = models.CharField(max_length=255)
+    original_name = models.CharField(max_length=255)
+    # Relative UUID path in PRIVATE_KNOWLEDGE_ROOT; never a media URL.
+    storage_name = models.CharField(max_length=128, unique=True)
+    file_type = models.CharField(max_length=8)
+    size = models.PositiveBigIntegerField()
+    status = models.CharField(max_length=16, default="processing", db_index=True,
+        choices=[("processing", "Обрабатывается"), ("ready", "Готов"), ("failed", "Ошибка")])
+    uploaded_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    error = models.TextField(blank=True)
+    error_code = models.CharField(max_length=32, blank=True)
+    claimed_at = models.DateTimeField(null=True, blank=True)
+    processing_token = models.CharField(max_length=32, blank=True)
+
+    class Meta:
+        ordering = ("-created_at", "-id")
+
+
+class KnowledgeChunk(models.Model):
+    document = models.ForeignKey(KnowledgeDocument, on_delete=models.CASCADE, related_name="chunks")
+    ordinal = models.PositiveIntegerField()
+    page = models.PositiveIntegerField(null=True, blank=True)
+    section = models.CharField(max_length=255, blank=True)
+    text = models.TextField()
+
+    class Meta:
+        ordering = ("ordinal",)
+        constraints = [models.UniqueConstraint(fields=("document", "ordinal"), name="unique_document_chunk")]

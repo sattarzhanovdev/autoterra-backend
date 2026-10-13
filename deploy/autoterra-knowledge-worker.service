@@ -1,0 +1,23 @@
+# Replace /srv/autoterra-backend and autoterra with your installation path/user.
+[Unit]
+Description=AutoTerra knowledge document worker
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=autoterra
+Group=autoterra
+WorkingDirectory=/srv/autoterra-backend
+EnvironmentFile=/srv/autoterra-backend/.env
+ExecStart=/srv/autoterra-backend/.venv/bin/python manage.py process_knowledge_documents
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+# Worker plus its single parser subprocess.
+MemoryMax=1500M
+TimeoutStopSec=150
+
+[Install]
+WantedBy=multi-user.target

@@ -25,3 +25,4 @@ __pycache__/
 htmlcov/
 
 firebase-service-account.json
+private_knowledge/

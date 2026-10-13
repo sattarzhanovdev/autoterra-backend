@@ -34,9 +34,9 @@ FCM_SERVICE_ACCOUNT_FILE = os.environ.get(
     str(BASE_DIR / "firebase-service-account.json"),
 )
 
-# Upload limits (20MB)
+# General request payload limit; document file size has its own upload handler.
 DATA_UPLOAD_MAX_MEMORY_SIZE = 20 * 1024 * 1024
-FILE_UPLOAD_MAX_MEMORY_SIZE = 20 * 1024 * 1024
+FILE_UPLOAD_MAX_MEMORY_SIZE = 2 * 1024 * 1024
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -141,7 +141,7 @@ MEDIA_ROOT = BASE_DIR / "media"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "")
-HF_CHAT_MODEL = os.environ.get("HF_CHAT_MODEL", "openai/gpt-oss-120b")
+HF_CHAT_MODEL = os.environ.get("HF_CHAT_MODEL", "openai/gpt-oss-120b:groq")
 HF_CHAT_URL = os.environ.get(
     "HF_CHAT_URL",
     "https://router.huggingface.co/v1/chat/completions",
@@ -225,3 +225,11 @@ YOOKASSA_RETURN_URL = os.environ.get("YOOKASSA_RETURN_URL", "https://autoterra.s
 # Webhook проверяется повторным запросом к API ЮKassa, отдельного секрета нет.
 
 PASSWORD_RESET_TIMEOUT = 15 * 60
+
+
+# Must be outside MEDIA_ROOT and any web-server public alias.
+PRIVATE_KNOWLEDGE_ROOT = Path(os.environ.get("PRIVATE_KNOWLEDGE_ROOT", str(BASE_DIR / "private_knowledge")))
+KNOWLEDGE_MAX_FILE_SIZE = 25 * 1024 * 1024
+KNOWLEDGE_PROCESS_TIMEOUT = 120
+KNOWLEDGE_MAX_EXTRACTED_CHARS = 5_000_000
+HF_CHAT_TIMEOUT = 45
