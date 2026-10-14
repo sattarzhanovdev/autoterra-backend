@@ -1,11 +1,14 @@
 import re
 from decimal import Decimal, InvalidOperation
 from django import forms
+from django.core.exceptions import PermissionDenied
+from django.db import transaction
+from django.db.models import Q
 from django.contrib import admin, messages
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.models import User
 from django.template.response import TemplateResponse
-from django.http import HttpResponse
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect, render
 from django.urls import path, reverse
 from django.utils.html import format_html
@@ -15,6 +18,8 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from .forms import ProductExcelImportForm
+from .order_admin_forms import OrderAdminForm, OrderItemCommandFormSet, OrderMutationReasonForm
+from .services import orders as order_service
 from .services.exports import EXPORTERS as EXPORT_FORMATS, ExportUnavailable, export_clients
 from .models import (
     Attachment,
@@ -649,26 +654,249 @@ class ProductAdmin(admin.ModelAdmin):
         return created, updated, errors
 
 
+class OrderAdjustmentInline(admin.StackedInline):
+    model = OrderAdjustment
+    extra = 0
+    fields = ("created_at", "created_by", "reason", "original_items", "adjusted_items")
+    readonly_fields = fields
+    can_delete = False
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
 @admin.register(Order)
 class OrderAdmin(admin.ModelAdmin):
+    form = OrderAdminForm
+    change_form_template = "admin/api/order/change_form.html"
     list_display = ("id", "client", "store", "distributor", "external_id", "status", "created_at")
     list_filter = ("status", "distributor", "store")
     search_fields = ("id", "external_id", "client__company_name", "client__inn", "store__name", "comment", "items__name", "items__sku")
-    readonly_fields = ("payment_method", "cash_collected_by", "client", "store", "distributor", "status", "stock_restored", "created_at", "confirmed_at", "paid_at", "shipped_at")
+    readonly_fields = ("external_id", "cash_collected_by", "status", "stock_restored", "created_at", "confirmed_at", "paid_at", "shipped_at")
+    inlines = (OrderItemInline, OrderAdjustmentInline)
+    actions = ("confirm_selected", "reject_selected", "cancel_selected", "ship_selected", "fulfill_selected")
+    transition_labels = {
+        "confirmed": "Подтвердить заказ", "rejected": "Отклонить заказ",
+        "cancelled": "Отменить заказ", "shipped": "Отметить отправку", "fulfilled": "Завершить заказ",
+    }
+
+    def get_queryset(self, request):
+        queryset = super().get_queryset(request)
+        role = getattr(getattr(request.user, "profile", None), "role", None)
+        if request.user.is_superuser or role == "admin":
+            return queryset
+        if role == "distributor":
+            return queryset.filter(distributor__user=request.user)
+        if role == "manager":
+            return queryset.filter(client__region__manager=request.user)
+        return queryset.none()
+
+    def _client_queryset(self, request, obj):
+        queryset = ClientProfile.objects.all()
+        role = getattr(getattr(request.user, "profile", None), "role", None)
+        if not request.user.is_superuser and role != "admin":
+            queryset = queryset.filter(distributor_id=obj.distributor_id)
+            if role == "manager":
+                queryset = queryset.filter(region__manager=request.user)
+        return queryset.filter(Q(status="active") | Q(pk=obj.client_id))
+
+    def has_change_permission(self, request, obj=None):
+        if not super().has_change_permission(request, obj):
+            return False
+        return obj is None or self.get_queryset(request).filter(pk=obj.pk).exists()
+
+    def get_readonly_fields(self, request, obj=None):
+        fields = list(self.readonly_fields)
+        if not order_service.is_editable_order(obj):
+            fields.extend(order_service.METADATA_FIELDS)
+        else:
+            if obj.status != "new" or obj.payments.exists():
+                fields.append("distributor")
+            if obj.payments.exists():
+                fields.append("payment_method")
+        return tuple(dict.fromkeys(fields))
 
     def has_add_permission(self, request):
         return False
 
     def has_delete_permission(self, request, obj=None):
         return False
-    inlines = (OrderItemInline,)
+
+    def get_form(self, request, obj=None, **kwargs):
+        form = super().get_form(request, obj, **kwargs)
+        editable = order_service.is_editable_order(obj)
+        if "adjustment_reason" in form.base_fields:
+            form.base_fields["adjustment_reason"].disabled = not editable
+        role = getattr(getattr(request.user, "profile", None), "role", None)
+        if obj and not request.user.is_superuser and role != "admin":
+            if "distributor" in form.base_fields:
+                form.base_fields["distributor"].queryset = Distributor.objects.filter(pk=obj.distributor_id)
+            if "client" in form.base_fields:
+                form.base_fields["client"].queryset = ClientProfile.objects.filter(distributor_id=obj.distributor_id)
+        if "client" in form.base_fields and obj:
+            form.base_fields["client"].queryset = self._client_queryset(request, obj)
+        if "store" in form.base_fields and obj:
+            client_id = request.POST.get("client", obj.client_id) if request.method == "POST" else obj.client_id
+            try:
+                client_id = int(client_id)
+            except (ValueError, TypeError):
+                client_id = obj.client_id
+            form.base_fields["store"].queryset = Store.objects.filter(client_id=client_id, is_active=True)
+        if "courier" in form.base_fields:
+            form.base_fields["courier"].queryset = User.objects.filter(is_active=True, profile__role="courier")
+        return form
+
+    def changeform_view(self, request, object_id=None, form_url="", extra_context=None):
+        # Keep the order locked through form validation/save_related. A payment
+        # webhook cannot make the form's unpaid snapshot stale before save.
+        with transaction.atomic():
+            if request.method == "POST" and object_id:
+                try:
+                    list(Order.objects.select_for_update(of=("self",)).filter(pk=int(object_id)))
+                except (TypeError, ValueError):
+                    pass
+            return super().changeform_view(request, object_id, form_url, extra_context)
+
+    def change_view(self, request, object_id, form_url="", extra_context=None):
+        obj = self.get_object(request, object_id)
+        context = dict(extra_context or {})
+        editable = order_service.is_editable_order(obj) and self.has_change_permission(request, obj)
+        context["can_adjust_items"] = editable
+        context["order_transition_buttons"] = [
+            {"label": label, "url": reverse("admin:api_order_transition", args=[obj.pk, target])}
+            for target, label in self.transition_labels.items()
+            if obj and self.has_change_permission(request, obj) and obj.can_transition_to(target)
+            and not (target == "confirmed" and obj.status == "adjusted")
+            and not order_service.has_active_payment(obj)
+        ]
+        if not editable:
+            context.update(show_save=False, show_save_and_continue=False, show_save_and_add_another=False)
+        return super().change_view(request, object_id, form_url, context)
+
+    def save_model(self, request, obj, form, change):
+        changes = {field: form.cleaned_data[field] for field in order_service.METADATA_FIELDS if field in form.cleaned_data}
+        saved = order_service.update_metadata(obj.pk, changes, actor=request.user,
+            reason=form.cleaned_data.get("adjustment_reason") or "Изменение клиента через Django Admin")
+        obj.__dict__.update(saved.__dict__)
+
+    def get_urls(self):
+        custom = [
+            path("<int:object_id>/stores/", self.admin_site.admin_view(self.stores_view), name="api_order_stores"),
+            path("<int:object_id>/adjust-items/", self.admin_site.admin_view(self.adjust_items_view), name="api_order_adjust_items"),
+            path("<int:object_id>/transition/<str:target>/", self.admin_site.admin_view(self.transition_view), name="api_order_transition"),
+        ]
+        return custom + super().get_urls()
+
+    def _editable_object(self, request, object_id):
+        order = self.get_object(request, object_id)
+        if order is None or not self.has_change_permission(request, order):
+            raise PermissionDenied
+        return order
+
+    def stores_view(self, request, object_id):
+        order = self._editable_object(request, object_id)
+        if not order_service.is_editable_order(order):
+            raise PermissionDenied
+        try:
+            client_id = int(request.GET.get("client", ""))
+        except (TypeError, ValueError):
+            return JsonResponse({"stores": []}, status=400)
+        if not self._client_queryset(request, order).filter(pk=client_id).exists():
+            raise PermissionDenied
+        return JsonResponse({"stores": list(Store.objects.filter(client_id=client_id, is_active=True)
+                                            .values("id", "name"))})
+
+    def adjust_items_view(self, request, object_id):
+        order = self._editable_object(request, object_id)
+        if not order_service.is_editable_order(order):
+            self.message_user(request, "Состав этого заказа недоступен для изменения", messages.ERROR)
+            return redirect("admin:api_order_change", order.pk)
+        initial = [{"item": item.pk, "product": item.product_id, "quantity": item.quantity} for item in order.items.order_by("pk")]
+        formset = OrderItemCommandFormSet(request.POST if request.method == "POST" else None,
+            initial=initial, form_kwargs={"order": order}, prefix="items")
+        reason = OrderMutationReasonForm(request.POST if request.method == "POST" else None)
+        error = None
+        if request.method == "POST" and formset.is_valid() and reason.is_valid():
+            payload = formset.command_payload(reason.cleaned_data["reason"])
+            try:
+                order_service.adjust_order(order.pk, payload, actor=request.user, source="admin")
+            except order_service.OrderError as exc:
+                error = exc.detail
+            else:
+                self.message_user(request, "Состав скорректирован. Клиент должен согласовать изменения.", messages.SUCCESS)
+                return redirect("admin:api_order_change", order.pk)
+        return TemplateResponse(request, "admin/api/order/adjust_items.html", {
+            **self.admin_site.each_context(request), "opts": self.model._meta, "original": order,
+            "title": f"Корректировка заказа #{order.pk}", "formset": formset, "reason_form": reason,
+            "error": error, "media": self.media,
+        })
+
+    def transition_view(self, request, object_id, target):
+        order = self._editable_object(request, object_id)
+        if target not in self.transition_labels:
+            raise PermissionDenied
+        form = OrderMutationReasonForm(request.POST if request.method == "POST" else None)
+        error = None
+        if request.method == "POST" and form.is_valid():
+            try:
+                order_service.transition_order(order.pk, target, actor=request.user, source="admin", reason=form.cleaned_data["reason"])
+            except order_service.OrderError as exc:
+                error = exc.detail
+            else:
+                self.message_user(request, "Статус заказа изменён", messages.SUCCESS)
+                return redirect("admin:api_order_change", order.pk)
+        return TemplateResponse(request, "admin/api/order/transition.html", {
+            **self.admin_site.each_context(request), "opts": self.model._meta, "original": order,
+            "title": self.transition_labels[target], "form": form, "error": error,
+        })
+
+    def _transition_selected(self, request, queryset, target):
+        for order in queryset:
+            if not self.has_change_permission(request, order):
+                raise PermissionDenied
+            try:
+                order_service.transition_order(order.pk, target, actor=request.user, source="admin",
+                    reason=order.rejection_reason or "Действие Django Admin")
+            except order_service.OrderError as exc:
+                self.message_user(request, f"Заказ #{order.pk}: {exc.detail}", messages.ERROR)
+            else:
+                self.message_user(request, f"Заказ #{order.pk}: {self.transition_labels[target]}", messages.SUCCESS)
+
+    @admin.action(description="Подтвердить выбранные заказы")
+    def confirm_selected(self, request, queryset):
+        self._transition_selected(request, queryset, "confirmed")
+
+    @admin.action(description="Отклонить выбранные заказы")
+    def reject_selected(self, request, queryset):
+        self._transition_selected(request, queryset, "rejected")
+
+    @admin.action(description="Отменить выбранные заказы")
+    def cancel_selected(self, request, queryset):
+        self._transition_selected(request, queryset, "cancelled")
+
+    @admin.action(description="Отметить отправку выбранных заказов")
+    def ship_selected(self, request, queryset):
+        self._transition_selected(request, queryset, "shipped")
+
+    @admin.action(description="Завершить выбранные заказы")
+    def fulfill_selected(self, request, queryset):
+        self._transition_selected(request, queryset, "fulfilled")
 
 
 @admin.register(OrderAdjustment)
 class OrderAdjustmentAdmin(admin.ModelAdmin):
     list_display = ("id", "order", "created_by", "created_at")
     search_fields = ("order__id", "reason")
-    readonly_fields = ("created_at",)
+    readonly_fields = tuple(field.name for field in OrderAdjustment._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(Payment)

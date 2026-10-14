@@ -758,9 +758,9 @@ class Order(models.Model):
     # источником правды для валидации во всех endpoint-ах заказа.
     STATUS_TRANSITIONS = {
         "new": {"confirmed", "adjusted", "rejected", "cancelled"},
-        "confirmed": {"paid", "cancelled"},
+        "confirmed": {"paid", "adjusted", "cancelled"},
         "adjusted": {"confirmed", "cancelled"},  # confirmed = клиент согласился
-        "accepted": {"confirmed", "rejected", "cancelled"},  # legacy
+        "accepted": {"confirmed", "adjusted", "rejected", "cancelled"},  # legacy
         "rejected": set(),
         "paid": {"shipped"},
         "shipped": {"fulfilled"},

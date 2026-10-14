@@ -1,0 +1,16 @@
+{% extends "admin/change_form.html" %}
+{% load i18n admin_urls %}
+{% block object-tools-items %}
+  {% if original and can_adjust_items %}
+    <li><a href="{% url 'admin:api_order_adjust_items' original.pk %}">Изменить состав</a></li>
+  {% endif %}
+  {% for button in order_transition_buttons %}
+    <li><a href="{{ button.url }}">{{ button.label }}</a></li>
+  {% endfor %}
+  {{ block.super }}
+{% endblock %}
+
+{% block after_field_sets %}
+  {{ block.super }}
+  {% if original and can_adjust_items %}<span id="order-stores-config" hidden data-url="{% url 'admin:api_order_stores' original.pk %}"></span>{% endif %}
+{% endblock %}
