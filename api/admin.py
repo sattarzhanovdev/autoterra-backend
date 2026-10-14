@@ -13,12 +13,14 @@ from django.shortcuts import redirect, render
 from django.urls import path, reverse
 from django.utils.html import format_html
 from django.utils import timezone
+from django.views.decorators.http import require_POST
+from django.utils.decorators import method_decorator
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from .forms import ProductExcelImportForm
-from .order_admin_forms import OrderAdminForm, OrderItemCommandFormSet, OrderMutationReasonForm
+from .order_admin_forms import OrderAdminForm, OrderItemCommandFormSet, OrderMutationReasonForm, OrderStatusCommandForm
 from .services import orders as order_service
 from .services.exports import EXPORTERS as EXPORT_FORMATS, ExportUnavailable, export_clients
 from .models import (
@@ -760,11 +762,27 @@ class OrderAdmin(admin.ModelAdmin):
                     pass
             return super().changeform_view(request, object_id, form_url, extra_context)
 
+    def _status_choices(self, request, obj):
+        if not obj or not self.has_change_permission(request, obj) or order_service.has_active_payment(obj):
+            return []
+        paid = bool(obj.paid_at or obj.payments.filter(status="succeeded").exists())
+        return [
+            (target, dict(Order.STATUS_CHOICES)[target])
+            for target in self.transition_labels
+            if obj.can_transition_to(target)
+            and not (target == "confirmed" and obj.status == "adjusted")
+            and not (paid and target in ("confirmed", "rejected", "cancelled"))
+        ]
+
     def change_view(self, request, object_id, form_url="", extra_context=None):
         obj = self.get_object(request, object_id)
         context = dict(extra_context or {})
         editable = order_service.is_editable_order(obj) and self.has_change_permission(request, obj)
         context["can_adjust_items"] = editable
+        choices = self._status_choices(request, obj)
+        context["order_status_form"] = OrderStatusCommandForm(choices=choices)
+        context["can_change_order_status"] = bool(choices)
+
         context["order_transition_buttons"] = [
             {"label": label, "url": reverse("admin:api_order_transition", args=[obj.pk, target])}
             for target, label in self.transition_labels.items()
@@ -784,6 +802,7 @@ class OrderAdmin(admin.ModelAdmin):
 
     def get_urls(self):
         custom = [
+            path("<int:object_id>/status/", self.admin_site.admin_view(self.set_status_view), name="api_order_set_status"),
             path("<int:object_id>/stores/", self.admin_site.admin_view(self.stores_view), name="api_order_stores"),
             path("<int:object_id>/adjust-items/", self.admin_site.admin_view(self.adjust_items_view), name="api_order_adjust_items"),
             path("<int:object_id>/transition/<str:target>/", self.admin_site.admin_view(self.transition_view), name="api_order_transition"),
@@ -832,6 +851,24 @@ class OrderAdmin(admin.ModelAdmin):
             **self.admin_site.each_context(request), "opts": self.model._meta, "original": order,
             "title": f"Корректировка заказа #{order.pk}", "formset": formset, "reason_form": reason,
             "error": error, "media": self.media,
+        })
+
+    @method_decorator(require_POST)
+    def set_status_view(self, request, object_id):
+        order = self._editable_object(request, object_id)
+        form = OrderStatusCommandForm(request.POST, choices=self._status_choices(request, order))
+        if form.is_valid():
+            try:
+                order_service.transition_order(order.pk, form.cleaned_data["status"], actor=request.user,
+                    source="admin", reason=form.cleaned_data["reason"])
+            except order_service.OrderError as exc:
+                form.add_error(None, exc.detail)
+            else:
+                self.message_user(request, "Статус заказа изменён", messages.SUCCESS)
+                return redirect("admin:api_order_change", order.pk)
+        return TemplateResponse(request, "admin/api/order/transition.html", {
+            **self.admin_site.each_context(request), "opts": self.model._meta, "original": order,
+            "title": "Изменить статус заказа", "form": form,
         })
 
     def transition_view(self, request, object_id, target):

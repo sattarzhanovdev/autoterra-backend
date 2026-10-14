@@ -317,3 +317,52 @@ class OrderAdminTests(_Base):
     def test_system_fields_rejected_by_service(self):
         with self.assertRaises(orders.OrderError):
             orders.update_metadata(self.order.pk, {'status': 'paid'}, actor=self.staff)
+
+
+    def test_status_selector_is_visible_and_lists_only_allowed_transitions(self):
+        response = self.http.get(self.url)
+        self.assertContains(response, 'Изменить статус заказа')
+        form = response.context['order_status_form']
+        self.assertEqual(dict(form.fields['status'].choices), {
+            'confirmed': 'Подтверждён', 'rejected': 'Отклонён', 'cancelled': 'Отменён'})
+        self.assertContains(response, reverse('admin:api_order_set_status', args=[self.order.pk]))
+
+    def test_status_selector_post_uses_business_service(self):
+        url = reverse('admin:api_order_set_status', args=[self.order.pk])
+        with patch('api.services.orders.transition_order', wraps=orders.transition_order) as command:
+            response = self.http.post(url, {'status': 'confirmed', 'reason': 'Наличие проверено'})
+        self.assertEqual(response.status_code, 302)
+        command.assert_called_once()
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, 'confirmed')
+        self.assertIsNotNone(self.order.confirmed_at)
+
+    def test_status_selector_rejects_arbitrary_paid_and_active_payment(self):
+        url = reverse('admin:api_order_set_status', args=[self.order.pk])
+        response = self.http.post(url, {'status': 'paid'})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.context['form'].errors)
+        Payment.objects.create(order=self.order, amount=1000, status='pending')
+        response = self.http.post(url, {'status': 'confirmed'})
+        self.assertTrue(response.context['form'].errors)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, 'new')
+
+    def test_status_selector_for_paid_order_allows_shipping(self):
+        self.order.status = 'paid'
+        self.order.paid_at = timezone.now()
+        self.order.save()
+        response = self.http.get(self.url)
+        self.assertEqual(list(response.context['order_status_form'].fields['status'].choices), [('shipped', 'Отправлен')])
+        response = self.http.post(reverse('admin:api_order_set_status', args=[self.order.pk]), {'status': 'shipped'})
+        self.assertEqual(response.status_code, 302)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, 'shipped')
+
+    def test_status_selector_requires_post_and_csrf(self):
+        from django.test import Client
+        url = reverse('admin:api_order_set_status', args=[self.order.pk])
+        self.assertEqual(self.http.get(url).status_code, 405)
+        checked = Client(enforce_csrf_checks=True)
+        checked.force_login(self.staff)
+        self.assertEqual(checked.post(url, {'status': 'confirmed'}).status_code, 403)

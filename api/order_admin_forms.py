@@ -89,3 +89,12 @@ OrderItemCommandFormSet = formset_factory(OrderItemCommandForm, formset=OrderIte
 class OrderMutationReasonForm(forms.Form):
     reason = forms.CharField(label='Причина / комментарий', required=False,
                             widget=forms.Textarea(attrs={'rows': 3}))
+
+
+class OrderStatusCommandForm(OrderMutationReasonForm):
+    status = forms.ChoiceField(label='Новый статус')
+
+    def __init__(self, *args, choices, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields['status'].choices = choices
+        self.order_fields(['status', 'reason'])

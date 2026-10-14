@@ -14,3 +14,22 @@
   {{ block.super }}
   {% if original and can_adjust_items %}<span id="order-stores-config" hidden data-url="{% url 'admin:api_order_stores' original.pk %}"></span>{% endif %}
 {% endblock %}
+
+{% block content %}
+  {% if original %}
+    <div class="module" id="order-status-panel">
+      <h2>Изменить статус заказа</h2>
+      <p>Текущий статус: <strong>{{ original.get_status_display }}</strong>.</p>
+      {% if can_change_order_status %}
+        <form method="post" action="{% url 'admin:api_order_set_status' original.pk %}">
+          {% csrf_token %}
+          {{ order_status_form.as_p }}
+          <p><input type="submit" value="Изменить статус" class="default"></p>
+        </form>
+      {% else %}
+        <p>Для текущего состояния заказа нет доступных переходов. Незавершённый платёж должен быть завершён или отменён.</p>
+      {% endif %}
+    </div>
+  {% endif %}
+  {{ block.super }}
+{% endblock %}
