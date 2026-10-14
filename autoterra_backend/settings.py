@@ -146,6 +146,7 @@ HF_CHAT_URL = os.environ.get(
     "HF_CHAT_URL",
     "https://router.huggingface.co/v1/chat/completions",
 )
+HF_CHAT_TIMEOUT = int(os.environ.get("HF_CHAT_TIMEOUT", "45"))
 
 # ── Email (SMTP) ──────────────────────────────────────────────────────────────
 # Used to notify the manager by email whenever a new order is placed.
@@ -232,4 +233,3 @@ PRIVATE_KNOWLEDGE_ROOT = Path(os.environ.get("PRIVATE_KNOWLEDGE_ROOT", str(BASE_
 KNOWLEDGE_MAX_FILE_SIZE = 25 * 1024 * 1024
 KNOWLEDGE_PROCESS_TIMEOUT = 120
 KNOWLEDGE_MAX_EXTRACTED_CHARS = 5_000_000
-HF_CHAT_TIMEOUT = 45

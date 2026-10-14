@@ -1,5 +1,7 @@
 import io
 import json
+import os
+import runpy
 import tempfile
 import zipfile
 from datetime import timedelta
@@ -9,7 +11,7 @@ from unittest.mock import patch, MagicMock
 from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
 from reportlab.pdfgen import canvas
 
@@ -184,11 +186,18 @@ class KnowledgeDocumentTests(TestCase):
         provider = MagicMock()
         provider.__enter__.return_value.read.return_value = json.dumps({'choices': [{'message': {
             'content': json.dumps({'answer': 'Температура 20 градусов [1].', 'insufficient': False})}}]}).encode()
-        with override_settings(HF_API_TOKEN='test-token'), patch('api.services.knowledge_retrieval.urllib.request.urlopen', return_value=provider) as call:
+        with override_settings(HF_API_TOKEN='test-token', HF_CHAT_TIMEOUT=17), patch('api.services.knowledge_retrieval.urllib.request.urlopen', return_value=provider) as call:
             response = self.client.post('/api/ai/chat/', json.dumps({'message': 'Primer drying'}), content_type='application/json', **self.auth)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['sources'][0]['filename'], 'manual.txt')
-        body = json.loads(call.call_args.args[0].data)
+        request = call.call_args.args[0]
+        headers = {key.lower(): value for key, value in request.header_items()}
+        self.assertEqual(headers['user-agent'], 'AutoTerra/1.0')
+        self.assertEqual(headers['accept'], 'application/json')
+        self.assertEqual(headers['content-type'], 'application/json')
+        self.assertEqual(headers['authorization'], 'Bearer test-token')
+        self.assertEqual(call.call_args.kwargs['timeout'], 17)
+        body = json.loads(request.data)
         self.assertIn('20 degrees', body['messages'][1]['content'])
         self.assertIn('только по предоставленным', body['messages'][0]['content'])
         self.assertEqual(response.json()['answer'], 'Температура 20 градусов [1].')
@@ -252,3 +261,22 @@ class KnowledgeDocumentTests(TestCase):
     def test_chat_validates_message(self):
         response = self.client.post('/api/ai/chat/', json.dumps({'message': ['invalid']}), content_type='application/json', **self.auth)
         self.assertEqual(response.status_code, 400)
+
+
+class KnowledgeChatSettingsTests(SimpleTestCase):
+    def load_settings(self, extra_env=None):
+        # Execute the actual settings module in an isolated environment; do not
+        # load local .env files or any credentials during these regression tests.
+        env = {'DEBUG': 'True', 'DB_ENGINE': 'sqlite3', **(extra_env or {})}
+        with patch.dict(os.environ, env, clear=True), patch('pathlib.Path.exists', return_value=False):
+            return runpy.run_path(str(Path(__file__).resolve().parents[1] / 'autoterra_backend' / 'settings.py'))
+
+    def test_hf_chat_timeout_defaults_to_45_without_environment_variable(self):
+        config = self.load_settings()
+        self.assertEqual(config['HF_CHAT_TIMEOUT'], 45)
+        self.assertIsInstance(config['HF_CHAT_TIMEOUT'], int)
+
+    def test_hf_chat_timeout_reads_integer_environment_override(self):
+        config = self.load_settings({'HF_CHAT_TIMEOUT': '90'})
+        self.assertEqual(config['HF_CHAT_TIMEOUT'], 90)
+        self.assertIsInstance(config['HF_CHAT_TIMEOUT'], int)

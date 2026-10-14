@@ -90,7 +90,12 @@ def grounded_answer(question, contexts):
         'response_format': {'type': 'json_object'},
     }
     request = urllib.request.Request(settings.HF_CHAT_URL, data=json.dumps(body).encode(),
-        headers={'Authorization': f'Bearer {settings.HF_API_TOKEN}', 'Content-Type': 'application/json'})
+        headers={
+            'Authorization': f'Bearer {settings.HF_API_TOKEN}',
+            'Content-Type': 'application/json',
+            'User-Agent': 'AutoTerra/1.0',
+            'Accept': 'application/json',
+        })
     try:
         with urllib.request.urlopen(request, timeout=settings.HF_CHAT_TIMEOUT, context=ssl.create_default_context(cafile=certifi.where())) as response:
             result = json.loads(response.read(256_000))
