@@ -193,3 +193,105 @@ class ProductSynonymSearchTests(TestCase):
         self.product.refresh_from_db()
         self.assertEqual(self.product.synonyms, ["маскировочная пленка"])
         self.assertEqual(search.search_products(Product.objects.filter(pk=self.product.pk), "маскировочная").count(), 1)
+
+
+@override_settings(ELASTICSEARCH_URL="", SECURE_SSL_REDIRECT=False)
+class PreciseProductSearchTests(TestCase):
+    def setUp(self):
+        self.dist = Distributor.objects.create(name="Search", inn="search")
+        self.other = Distributor.objects.create(name="Other", inn="other-search")
+
+    def product(self, sku, name, **kwargs):
+        return Product.objects.create(distributor=self.dist, sku=sku, name=name, **kwargs)
+
+    def results(self, query):
+        return list(search.search_products(Product.objects.filter(distributor=self.dist), query))
+
+    def test_article_punctuation_spacing_and_compact_name(self):
+        article = self.product("13-10", "Шлифблок (мягкий)")
+        paper = self.product("P 800", "Наждачная бумага")
+        for query, expected in (("13-10", article), ("1310", article), ("13 10", article),
+                                ("p800", paper), ("мягкий шлифблок", article),
+                                ("шлифблок (мягкий)", article), ("нажд бум", paper),
+                                ("наждачнаябумага", paper)):
+            with self.subTest(query=query):
+                self.assertEqual(self.results(query), [expected])
+        self.assertEqual(self.results("мягкий отсутствует"), [])
+        # AND may use different fields, in either order.
+        self.assertEqual(self.results("мягкий 1310"), [article])
+        self.assertEqual(self.results("1310 мягкий"), [article])
+
+    def test_lookalikes_case_yo_and_unicode_punctuation(self):
+        paper = self.product("3M P120", "Лист 230х280 лёгкий")
+        for query in ("230x280", "230Х280", "3М Р120", "3m p120", "ЛЁГКИЙ", "3М—Р120"):
+            with self.subTest(query=query):
+                self.assertEqual(self.results(query), [paper])
+        from .services.product_names import normalize_search_text
+        self.assertEqual(normalize_search_text("АВЕКМНОРСТУХ ё /!?_ 🧽"), "abekmhopctyx e")
+        self.assertEqual(self.results(" /!?_ "), [paper])
+
+    def ranked_products(self):
+        exact = self.product("13-10", "Z exact", category="Z")
+        prefix = self.product("13-100", "Z prefix", category="Z")
+        name = self.product("OTHER", "13 10 name", category="Z")
+        rest = self.product("REST", "A rest", category="A", synonyms=["10 13"])
+        return [exact, prefix, name, rest]
+
+    def test_article_name_groups_and_remaining_category_name_order(self):
+        expected = self.ranked_products()
+        rest2 = self.product("REST2", "B rest", category="A", synonyms=["13 10"])
+        rest3 = self.product("REST3", "A rest", category="B", synonyms=["13 10"])
+        self.assertEqual(self.results("13-10"), expected + [rest2, rest3])
+        # Compact substring is SKU-only, not a match against brand/name lines.
+        compact_sku = self.product("A13-10B", "Article substring")
+        self.product("NO", "Unrelated", brand="13-10")
+        self.assertIn(compact_sku, self.results("1 310"))
+        self.assertNotIn(Product.objects.get(sku="NO"), self.results("1 310"))
+
+    def test_es_rank_is_secondary_to_article_and_name_groups(self):
+        expected = self.ranked_products()
+        rest2 = self.product("REST2", "Z rest", category="Z", synonyms=["13 10"])
+        with override_settings(ELASTICSEARCH_URL="http://es:9200"), patch.object(
+            search, "_elasticsearch_ids", return_value=[rest2.pk] + [p.pk for p in reversed(expected)],
+        ):
+            self.assertEqual(self.results("13-10"), expected[:3] + [rest2, expected[3]])
+
+    def test_client_catalog_preserves_ranking_and_distributor_scope(self):
+        from django.contrib.auth.models import User
+        from .models import AuthToken, ClientProfile, Region
+        expected = self.ranked_products()
+        foreign = Product.objects.create(distributor=self.other, sku="13-10", name="Foreign")
+        inactive = self.product("13 10", "Inactive", is_active=False)
+        user = User.objects.create_user(username="search-client")
+        user.profile.role = "client"
+        user.profile.save()
+        region = Region.objects.create(code="SEARCH", name="Search")
+        ClientProfile.objects.create(user=user, distributor=self.dist, region=region,
+            status="active", company_name="Search client", inn="1234567890", city="Москва", contact_name="Test", phone="+79001112233")
+        token = AuthToken.objects.create(user=user, key="search-client-token")
+        for es in (False, True):
+            with override_settings(ELASTICSEARCH_URL="http://es:9200" if es else ""), patch.object(
+                search, "_elasticsearch_ids", return_value=[foreign.pk, inactive.pk] + [p.pk for p in reversed(expected)],
+            ):
+                response = self.client.get("/api/products/", {"search": "13-10"},
+                    HTTP_AUTHORIZATION=f"Bearer {token.key}")
+                self.assertEqual(response.status_code, 200)
+                body = response.json()
+                self.assertEqual([row["id"] for row in body["results"]], [str(p.pk) for p in expected])
+                self.assertEqual(body["count"], 4)
+                self.assertEqual(set(body), {"results", "pagination", "count", "categories"})
+
+    def test_batched_rebuild_covers_inactive_and_other_distributors(self):
+        from io import StringIO
+        from django.core.management import call_command, CommandError
+        from .services.product_names import product_search_text
+        products = [self.product("13-10", "Шлифблок"), self.product("P 800", "Лёгкий", is_active=False),
+                    Product.objects.create(distributor=self.other, sku="3М Р120", name="Бумага", synonyms=["нажд бум"])]
+        Product.objects.update(search_text="obsolete")
+        call_command("rebuild_product_search", batch_size=1, stdout=StringIO())
+        for product in products:
+            product.refresh_from_db()
+            self.assertEqual(product.search_text, product_search_text(product))
+        self.assertEqual(self.results("1310"), [products[0]])
+        with self.assertRaises(CommandError):
+            call_command("rebuild_product_search", batch_size=0, stdout=StringIO())

@@ -1850,7 +1850,7 @@ def products(request):
     )
     return JsonResponse(paginated_response(
         request,
-        qs.order_by("category", "name"),
+        qs if search else qs.order_by("category", "name"),
         lambda product: _format_product(product, client),
         extra={"categories": categories},
     ))
@@ -5995,7 +5995,7 @@ def client_prices(request, client_id):
     search = request.GET.get('search', '').strip()
     if search:
         qs = _search_products(qs, search)
-    products, meta = paginate(request, qs.order_by('name', 'pk'))
+    products, meta = paginate(request, qs if search else qs.order_by('name', 'pk'))
     overrides = {entry.product_id: entry for entry in ClientPriceOverride.objects.filter(
         client=client, product_id__in=[p.pk for p in products])}
     return JsonResponse({

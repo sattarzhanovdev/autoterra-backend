@@ -1,7 +1,15 @@
 """Shared normalization for product names, synonyms and search."""
 
+_LOOKALIKES = str.maketrans("авекмнорстух", "abekmhopctyx")
+
+
 def normalize_search_text(value):
-    return " ".join(str(value or "").casefold().replace("ё", "е").split())
+    value = str(value or "").casefold().replace("ё", "е").translate(_LOOKALIKES)
+    return " ".join("".join(c if c.isalpha() or c.isdigit() else " " for c in value).split())
+
+
+def compact_search_text(value):
+    return normalize_search_text(value).replace(" ", "")
 
 
 def normalize_product_synonyms(value):
@@ -22,10 +30,12 @@ def normalize_product_synonyms(value):
 
 
 def product_search_text(product):
-    # Newlines prevent a query from matching across two unrelated fields.
-    return "\n".join(normalize_search_text(value) for value in (
+    # Fixed first two lines let SQL extract the compact SKU and normalized name
+    # for ranking without database-specific Unicode normalization functions.
+    lines = [normalize_search_text(value) for value in (
         product.name, product.sku, product.brand, product.category, *product.synonyms,
-    ))
+    )]
+    return "\n".join([compact_search_text(product.sku), *lines, compact_search_text(product.name)])
 
 
 def normalize_brand(value):

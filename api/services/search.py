@@ -13,7 +13,8 @@ import urllib.error
 import urllib.request
 
 from django.conf import settings
-from django.db.models import Case, When
+from django.db.models import Case, Q, Value, When
+from django.db.models.functions import StrIndex, Substr
 
 logger = logging.getLogger(__name__)
 
@@ -51,14 +52,33 @@ def search_products(queryset, query: str):
             ids = _elasticsearch_ids(query)
             if ids:
                 ordering = Case(*[When(id=pk, then=position) for position, pk in enumerate(ids)], default=len(ids))
-                return matches.order_by(ordering, "category", "name", "pk")
+                return matches.order_by("_search_group", ordering, "category", "name", "pk")
         except Exception as exc:
             logger.warning("Elasticsearch недоступен, откат на поиск в БД: %s", exc)
     return matches
 
 
 def _database_search(queryset, query: str):
-    return queryset.filter(search_text__contains=query)
+    compact = query.replace(" ", "")
+    queryset = queryset.annotate(
+        _search_sku=Substr("search_text", 1, StrIndex("search_text", Value("\n")) - 1),
+        _search_after_sku=Substr("search_text", StrIndex("search_text", Value("\n")) + 1),
+    ).annotate(
+        _search_name=Substr("_search_after_sku", 1, StrIndex("_search_after_sku", Value("\n")) - 1),
+    )
+    words = queryset
+    for word in query.split():
+        words = words.filter(search_text__contains=word)
+    # Keep the compact alternative SKU-only: never combine words across fields
+    # into a fabricated article. Both branches retain the caller's access scope.
+    return queryset.filter(Q(pk__in=words.values("pk")) | Q(_search_sku__contains=compact)).annotate(
+        _search_group=Case(
+            When(_search_sku=compact, then=Value(0)),
+            When(_search_sku__startswith=compact, then=Value(1)),
+            When(_search_name__startswith=query, then=Value(2)),
+            default=Value(3),
+        ),
+    ).order_by("_search_group", "category", "name", "pk")
 
 
 def _elasticsearch_ids(query: str):
