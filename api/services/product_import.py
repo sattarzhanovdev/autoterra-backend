@@ -17,8 +17,10 @@
 В прайсе 1С шапка состоит из нескольких строк: «Номенклатура» → name,
 «Код» → sku (включая ведущие нули), «Артикул» → wb_article. Строки папок
 определяются по outlineLevel даже при наличии кода/агрегатного остатка;
-верхний раздел → group_name, ближайший раздел → category. Цена округляется
-до копеек, дробный остаток — вниз до целых единиц с предупреждением.
+верхний раздел → group_name, категория нормализуется по названию и иерархии
+в одну из 12 категорий каталога. Неопределённые категории пропускаются с
+предупреждением. Цена округляется до копеек, дробный остаток — вниз до целых
+единиц с предупреждением.
 Неправильные цены/остатки/идентификаторы не обнуляют товар, а пропускают строку.
 
 Модуль ничего не пишет в БД — только парсит и нормализует строки. Апсерт
@@ -34,6 +36,7 @@ from openpyxl import load_workbook
 
 from api.models import MAX_PRODUCT_IMAGES, normalize_product_images
 from api.services.product_names import normalize_product_synonyms
+from api.services.product_categories import determine_product_category
 
 
 # Каноническое имя поля -> набор допустимых заголовков (в нижнем регистре).
@@ -401,12 +404,19 @@ def _parse_products_sheet(sheet):
             if "wb_article" in mapping:
                 product["wb_article"] = _identifier(sheet.cell(number, mapping["wb_article"] + 1))
             labels = [groups[depth] for depth in sorted(groups)]
-            if labels:
-                if "group_name" not in mapping:
-                    product["group_name"] = labels[0]
-                if "category" not in mapping:
-                    product["category"] = labels[-1]
+            if labels and "group_name" not in mapping:
+                product["group_name"] = labels[0]
             product.update(stock_values)
+            folder = _norm(_cell(row, mapping, "category")) or (labels[-1] if labels else product["group_name"])
+            category = determine_product_category(name, folder, [product["group_name"], *labels])
+            if category is None:
+                errors.append(
+                    f"Строка {number} ({sku}): не удалось определить категорию товара «{name}» "
+                    f"(папка 1С: «{folder}») — пропущено; "
+                    "нужна одна из 12 категорий каталога."
+                )
+                continue
+            product["category"] = category
             try:
                 _validate_one_c_product(product)
             except ValueError as exc:

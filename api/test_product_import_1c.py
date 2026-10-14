@@ -11,6 +11,7 @@ from openpyxl import Workbook
 
 from .models import MAX_PRODUCT_IMAGES, Distributor, Product
 from .services.product_import import parse_products_workbook
+from .services.product_categories import CANONICAL_PRODUCT_CATEGORIES, determine_product_category
 from .test_product_import import StockUploadFileEndpointTests
 
 
@@ -57,6 +58,55 @@ def item(**changes):
     return result
 
 
+class OneCCategoryTests(TestCase):
+    def test_requested_product_and_folder_classification(self):
+        cases = [
+            ('SUNMIGHT Абразивные круги 150мм', '', 'Абразивы'),
+            ('Круг для снятия ржавчины', 'Насадки на дрель', 'Абразивы'),
+            ('Бокорезы', '', 'Инструменты'),
+            ('Плоскогубцы', '', 'Инструменты'),
+            ('Монтировки', '', 'Инструменты'),
+            ('Гайковерты', '', 'Инструменты'),
+            ('Компрессометр', '', 'Инструменты'),
+            ('Рефрактометр', '', 'Инструменты'),
+            ('Разбавитель', '', 'Растворители'),
+            ('Фильтры', '', 'Расходники'),
+            ('Лаки для автомобиля', '', 'Лаки'),
+            ('Грунтовки для автомобиля', '', 'Грунтовки'),
+            ('Шпатлевки для автомобиля', '', 'Шпатлёвки'),
+            ('Автомобильная шпатлевка', '', 'Шпатлёвки'),
+            ('Краска базовая', '', 'Краски базовые'),
+            ('Акриловая эмаль 2К', '', 'Краски 2K'),
+            ('Антикор', '', 'Антикоры'),
+            ('Герметик', '', 'Герметики'),
+            ('Фильтр для краски', 'Базовые эмали', 'Расходники'),
+            ('Отвердитель для лака', 'Лаки', 'Отвердители'),
+            ('Грунт акриловый 2К', 'Краски 2K', 'Грунтовки'),
+            ('Краскопульт для грунта', 'Грунтовки', 'Инструменты'),
+            ('Полировальный круг 150мм', '', 'Абразивы'),
+            ('Малярный комбинезон XL', 'Разное', 'Расходники'),
+            ('Фильтр для лака', 'Лаки', 'Расходники'),
+            ('Фильтр для растворителя', '', 'Расходники'),
+            ('Шлифовальная машина', '', 'Инструменты'),
+            ('Артикул 123', 'SUNMIGHT Абразивные круги 150мм', 'Абразивы'),
+            ('Артикул 123', 'Бокорезы', 'Инструменты'),
+        ]
+        for name, folder, expected in cases:
+            with self.subTest(name=name, folder=folder):
+                self.assertEqual(determine_product_category(name, folder), expected)
+
+    def test_canonical_categories_are_single_source_and_idempotent(self):
+        self.assertEqual(len(CANONICAL_PRODUCT_CATEGORIES), 12)
+        self.assertEqual(len(set(CANONICAL_PRODUCT_CATEGORIES)), 12)
+        for category in CANONICAL_PRODUCT_CATEGORIES:
+            self.assertEqual(determine_product_category(category), category)
+
+    def test_hierarchy_fallback_and_unknown_category(self):
+        self.assertEqual(determine_product_category('Материал X', 'Серия X',
+            ['Материалы', 'Грунтовки', 'Серия X']), 'Грунтовки')
+        self.assertIsNone(determine_product_category('Неизвестный товар', 'Новая папка', ['Разное']))
+
+
 class OneCParserTests(TestCase):
     def test_real_multilevel_header_name_code_article_price_stock_and_photo(self):
         products, errors = parse_products_workbook(one_c_workbook())
@@ -70,7 +120,7 @@ class OneCParserTests(TestCase):
         self.assertEqual(product['quantity'], 2)
         self.assertEqual(product['images'], ['https://example.com/photo.jpg'])
         self.assertEqual(product['group_name'], '000.Akzo Nobel')
-        self.assertEqual(product['category'], 'Akzo Nobel Оборудование')
+        self.assertEqual(product['category'], 'Инструменты')
         self.assertEqual(product['status'], 'onOrder')
         self.assertTrue(product['_has_price'])
         self.assertTrue(product['_has_quantity'])
@@ -86,14 +136,60 @@ class OneCParserTests(TestCase):
             {'name': 'Грунты', 'code': 'G3', 'level': 1},
             item(code='P1', level=2),
             {'name': 'Инструменты', 'code': 'G4', 'level': 0},
-            item(code='T1', level=1),
+            item(name='Гайковерт', code='T1', level=1),
         ]
         products, errors = parse_products_workbook(one_c_workbook(rows))
         self.assertEqual(errors, [])
         self.assertEqual([p['sku'] for p in products], ['L1', 'L2', 'P1', 'T1'])
-        self.assertEqual([p['category'] for p in products], ['2K', '2K', 'Грунты', 'Инструменты'])
+        self.assertEqual([p['category'] for p in products], ['Лаки', 'Лаки', 'Грунтовки', 'Инструменты'])
         self.assertEqual([p['group_name'] for p in products], ['Материалы'] * 3 + ['Инструменты'])
         self.assertEqual(products[1]['wb_article'], '')
+
+    def test_all_workbook_products_have_canonical_categories(self):
+        rows = []
+        for index, (folder, name) in enumerate([
+            ('SUNMIGHT Абразивные круги 150мм', 'Круг P120'),
+            ('Насадки на дрель', 'Круг для снятия ржавчины'),
+            ('Бокорезы', 'Модель X'), ('Плоскогубцы', 'Модель X'),
+            ('Монтировки', 'Модель X'), ('Гайковерты', 'Модель X'),
+            ('Растворители', 'Разбавитель'), ('Разное', 'Фильтры'),
+            ('Лаки для автомобиля', 'Материал X'),
+            ('Грунтовки для автомобиля', 'Материал X'),
+            ('Шпатлевки для автомобиля', 'Материал X'),
+        ]):
+            rows += [{'name': folder, 'code': f'GROUP-{index}', 'level': 0},
+                     item(name=name, code=f'PRODUCT-{index}', level=1)]
+        products, errors = parse_products_workbook(one_c_workbook(rows))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(products), 11)
+        self.assertTrue(all(product['category'] in CANONICAL_PRODUCT_CATEGORIES for product in products))
+        self.assertEqual(products[1]['category'], 'Абразивы')
+        self.assertEqual(products[1]['group_name'], 'Насадки на дрель')
+
+    def test_unknown_category_skips_row_with_warning_instead_of_raw_folder(self):
+        products, errors = parse_products_workbook(one_c_workbook([
+            {'name': 'Неизвестная папка', 'code': 'GROUP', 'level': 0},
+            item(name='Неизвестный товар', code='UNKNOWN'),
+            item(name='Лак', code='GOOD'),
+        ]))
+        self.assertEqual([product['sku'] for product in products], ['GOOD'])
+        self.assertEqual(products[0]['category'], 'Лаки')
+        self.assertEqual(len(errors), 1)
+        self.assertIn('Строка 8 (UNKNOWN)', errors[0])
+        self.assertIn('не удалось определить категорию', errors[0])
+        self.assertIn('Неизвестная папка', errors[0])
+
+    def test_explicit_one_c_category_is_normalized(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(['Номенклатура', 'Код', 'Категория', 'Цена', 'Остаток'])
+        sheet.append(['Модель X', 'CODE', 'Бокорезы ' + 'x' * 500, 100, 3])
+        stream = io.BytesIO()
+        workbook.save(stream)
+        stream.seek(0)
+        products, errors = parse_products_workbook(stream)
+        self.assertEqual(errors, [])
+        self.assertEqual(products[0]['category'], 'Инструменты')
 
     def test_fractional_stock_floors_with_row_warning_and_localized_numbers(self):
         products, errors = parse_products_workbook(one_c_workbook([
@@ -177,14 +273,15 @@ class OneCParserTests(TestCase):
     def test_ordinary_excel_keeps_article_as_sku(self):
         workbook = Workbook()
         sheet = workbook.active
-        sheet.append(['Артикул', 'Код', 'Наименование', 'Цена', 'Остаток'])
-        sheet.append(['LEGACY', 'EXTERNAL', 'Лак', 200, 3])
+        sheet.append(['Артикул', 'Код', 'Наименование', 'Цена', 'Остаток', 'Категория'])
+        sheet.append(['LEGACY', 'EXTERNAL', 'Лак', 200, 3, 'Произвольная категория'])
         stream = io.BytesIO()
         workbook.save(stream)
         stream.seek(0)
         products, errors = parse_products_workbook(stream)
         self.assertEqual(errors, [])
         self.assertEqual(products[0]['sku'], 'LEGACY')
+        self.assertEqual(products[0]['category'], 'Произвольная категория')
 
 
 class OneCUploadEndpointTests(TestCase):
@@ -209,6 +306,8 @@ class OneCUploadEndpointTests(TestCase):
             self.assertEqual(existing.quantity, 2)
             self.assertEqual(existing.wb_article, '2002956')
             self.assertEqual(existing.brand, 'Бренд')
+            self.assertEqual(existing.category, 'Инструменты')
+            self.assertIn(existing.category, CANONICAL_PRODUCT_CATEGORIES)
         self.assertEqual(Product.objects.filter(distributor=self.distributor).count(), 1)
         foreign.refresh_from_db()
         self.assertEqual(foreign.price, Decimal('10'))
@@ -222,17 +321,19 @@ class OneCUploadEndpointTests(TestCase):
         response = self._upload(one_c_workbook())
         self.assertEqual(response.json()['created'], 1)
         product = Product.objects.get(distributor=self.distributor, sku='00023078')
-        response = self._upload(one_c_workbook([item(code='00023078', article='NEW-ARTICLE', name='Новое название',
+        response = self._upload(one_c_workbook([item(code='00023078', article='NEW-ARTICLE', name='Новый грунт',
             price='123,45', quantity=7, images='https://example.com/new.jpg')]))
         self.assertEqual(response.status_code, 200, response.content)
         self.assertEqual(response.json()['created'], 0)
         self.assertEqual(response.json()['updated'], 1)
         product.refresh_from_db()
-        self.assertEqual(product.name, 'Новое название')
+        self.assertEqual(product.name, 'Новый грунт')
         self.assertEqual(product.price, Decimal('123.45'))
         self.assertEqual(product.quantity, 7)
         self.assertEqual(product.wb_article, 'NEW-ARTICLE')
         self.assertEqual(product.images, ['https://example.com/new.jpg'])
+        self.assertEqual(product.category, 'Грунтовки')
+        self.assertIn(product.category, CANONICAL_PRODUCT_CATEGORIES)
         self.assertEqual(Product.objects.filter(distributor=self.distributor).count(), 1)
 
     def test_bad_rows_and_fractional_warnings_are_returned_by_endpoint(self):
@@ -242,6 +343,33 @@ class OneCUploadEndpointTests(TestCase):
         self.assertEqual(len(response.json()['errors']), 2)
         self.assertFalse(Product.objects.filter(sku='BAD').exists())
         self.assertEqual(Product.objects.get(sku='000001').quantity, 0)
+
+    def test_unknown_category_does_not_create_or_overwrite_existing_product(self):
+        original = Product.objects.create(distributor=self.distributor, sku='EXISTING',
+            name='Лак', category='Лаки', price=100, quantity=5)
+        response = self._upload(one_c_workbook([
+            {'name': 'Неизвестная папка', 'code': 'GROUP', 'level': 0},
+            item(name='Неизвестный товар', code='NEW'),
+            item(name='Неизвестный товар', code='EXISTING', price=500, quantity=20),
+            item(name='Грунт', code='VALID'),
+        ]))
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()['created'], 1)
+        self.assertEqual(response.json()['updated'], 0)
+        self.assertEqual(len(response.json()['errors']), 2)
+        self.assertFalse(Product.objects.filter(distributor=self.distributor, sku='NEW').exists())
+        original.refresh_from_db()
+        self.assertEqual(original.category, 'Лаки')
+        self.assertEqual(original.name, 'Лак')
+        self.assertEqual(original.price, Decimal('100'))
+        self.assertEqual(original.quantity, 5)
+
+    def test_only_unknown_categories_returns_existing_upload_error_contract(self):
+        response = self._upload(one_c_workbook([item(name='Неизвестный товар', code='UNKNOWN')]))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('не удалось определить категорию', response.json()['detail'])
+        self.assertEqual(len(response.json()['errors']), 1)
+        self.assertFalse(Product.objects.filter(distributor=self.distributor).exists())
 
     def test_missing_photo_column_preserves_existing_photos_on_update(self):
         original = Product.objects.create(distributor=self.distributor, sku='00023078', name='Товар',
