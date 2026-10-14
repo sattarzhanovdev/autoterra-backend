@@ -68,7 +68,30 @@ def _ssl_context():
     return ssl.create_default_context()
 
 
-def payment_body(order, amount, description=""):
+def resolve_return_url(value):
+    """Accept client redirects only to explicitly configured HTTPS origins."""
+    if value == "":
+        return settings.YOOKASSA_RETURN_URL
+    if not isinstance(value, str) or len(value) > 2048:
+        raise ValueError("Недопустимый адрес возврата")
+    # urlsplit removes some whitespace/control characters; browsers can also
+    # interpret backslashes differently. Reject these ambiguous inputs first.
+    if (value != value.strip() or "\\" in value
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+        raise ValueError("Недопустимый адрес возврата")
+    parsed = urlsplit(value)
+    parsed.port  # Raises ValueError for malformed ports.
+    if (parsed.scheme != "https" or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or "#" in value):
+        raise ValueError("Недопустимый адрес возврата")
+    origin = f"{parsed.scheme}://{parsed.netloc}".lower()
+    if origin not in {item.lower() for item in settings.YOOKASSA_WEB_RETURN_ORIGINS}:
+        raise ValueError("Недопустимый адрес возврата")
+    return value
+
+
+def payment_body(order, amount, description="", return_url=None):
     payable = Decimal(amount).quantize(Decimal("0.01"))
     order_items = list(order.items.order_by("pk"))
     quantities = [item.quantity for item in order_items]
@@ -122,7 +145,7 @@ def payment_body(order, amount, description=""):
         "capture": True,  # одностадийная оплата: списываем сразу
         "confirmation": {
             "type": "redirect",
-            "return_url": settings.YOOKASSA_RETURN_URL,
+            "return_url": settings.YOOKASSA_RETURN_URL if return_url is None else return_url,
         },
         "description": description or f"Заказ ORD-{order.id:05d}",
         "metadata": {

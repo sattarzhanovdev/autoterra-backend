@@ -2535,6 +2535,11 @@ def _prepare_order_payment(client, order_id, payload):
     if total is None or total < 0 or (total == 0 and not order.items.exists()):
         return JsonResponse({"detail": "Некорректная сумма или пустой заказ"}, status=400)
 
+    try:
+        return_url = pay.resolve_return_url(payload.get("returnUrl", ""))
+    except ValueError:
+        return JsonResponse({"detail": "Недопустимый адрес возврата"}, status=400)
+
     # Переиспользуем ещё не оплаченный платёж (не создаём дубли при повторном тапе)
     existing = order.payments.filter(status__in=["pending", "waiting_for_capture"]).first()
     if existing:
@@ -2590,7 +2595,7 @@ def _prepare_order_payment(client, order_id, payload):
         currency="RUB",
         status="pending",
         idempotence_key=idempotence_key,
-        raw_response={"request": pay.payment_body(order, payable)},
+        raw_response={"request": pay.payment_body(order, payable, return_url=return_url)},
     )
     return payment
 

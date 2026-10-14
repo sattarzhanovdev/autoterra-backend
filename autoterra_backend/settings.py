@@ -223,6 +223,12 @@ YOOKASSA_API_URL = os.environ.get("YOOKASSA_API_URL", "https://api.yookassa.ru/v
 YOOKASSA_RECEIPT_EMAIL = os.environ.get("YOOKASSA_RECEIPT_EMAIL", DEFAULT_FROM_EMAIL)
 # Куда вернётся пользователь после оплаты (deep-link в приложение или веб-страница)
 YOOKASSA_RETURN_URL = os.environ.get("YOOKASSA_RETURN_URL", "https://autoterra.shop/api/payments/yookassa/return/")
+# Точные HTTPS-origin веб-сайтов, которым разрешён клиентский returnUrl.
+YOOKASSA_WEB_RETURN_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("YOOKASSA_WEB_RETURN_ORIGINS", "").split(",")
+    if origin.strip()
+]
 # Webhook проверяется повторным запросом к API ЮKassa, отдельного секрета нет.
 
 PASSWORD_RESET_TIMEOUT = 15 * 60

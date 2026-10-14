@@ -37,6 +37,110 @@ class PaymentTests(_Base):
         return Payment.objects.create(order=self.order, amount=amount,
             provider_payment_id="provider-1", idempotence_key="fixed-key")
 
+    @override_settings(YOOKASSA_RETURN_URL="https://api.example.com/mobile-return/",
+                       YOOKASSA_WEB_RETURN_ORIGINS=[],
+                       YOOKASSA_RECEIPT_EMAIL="receipts@example.com")
+    def test_mobile_return_url_default_and_empty_value(self):
+        for payload in ({}, {"returnUrl": ""}):
+            with self.subTest(payload=payload):
+                def create(*args, **kwargs):
+                    expected = "https://api.example.com/mobile-return/"
+                    self.assertEqual(kwargs["request_body"]["confirmation"]["return_url"], expected)
+                    self.assertEqual(Payment.objects.get(order=self.order).raw_response[
+                        "request"]["confirmation"]["return_url"], expected)
+                    return self.response()
+                with patch.object(payments, "create_payment", side_effect=create):
+                    self.assertEqual(self.pay(**payload).status_code, 201)
+                self.order.payments.all().delete()
+
+    @override_settings(YOOKASSA_WEB_RETURN_ORIGINS=["https://avtoterra.vercel.app"],
+                       YOOKASSA_RECEIPT_EMAIL="receipts@example.com")
+    def test_web_return_url_saved_and_sent_to_provider(self):
+        for host in ("avtoterra.vercel.app", "AVTOTERRA.VERCEL.APP"):
+            with self.subTest(host=host):
+                url = f"https://{host}/account.html?order={self.order.pk}&paid=1"
+                def create(*args, **kwargs):
+                    self.assertEqual(kwargs["request_body"]["confirmation"]["return_url"], url)
+                    self.assertEqual(Payment.objects.get(order=self.order).raw_response[
+                        "request"]["confirmation"]["return_url"], url)
+                    return self.response()
+                with patch.object(payments, "create_payment", side_effect=create):
+                    self.assertEqual(self.pay(returnUrl=url).status_code, 201)
+                self.order.refresh_from_db()
+                self.assertEqual(self.order.status, "confirmed")
+                self.order.payments.all().delete()
+
+    @override_settings(YOOKASSA_WEB_RETURN_ORIGINS=["https://avtoterra.vercel.app"])
+    def test_invalid_web_return_url_does_not_create_payment_or_spend_bonus(self):
+        self._credit(100)
+        invalid = [
+            "https://evil.com/account", "http://avtoterra.vercel.app/account",
+            "javascript:alert(1)", "https://a@evil.com",
+            "https://a@avtoterra.vercel.app", "https://avtoterra.vercel.app.evil.com",
+            "https://avtoterra.vercel.app/" + "x" * 2048,
+            "https://avtoterra.vercel.app/account#paid", "https://avtoterra.vercel.app/#",
+            "https://avtoterra.vercel.app:443/", "https://avtoterra.vercel.app:invalid/",
+            "https://[invalid/", " https://avtoterra.vercel.app/",
+            "https://avtoterra.vercel.app/\n", "https://avtoterra.vercel.app\\@evil.com/",
+            None, 123, False, [], {},
+        ]
+        with patch.object(payments, "create_payment") as create:
+            for url in invalid:
+                with self.subTest(url=url):
+                    response = self.pay(returnUrl=url, useBonus=True)
+                    self.assertEqual(response.status_code, 400)
+                    self.assertEqual(response.json(), {"detail": "Недопустимый адрес возврата"})
+                    self.assertFalse(Payment.objects.filter(order=self.order).exists())
+                    self.assertEqual(bonuses.balance(self.client_profile), Decimal("100"))
+                    self.assertFalse(BonusTransaction.objects.filter(order=self.order, kind="order").exists())
+            create.assert_not_called()
+
+    @override_settings(YOOKASSA_WEB_RETURN_ORIGINS=["https://AVTOTERRA.VERCEL.APP:8443"])
+    def test_explicit_port_and_maximum_return_url_length(self):
+        prefix = "https://avtoterra.vercel.app:8443/"
+        url = prefix + "x" * (2048 - len(prefix))
+        self.assertEqual(payments.resolve_return_url(url), url)
+        with self.assertRaises(ValueError):
+            payments.resolve_return_url(url + "x")
+        with self.assertRaises(ValueError):
+            payments.resolve_return_url("https://avtoterra.vercel.app/")
+
+    @override_settings(YOOKASSA_WEB_RETURN_ORIGINS=[])
+    def test_empty_allowlist_disables_client_return_url(self):
+        with patch.object(payments, "create_payment") as create:
+            self.assertEqual(self.pay(returnUrl="https://avtoterra.vercel.app/").status_code, 400)
+            create.assert_not_called()
+        self.assertFalse(Payment.objects.exists())
+
+    @override_settings(YOOKASSA_WEB_RETURN_ORIGINS=["https://avtoterra.vercel.app"],
+                       YOOKASSA_RECEIPT_EMAIL="receipts@example.com")
+    def test_existing_payment_keeps_original_return_url_and_confirmation(self):
+        from .views import _prepare_order_payment
+        original = "https://avtoterra.vercel.app/account.html?attempt=first"
+        for status in ("pending", "waiting_for_capture"):
+            with self.subTest(status=status):
+                payment = _prepare_order_payment(self.client_profile, self.order.pk, {"returnUrl": original})
+                payment.provider_payment_id = "provider-1"
+                payment.confirmation_url = "https://yoomoney.ru/pay/original"
+                payment.status = status
+                payment.save()
+                repeated = _prepare_order_payment(self.client_profile, self.order.pk, {
+                    "returnUrl": "https://avtoterra.vercel.app/account.html?attempt=second"})
+                self.assertEqual(repeated.pk, payment.pk)
+                self.assertEqual(repeated.raw_response["request"]["confirmation"]["return_url"], original)
+                response = self.response(status, confirmation={"confirmation_url": payment.confirmation_url})
+                with patch.object(payments, "fetch_payment", return_value=response), \
+                     patch.object(payments, "create_payment") as create:
+                    result = self.pay(returnUrl="https://avtoterra.vercel.app/changed")
+                    self.assertEqual(result.status_code, 201)
+                    self.assertEqual(result.json()["payment"]["id"], str(payment.pk))
+                    self.assertEqual(result.json()["payment"]["confirmationUrl"], payment.confirmation_url)
+                    create.assert_not_called()
+                self.assertEqual(Payment.objects.filter(order=self.order).count(), 1)
+                payment.refresh_from_db()
+                self.assertEqual(payment.confirmation_url, "https://yoomoney.ru/pay/original")
+                self.order.payments.all().delete()
+
     @override_settings(YOOKASSA_RECEIPT_EMAIL="receipts@example.com")
     def test_receipt_uses_client_email_and_product_fields(self):
         self.client_profile.user.email = "buyer@example.com"
