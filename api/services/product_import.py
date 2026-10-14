@@ -1,5 +1,5 @@
 """Разбор Excel-файла с товарами (шаблон Wildberries «Общие характеристики»
-и совместимые/упрощённые таблицы).
+и совместимые/упрощённые таблицы, включая иерархический прайс 1С).
 
 Особенности шаблона WB, которые здесь учитываются:
   • Лист с товарами называется «Товары» (может быть не первым/активным).
@@ -14,13 +14,21 @@
     допускается до 30) — самих файлов в книге нет. Мы сохраняем только ссылки
     и не более MAX_PRODUCT_IMAGES штук на товар.
 
+В прайсе 1С шапка состоит из нескольких строк: «Номенклатура» → name,
+«Код» → sku (включая ведущие нули), «Артикул» → wb_article. Строки папок
+определяются по outlineLevel даже при наличии кода/агрегатного остатка;
+верхний раздел → group_name, ближайший раздел → category. Цена округляется
+до копеек, дробный остаток — вниз до целых единиц с предупреждением.
+Неправильные цены/остатки/идентификаторы не обнуляют товар, а пропускают строку.
+
 Модуль ничего не пишет в БД — только парсит и нормализует строки. Апсерт
 делает вызывающий код (admin-импорт и API-эндпоинт).
 """
 
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
+import re
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR, ROUND_HALF_UP
 
 from openpyxl import load_workbook
 
@@ -33,7 +41,7 @@ _HEADER_SYNONYMS = {
     "group_name": ["группа", "group"],
     "sku": ["артикул продавца", "артикул", "sku", "код", "код товара", "article"],
     "wb_article": ["артикул wb", "wb", "артикул вб"],
-    "name": ["наименование", "название", "name", "product name", "товар"],
+    "name": ["наименование", "название", "name", "product name", "товар", "номенклатура"],
     "category": ["категория продавца", "категория", "category"],
     "brand": ["бренд", "brand", "производитель"],
     "description": ["описание", "description"],
@@ -72,7 +80,7 @@ _STATUS_ALIASES = {
 
 
 def _norm(value) -> str:
-    return " ".join(str(value or "").strip().split())
+    return " ".join(str("" if value is None else value).strip().split())
 
 
 def _map_header_row(row):
@@ -97,6 +105,112 @@ def _find_header(rows):
         if _REQUIRED.issubset(mapping) and len(mapping) > len(best_map):
             best_idx, best_map = idx, mapping
     return best_idx, best_map
+
+
+def _find_1c_header(rows):
+    """Combine the 1C report header bands, stopping before nomenclature data.
+
+    Real export: Номенклатура/Артикул/Код on row 3, Цена/Остаток/Фото
+    on row 6, with currency and tax notes between them. No positional mapping.
+    """
+    for start, row in enumerate(rows[:_MAX_HEADER_SCAN]):
+        name_col = next((i for i, value in enumerate(row)
+                         if _norm(value).lower() == "номенклатура"), None)
+        if name_col is None:
+            continue
+        mapping, code_col, article_col, end = {}, None, None, start
+        for index in range(start, min(start + 8, len(rows))):
+            band = rows[index]
+            name_value = _norm(band[name_col]) if name_col < len(band) else ""
+            if index > start and name_value and name_value.lower() != "номенклатура":
+                break
+            # Later/lower header bands refine the same column, e.g. stock title.
+            mapping.update(_map_header_row(band))
+            for col, value in enumerate(band):
+                header = _norm(value).lower()
+                if header in ("код", "код товара"):
+                    code_col = col
+                elif header == "артикул":
+                    article_col = col
+            if _map_header_row(band):
+                end = index
+        if code_col is not None:
+            mapping["name"] = name_col
+            mapping["sku"] = code_col
+            if article_col is not None:
+                mapping["wb_article"] = article_col
+            return end, mapping
+    return None, {}
+
+
+def _identifier(cell):
+    """Keep textual leading zeros and Excel zero-padded numeric codes."""
+    value = cell.value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, int) or (isinstance(value, float) and value.is_integer()):
+            result = str(int(value))
+            if re.fullmatch(r"0+", cell.number_format or ""):
+                result = result.zfill(len(cell.number_format))
+            return result
+    return _norm(value)
+
+
+def _one_c_number(value, label):
+    try:
+        if isinstance(value, bool):
+            raise ValueError()
+        amount = Decimal(_norm(value).replace(" ", "").replace(",", ".") or "0")
+        if not amount.is_finite() or amount < 0:
+            raise ValueError()
+        return amount
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"{label}: некорректное неотрицательное число {value!r}") from None
+
+
+def _one_c_stock(row, mapping):
+    values, warnings = {}, []
+    if "price" in mapping:
+        price = _one_c_number(_cell(row, mapping, "price"), "Цена")
+        if price > Decimal("9999999999.99"):
+            raise ValueError("Цена превышает допустимый предел")
+        values["price"] = price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if "quantity" in mapping:
+        quantity = _one_c_number(_cell(row, mapping, "quantity"), "Остаток")
+        if quantity > 2147483647:
+            raise ValueError("Остаток превышает допустимый предел")
+        whole = quantity.to_integral_value(rounding=ROUND_FLOOR)
+        values["quantity"] = int(whole)
+        if quantity != whole:
+            warnings.append(f"дробный остаток {quantity} округлён вниз до {int(whole)} целых единиц")
+    return values, warnings
+
+
+def _one_c_group_rows(sheet, rows, header_idx, mapping):
+    """Folders have codes and sometimes aggregate stock: use outline hierarchy.
+
+    A named row followed by a deeper named row is a folder, not a product.
+    Flat exports may also have standalone section labels with no product data.
+    """
+    named = [(index, row) for index, row in enumerate(rows[header_idx + 1:], header_idx + 1)
+             if _norm(_cell(row, mapping, "name"))]
+    groups = set()
+    for (index, row), (next_index, _) in zip(named, named[1:]):
+        if sheet.row_dimensions[next_index + 1].outlineLevel > sheet.row_dimensions[index + 1].outlineLevel:
+            groups.add(index)
+    for index, row in named:
+        if all(not _norm(_cell(row, mapping, key)) for key in ("sku", "wb_article", "price", "quantity", "images", "status")):
+            groups.add(index)
+    return groups
+
+
+def _validate_one_c_product(product):
+    from api.models import Product
+    for field, value in product.items():
+        if not isinstance(value, str) or field.startswith("_"):
+            continue
+        limit = Product._meta.get_field(field).max_length
+        if limit and len(value) > limit:
+            raise ValueError(f"Поле {field}: длина превышает {limit} символов")
 
 
 def _cell(row, mapping, key, default=None):
@@ -133,7 +247,7 @@ def _images(value):
     значения без http(s) отбрасываем, сверх MAX_PRODUCT_IMAGES — обрезаем и
     сообщаем об этом вызывающему коду, чтобы предупредить пользователя.
     """
-    raw = _norm(value)
+    raw = str(value or "").strip()
     if not raw:
         return [], []
 
@@ -169,41 +283,94 @@ def parse_products_workbook(file_obj):
     except Exception as exc:  # noqa: BLE001 — покажем пользователю понятную ошибку
         return [], [f"Не удалось прочитать файл: {exc}"]
 
-    # Предпочитаем лист «Товары», иначе первый активный.
-    sheet = None
-    for name in workbook.sheetnames:
-        if _norm(name).lower() in ("товары", "products", "товар"):
-            sheet = workbook[name]
-            break
-    if sheet is None:
-        sheet = workbook.active
+    try:
+        # Предпочитаем лист «Товары», иначе первый активный.
+        sheet = None
+        for name in workbook.sheetnames:
+            if _norm(name).lower() in ("товары", "products", "товар"):
+                sheet = workbook[name]
+                break
+        if sheet is None:
+            sheet = workbook.active
 
+        # Keep the existing streaming path for WB/plain workbooks. Only 1C
+        # needs row_dimensions, which openpyxl read-only sheets do not expose.
+        header_rows = list(sheet.iter_rows(max_row=_MAX_HEADER_SCAN, values_only=True))
+        if _find_1c_header(header_rows)[0] is not None:
+            sheet_name = sheet.title
+            workbook.close()
+            if hasattr(file_obj, "seek"):
+                file_obj.seek(0)
+            workbook = load_workbook(file_obj, data_only=True)
+            sheet = workbook[sheet_name]
+        return _parse_products_sheet(sheet)
+    finally:
+        workbook.close()
+
+
+def _parse_products_sheet(sheet):
     rows = list(sheet.iter_rows(values_only=True))
     if not rows:
         return [], ["Файл пустой."]
 
-    header_idx, mapping = _find_header(rows)
+    header_idx, mapping = _find_1c_header(rows)
+    is_one_c = header_idx is not None
+    if not is_one_c:
+        if any(_norm(value).lower() == "номенклатура"
+               for row in rows[:_MAX_HEADER_SCAN] for value in row):
+            return [], ["Не найдена колонка «Код» в шапке прайса 1С — импорт по артикулу запрещён."]
+        header_idx, mapping = _find_header(rows)
     if header_idx is None:
-        return [], ["Не найдена строка с заголовками (нужны колонки «Артикул продавца» и «Наименование»)."]
+        return [], ["Не найдена строка с заголовками (нужны «Код» и «Номенклатура» для 1С или «Артикул продавца» и «Наименование»)."]
 
     has_price = "price" in mapping
     has_quantity = "quantity" in mapping
     has_status = "status" in mapping
 
     products, errors = [], []
+    group_rows = _one_c_group_rows(sheet, rows, header_idx, mapping) if is_one_c else set()
+    groups = {}
+    has_outline = is_one_c and any(sheet.row_dimensions[i + 1].outlineLevel for i in range(header_idx + 1, len(rows)))
     for number, row in enumerate(rows[header_idx + 1:], start=header_idx + 2):
-        sku = _norm(_cell(row, mapping, "sku"))
+        if is_one_c and any(sheet.cell(number, mapping[field] + 1).data_type == "e"
+                            for field in ("sku", "name")):
+            errors.append(f"Строка {number}: код или номенклатура содержит ошибку Excel — пропущено.")
+            continue
+        sku = (_identifier(sheet.cell(number, mapping["sku"] + 1)) if is_one_c
+               else _norm(_cell(row, mapping, "sku")))
         name = _norm(_cell(row, mapping, "name"))
+        if is_one_c:
+            if not name and not sku:
+                continue
+            if name.lower() == "номенклатура" and sku.lower() in ("код", "код товара"):
+                continue  # repeated report header
+            level = sheet.row_dimensions[number].outlineLevel if has_outline else (0 if number - 1 in group_rows else 1)
+            groups = {depth: label for depth, label in groups.items() if depth < level}
+            if number - 1 in group_rows:
+                groups[level] = name
+                continue
+            if not name and sku:
+                errors.append(f"Строка {number} ({sku}): нет номенклатуры — пропущено.")
+                continue
 
         # Пустые строки и строки-подсказки (без названия) пропускаем молча.
         if not name:
             continue
         if not sku:
-            errors.append(f"Строка {number}: указано название, но нет артикула — пропущено.")
+            identifier = "кода" if is_one_c else "артикула"
+            errors.append(f"Строка {number}: указано название, но нет {identifier} — пропущено.")
             continue
 
+        stock_values, stock_warnings = {}, []
+        if is_one_c:
+            try:
+                stock_values, stock_warnings = _one_c_stock(row, mapping)
+            except (ValueError, InvalidOperation) as exc:
+                errors.append(f"Строка {number} ({sku}): {exc} — пропущено.")
+                continue
+
         images, image_warnings = _images(_cell(row, mapping, "images"))
-        for warning in image_warnings:
+        for warning in image_warnings + stock_warnings:
             errors.append(f"Строка {number} ({sku}): {warning}.")
 
         product = {
@@ -230,13 +397,28 @@ def parse_products_workbook(file_obj):
             "_has_quantity": has_quantity,
             "_has_status": has_status,
         }
+        if is_one_c:
+            if "wb_article" in mapping:
+                product["wb_article"] = _identifier(sheet.cell(number, mapping["wb_article"] + 1))
+            labels = [groups[depth] for depth in sorted(groups)]
+            if labels:
+                if "group_name" not in mapping:
+                    product["group_name"] = labels[0]
+                if "category" not in mapping:
+                    product["category"] = labels[-1]
+            product.update(stock_values)
+            try:
+                _validate_one_c_product(product)
+            except ValueError as exc:
+                errors.append(f"Строка {number} ({sku}): {exc} — пропущено.")
+                continue
         if "synonyms" in mapping:
             product["synonyms"] = normalize_product_synonyms(_norm(_cell(row, mapping, "synonyms")))
         if "images" not in mapping:
             product.pop("images")
-        if has_price:
+        if has_price and not is_one_c:
             product["price"] = _money(_cell(row, mapping, "price", 0))
-        if has_quantity:
+        if has_quantity and not is_one_c:
             product["quantity"] = max(_int(_cell(row, mapping, "quantity", 0)), 0)
         if has_status:
             product["status"] = _status(_cell(row, mapping, "status", "inStock"))
