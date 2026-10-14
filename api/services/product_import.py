@@ -273,13 +273,16 @@ def _images(value):
     return normalize_product_images(valid), warnings
 
 
-def parse_products_workbook(file_obj):
+def parse_products_workbook(file_obj, *, category_audit=None):
     """Парсит книгу Excel и возвращает (products, errors).
 
     products — список dict с каноническими ключами и флагами наличия колонок
     (`_has_price`, `_has_quantity`, `_has_status`), чтобы вызывающий код мог
     не затирать цену/остаток отсутствующими данными.
     errors — список строк с проблемами (для показа пользователю).
+    category_audit — необязательный список, в который добавляются решения
+    классификатора 1С с номером строки, кодом, папкой и полной иерархией.
+    Аудит ничего не пишет в БД и не меняет решения классификатора.
     """
     try:
         workbook = load_workbook(file_obj, read_only=True, data_only=True)
@@ -306,12 +309,12 @@ def parse_products_workbook(file_obj):
                 file_obj.seek(0)
             workbook = load_workbook(file_obj, data_only=True)
             sheet = workbook[sheet_name]
-        return _parse_products_sheet(sheet)
+        return _parse_products_sheet(sheet, category_audit=category_audit)
     finally:
         workbook.close()
 
 
-def _parse_products_sheet(sheet):
+def _parse_products_sheet(sheet, *, category_audit=None):
     rows = list(sheet.iter_rows(values_only=True))
     if not rows:
         return [], ["Файл пустой."]
@@ -409,18 +412,26 @@ def _parse_products_sheet(sheet):
             product.update(stock_values)
             folder = _norm(_cell(row, mapping, "category")) or (labels[-1] if labels else product["group_name"])
             category = determine_product_category(name, folder, [product["group_name"], *labels])
+            # Validate normalized fields before auditing; unknown categories
+            # are never saved, but their otherwise valid rows must be reported.
+            product["category"] = category or ""
+            try:
+                _validate_one_c_product(product)
+            except ValueError as exc:
+                errors.append(f"Строка {number} ({sku}): {exc} — пропущено.")
+                continue
+            if category_audit is not None:
+                hierarchy = labels or ([product["group_name"]] if product["group_name"] else [])
+                category_audit.append({
+                    "row": number, "sku": sku, "name": name,
+                    "folder": folder, "hierarchy": hierarchy, "category": category,
+                })
             if category is None:
                 errors.append(
                     f"Строка {number} ({sku}): не удалось определить категорию товара «{name}» "
                     f"(папка 1С: «{folder}») — пропущено; "
                     "нужна одна из 12 категорий каталога."
                 )
-                continue
-            product["category"] = category
-            try:
-                _validate_one_c_product(product)
-            except ValueError as exc:
-                errors.append(f"Строка {number} ({sku}): {exc} — пропущено.")
                 continue
         if "synonyms" in mapping:
             product["synonyms"] = normalize_product_synonyms(_norm(_cell(row, mapping, "synonyms")))

@@ -4,6 +4,8 @@ No commercial workbook is stored in Git. Its A/M/N/O/Q/S layout and folder
 outline (folders also carry codes and aggregate stock) are reproduced below.
 """
 import io
+import os
+from unittest import skipUnless
 from decimal import Decimal
 
 from django.test import TestCase
@@ -378,3 +380,152 @@ class OneCUploadEndpointTests(TestCase):
         self.assertEqual(response.status_code, 200, response.content)
         original.refresh_from_db()
         self.assertEqual(original.images, ['https://example.com/preserved.jpg'])
+
+
+class ExpandedOneCCategoryTests(TestCase):
+    def test_group_families_and_common_abbreviations(self):
+        cases = [
+            ('Кисть флейцевая', 'ОРМИС', 'Инструменты'),
+            ('Набор шпателей ПВХ', 'ОРМИС', 'Инструменты'),
+            ('Нож Стандарт', 'ОРМИС', 'Инструменты'),
+            ('Набор щеток д/зачис.поверх.пластик', 'ОРМИС', 'Абразивы'),
+            ('INP MBX щетка большая', 'INP', 'Абразивы'),
+            ('Щетка-крацовка д/УШМ', 'ОРМИС', 'Абразивы'),
+            ('Щиток токаря,защитный лицевой', 'ОРМИС', 'Расходники'),
+            ('Круг лепестковый P80', 'DEBEVER', 'Абразивы'),
+            ('Шлиф.блок 120х98х13мм P120', 'SUNMIGHT', 'Абразивы'),
+            ('Ручной шлифовальный блок-ракель без абразива', 'SANDWOX', 'Инструменты'),
+            ('Круг полир.150х25мм', 'РМ Разное', 'Абразивы'),
+            ('Водостойкая бумагаP1000', 'SIA', 'Абразивы'),
+            ('Перф.листы Goldflex', 'MIRKA Перфорированные листы в рулоне Goldflex Soft', 'Абразивы'),
+            ('Полоса IRIDIUM 81*133мм', 'MIRKA Полосы IRIDIUM 81х133мм 54 отв', 'Абразивы'),
+            ('Блок подготовки воздуха', 'WIEDER KRAFT', 'Инструменты'),
+            ('Цилиндр WDK-серия', 'WIEDER KRAFT', 'Инструменты'),
+            ('Набор для рихтовки', 'WIEDER KRAFT', 'Инструменты'),
+            ('Stirring Lid-Assembied', 'PPG SELEMIX', 'Инструменты'),
+            ('Бесщеточная орбитальная машинка', 'TesKom Машинки', 'Инструменты'),
+            ('Ручка системы X', 'РМ Столы/стойки', 'Инструменты'),
+            ('Комплект панелей для верстака', 'FERRUM (Металлическая мебель)', 'Инструменты'),
+            ('Модель изоляции X', 'Шумоизоляция К-УРАЛ', 'Расходники'),
+            ('Валик прикаточный', 'Шумоизоляция К-УРАЛ', 'Инструменты'),
+            ('Полумаска противогазоаэрозольная', 'JP Полумаска', 'Расходники'),
+            ('Предфильтр', '3M Китай', 'Расходники'),
+            ('Фреза для ремонта пластика', 'FULLEN-POLYMER', 'Инструменты'),
+            ('Синий плоский профиль', 'FULLEN-POLYMER', 'Расходники'),
+            ('Набор треугольных прутов сварочных для PP1', 'BAMPERUS', 'Расходники'),
+            ('Холодная сварка универсальная', 'ОРМИС', 'Герметики'),
+            ('Уплотнительная масса под кисть', 'POLFILL', 'Герметики'),
+            ('Антисиликон NF', 'Fitter Разное', 'Растворители'),
+            ('LE-series SRA 1л', 'LENERGY', 'Растворители'),
+            ('Смывка краски (бутылка)', 'Смывка', 'Растворители'),
+            ('Преобразователь ржавчины с распылителем', 'ПОЛИХИМ', 'Антикоры'),
+            ('Праймер (с кисточкой)', '3M Китай', 'Грунтовки'),
+            ('Базовая краска с тест-картой', 'Краски', 'Краски базовые'),
+            ('Отвердитель для лака', 'Лаки', 'Отвердители'),
+            ('Грунт с отвердителем', 'Грунты и отвердители', 'Грунтовки'),
+            ('Аэрозольная акриловая эмаль 1К', 'NC Спрей-краска', 'Краски базовые'),
+            ('Эмаль для суппортов RAPTOR, аэрозоль', 'U-POL Термостойкие краски HIGH HEAT!', 'Краски базовые'),
+            ('Защитное покрытие RAPTOR', 'U-POL Raptor', 'Краски 2K'),
+            ('Эмаль MobiHARD ПУ', 'ЭМАЛИ', 'Краски 2K'),
+            ('Эмаль HARDMAX PUR', 'ЭМАЛИ', 'Краски 2K'),
+            ('SCV BT LV 151 DTM КОНВ.П/М', 'Sikkens Тонеры Autocoat BT SCV', 'Краски 2K'),
+            ('Пигмент Hymax RED LUMINA', 'Hymax Спецпродукты', 'Краски базовые'),
+            ('Паста колер. POLYMER U', 'Пигменты PALIZH', 'Краски базовые'),
+            ('SYSTEMIX Пигментная паста', 'ПИГМЕНТНЫЕ ПАСТЫ SYSTEMIX', 'Краски базовые'),
+            ('Пигментная паста 2К', 'Пигменты PALIZH', 'Краски 2K'),
+            ('Сухое проявочное покрытие', 'Разное', 'Расходники'),
+            ('Силикагель для осушителя', 'РМ Разное', 'Расходники'),
+            ('Паста полировальная', 'HIQ', 'Расходники'),
+            ('Жидкость для детейлинга', 'MENZERNA', 'Расходники'),
+        ]
+        for name, folder, expected in cases:
+            with self.subTest(name=name, folder=folder):
+                self.assertEqual(determine_product_category(name, folder), expected)
+
+    def test_unknown_products_in_mixed_groups_remain_unresolved(self):
+        for folder in ['Разное', '001.Краски', 'ОРМИС', 'WIEDER KRAFT', 'FULLEN-POLYMER', 'LENERGY']:
+            with self.subTest(folder=folder):
+                self.assertIsNone(determine_product_category('Неизвестный товар XYZ', folder))
+        self.assertIsNone(determine_product_category('Цилиндр XYZ', 'Неизвестная папка'))
+
+    def test_audit_preserves_full_hierarchy_and_does_not_write_database(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from django.core.management import call_command
+        rows = [
+            {'name': 'Материалы', 'code': 'G0', 'level': 0},
+            {'name': 'Шумоизоляция', 'code': 'G1', 'level': 1},
+            {'name': 'Шумоизоляция К-УРАЛ', 'code': 'G2', 'level': 2},
+            item(name='Модель X', code='P1', level=3),
+            item(name='Модель Y', code='P2', level=3),
+        ]
+        audit = []
+        products, errors = parse_products_workbook(one_c_workbook(rows), category_audit=audit)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(products), 2)
+        self.assertEqual(audit[0]['hierarchy'], ['Материалы', 'Шумоизоляция', 'Шумоизоляция К-УРАЛ'])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workbook = root / 'price.xlsx'
+            workbook.write_bytes(one_c_workbook(rows).getvalue())
+            baseline = root / 'baseline.json'
+            baseline.write_text(json.dumps([dict(row, category=None) for row in audit]), encoding='utf-8')
+            call_command('audit_1c_categories', str(workbook), output_dir=root / 'report',
+                baseline=baseline, expect_total=2, require_complete=True, stdout=io.StringIO())
+            report = json.loads((root / 'report/category-audit.json').read_text(encoding='utf-8'))
+            self.assertEqual(report['summary']['classified'], 2)
+            self.assertEqual(report['summary']['unresolved'], 0)
+            self.assertEqual(report['summary']['unresolved_before'], 2)
+            self.assertEqual(report['unresolved_before'][0]['folder_total'], 2)
+            self.assertEqual(report['unresolved_before'][0]['folder_unresolved_before'], 2)
+        self.assertFalse(Product.objects.exists())
+
+    def test_unknown_rows_are_audited_without_default_category(self):
+        audit = []
+        products, errors = parse_products_workbook(
+            one_c_workbook([item(name='Неизвестный товар', code='UNKNOWN')]), category_audit=audit)
+        self.assertEqual(products, [])
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(len(audit), 1)
+        self.assertIsNone(audit[0]['category'])
+
+    def test_expanded_groups_repeat_import_without_duplicates(self):
+        from .services.product_import import upsert_products
+        distributor = Distributor.objects.create(name='Category audit', inn='category-audit')
+        rows = [item(name='Шпатель фасадный', code='TOOL'),
+                item(name='Предфильтр для полумаски', code='SUPPLY'),
+                item(name='SRA для переходов', code='SOLVENT')]
+        products, errors = parse_products_workbook(one_c_workbook(rows))
+        self.assertEqual(errors, [])
+        self.assertEqual(upsert_products(distributor, products), (3, 0))
+        changed, errors = parse_products_workbook(one_c_workbook([
+            dict(row, quantity=9, price=200) for row in rows]))
+        self.assertEqual(errors, [])
+        self.assertEqual(upsert_products(distributor, changed), (0, 3))
+        self.assertEqual(Product.objects.filter(distributor=distributor).count(), 3)
+        self.assertEqual(set(Product.objects.filter(distributor=distributor).values_list('category', flat=True)),
+                         {'Инструменты', 'Расходники', 'Растворители'})
+        self.assertTrue(all(p.quantity == 9 and p.price == Decimal('200')
+                            for p in Product.objects.filter(distributor=distributor)))
+
+
+@skipUnless(os.environ.get('AUTOTERRA_TEST_1C_WORKBOOK'), 'Private real workbook path is not configured')
+class RealOneCWorkbookTests(TestCase):
+    def test_complete_real_workbook_and_two_upserts(self):
+        from pathlib import Path
+        from .services.product_import import upsert_products
+        audit = []
+        products, errors = parse_products_workbook(
+            Path(os.environ['AUTOTERRA_TEST_1C_WORKBOOK']), category_audit=audit)
+        self.assertEqual(len(audit), 3968)
+        self.assertEqual(len(products), 3968)
+        self.assertFalse(any('не удалось определить категорию' in error for error in errors))
+        self.assertTrue(all(product['category'] in CANONICAL_PRODUCT_CATEGORIES for product in products))
+        self.assertEqual(len({product['sku'] for product in products}), 3968)
+        distributor = Distributor.objects.create(name='Private real workbook test', inn='real-price-audit')
+        self.assertEqual(upsert_products(distributor, products), (3968, 0))
+        self.assertEqual(upsert_products(distributor, products), (0, 3968))
+        self.assertEqual(Product.objects.filter(distributor=distributor).count(), 3968)
+        for product in Product.objects.filter(distributor=distributor):
+            self.assertIn(product.category, CANONICAL_PRODUCT_CATEGORIES)
