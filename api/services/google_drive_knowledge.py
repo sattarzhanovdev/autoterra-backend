@@ -33,14 +33,33 @@ class DriveError(ValueError):
     """Only controlled codes may leave this integration; never Google error bodies."""
 
 
+class APIKeyLogFilter(logging.Filter):
+    """urllib3 DEBUG/retry logging otherwise includes the complete query string."""
+    def filter(self, record):
+        record.msg = re.sub(r'([?&]key=)[^&\s\'\"]+', r'\1[REDACTED]', record.getMessage())
+        record.args = ()
+        return True
+
+
+API_KEY_LOG_FILTER = APIKeyLogFilter()
+
+
 class DriveClient:
     def __init__(self):
+        path = settings.GOOGLE_DRIVE_CREDENTIALS_FILE
+        self.public_mode = not bool(path)
+        self.api_key = '' if path else settings.GOOGLE_DRIVE_API_KEY
+        if self.public_mode:
+            if not self.api_key:
+                raise DriveError('credentials_not_configured')
+            import requests
+            self.session = requests.Session()
+            for name in ('urllib3.connectionpool', 'urllib3.util.retry'):
+                logging.getLogger(name).addFilter(API_KEY_LOG_FILTER)
+            return
         from google.oauth2.service_account import Credentials
         from google.auth.transport.requests import AuthorizedSession
 
-        path = settings.GOOGLE_DRIVE_CREDENTIALS_FILE
-        if not path:
-            raise DriveError('credentials_not_configured')
         try:
             credentials = Credentials.from_service_account_file(path, scopes=[
                 'https://www.googleapis.com/auth/drive.readonly'])
@@ -53,9 +72,14 @@ class DriveClient:
 
     def get(self, path, **kwargs):
         try:
+            params = dict(kwargs.pop('params', {}))
+            if self.public_mode:
+                params['key'] = self.api_key
+            else:
+                kwargs['max_allowed_time'] = settings.GOOGLE_DRIVE_REQUEST_TIMEOUT
             response = self.session.get('https://www.googleapis.com/drive/v3/' + path,
                 timeout=settings.GOOGLE_DRIVE_REQUEST_TIMEOUT,
-                max_allowed_time=settings.GOOGLE_DRIVE_REQUEST_TIMEOUT, **kwargs)
+                params=params, **kwargs)
             if response.status_code != 200:
                 code = response.status_code
                 response.close()
@@ -108,6 +132,8 @@ class DriveClient:
         if int(item.get('size', 0)) > limit:
             raise DriveError('file_too_large')
         native = item['mimeType'] in EXPORTS
+        if native and self.public_mode:
+            raise DriveError('workspace_export_requires_oauth')
         params = {'mimeType': MIME_TYPES[extension]} if native else {'alt': 'media', 'supportsAllDrives': 'true'}
         endpoint = 'files/' + quote(item['id'], safe='') + ('/export' if native else '')
         started, size = time.monotonic(), 0
@@ -188,6 +214,10 @@ def sync_file(client, item, folder_id, retry_failed=False):
     if extension is None:
         source.status = 'unsupported'
         source.error = 'transcription_required' if source.mime_type.startswith(('video/', 'audio/')) else 'unsupported_format'
+        source.save(update_fields=['status', 'error'])
+        return 'failed'
+    if source.mime_type in EXPORTS and client.public_mode:
+        source.status, source.error = 'unsupported', 'workspace_export_requires_oauth'
         source.save(update_fields=['status', 'error'])
         return 'failed'
     new_doc = None

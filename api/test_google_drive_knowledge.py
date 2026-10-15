@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -31,6 +32,7 @@ class GoogleDriveKnowledgeTests(TestCase):
         self.parser.start()
         self.addCleanup(self.parser.stop)
         self.drive = MagicMock()
+        self.drive.public_mode = False
         self.items = []
         self.data = {}
         self.drive.list_files.side_effect = lambda folder: list(self.items)
@@ -245,6 +247,8 @@ class DriveHTTPTests(TestCase):
     """Transport is mocked too: no test can call Google or read actual credentials."""
     def make_client(self):
         client = DriveClient.__new__(DriveClient)
+        client.public_mode = False
+        client.api_key = ''
         client.session = MagicMock()
         return client
 
@@ -317,3 +321,207 @@ class DriveHTTPTests(TestCase):
         client.session.get.return_value = MagicMock(status_code=403)
         with self.assertRaisesMessage(DriveError, 'drive_http_403'):
             client.list_files('root')
+
+
+@override_settings(GOOGLE_DRIVE_CREDENTIALS_FILE='', GOOGLE_DRIVE_API_KEY='unit-test-api-key',
+                   GOOGLE_DRIVE_REQUEST_TIMEOUT=10, GOOGLE_DRIVE_KNOWLEDGE_FOLDER_ID='public-root')
+class PublicDriveHTTPTests(TestCase):
+    def setUp(self):
+        session_patch = patch('requests.Session')
+        self.session = session_patch.start().return_value
+        self.addCleanup(session_patch.stop)
+        self.drive = DriveClient()
+        self.addCleanup(self.drive.close)
+
+    def response(self, data=None, content=b'hello'):
+        response = MagicMock(status_code=200)
+        response.__enter__.return_value = response
+        response.json.return_value = data or {}
+        response.headers = {}
+        response.iter_content.return_value = [content]
+        return response
+
+    def test_public_listing_uses_key_and_existing_query_parameters(self):
+        self.session.get.return_value = self.response({'files': []})
+        self.assertEqual(self.drive.list_files('root'), [])
+        call = self.session.get.call_args
+        self.assertEqual(call.args[0], 'https://www.googleapis.com/drive/v3/files')
+        self.assertEqual(call.kwargs['params']['key'], 'unit-test-api-key')
+        self.assertEqual(call.kwargs['params']['q'], "'root' in parents and trashed = false")
+        self.assertEqual(call.kwargs['params']['supportsAllDrives'], 'true')
+        self.assertEqual(call.kwargs['params']['includeItemsFromAllDrives'], 'true')
+        self.assertIn('modifiedTime', call.kwargs['params']['fields'])
+        self.assertEqual(call.kwargs['timeout'], 10)
+        self.assertNotIn('max_allowed_time', call.kwargs)
+
+    def test_recursive_listing_and_pagination_keep_api_key(self):
+        self.session.get.side_effect = [self.response({'nextPageToken': 'next', 'files': [
+            {'id': 'sub', 'name': 'nested', 'mimeType': 'application/vnd.google-apps.folder'}]}),
+            self.response({'files': [{'id': 'file1', 'name': 'one.txt', 'mimeType': 'text/plain'}]}),
+            self.response({'files': [{'id': 'file2', 'name': 'two.txt', 'mimeType': 'text/plain'}]})]
+        self.assertEqual({f['id'] for f in self.drive.list_files('root')}, {'file1', 'file2'})
+        calls = self.session.get.call_args_list
+        self.assertEqual(calls[1].kwargs['params']['pageToken'], 'next')
+        self.assertEqual(calls[2].kwargs['params']['q'], "'sub' in parents and trashed = false")
+        self.assertTrue(all(call.kwargs['params']['key'] == 'unit-test-api-key' for call in calls))
+
+    def test_public_files_download_via_official_api_with_key(self):
+        self.session.get.return_value = self.response()
+        for extension in ('pdf', 'docx', 'xlsx', 'txt', 'html'):
+            with self.subTest(extension=extension):
+                stream = io.BytesIO()
+                self.assertEqual(self.drive.download({'id': 'public-file', 'mimeType': MIME_TYPES[extension]}, extension, stream), 5)
+                self.assertEqual(stream.read(), b'hello')
+                call = self.session.get.call_args
+                self.assertEqual(call.args[0], 'https://www.googleapis.com/drive/v3/files/public-file')
+                self.assertEqual(call.kwargs['params']['alt'], 'media')
+                self.assertEqual(call.kwargs['params']['key'], 'unit-test-api-key')
+
+    def test_workspace_export_requires_oauth_without_scraping_or_network(self):
+        for mime, extension in [('application/vnd.google-apps.document', 'docx'),
+                                ('application/vnd.google-apps.spreadsheet', 'xlsx')]:
+            with self.subTest(mime=mime), self.assertRaisesMessage(DriveError, 'workspace_export_requires_oauth'):
+                self.drive.download({'id': 'workspace-file', 'mimeType': mime}, extension, io.BytesIO())
+        self.session.get.assert_not_called()
+
+    @override_settings(GOOGLE_DRIVE_API_KEY='')
+    def test_no_credentials_or_key_returns_controlled_error(self):
+        with self.assertRaisesMessage(DriveError, 'credentials_not_configured'):
+            DriveClient()
+        with self.assertRaisesMessage(CommandError, 'credentials_not_configured'):
+            call_command('sync_google_drive_knowledge')
+
+    def test_api_and_transport_errors_do_not_expose_key(self):
+        self.session.get.return_value = MagicMock(status_code=403)
+        with self.assertRaisesMessage(DriveError, 'drive_http_403') as caught:
+            self.drive.list_files('root')
+        self.assertNotIn('unit-test-api-key', str(caught.exception))
+        self.session.get.side_effect = RuntimeError('URL?key=unit-test-api-key')
+        with self.assertRaisesMessage(DriveError, 'drive_request_failed') as caught:
+            self.drive.list_files('root')
+        self.assertNotIn('unit-test-api-key', str(caught.exception))
+
+    def test_http_debug_logging_redacts_query_key(self):
+        def transport(*args, **kwargs):
+            logging.getLogger('urllib3.connectionpool').debug('GET %s', '/drive/v3/files?key=unit-test-api-key&q=root')
+            logging.getLogger('urllib3.util.retry').debug('Retry: %s', '/files?key=unit-test-api-key')
+            return self.response()
+        self.session.get.side_effect = transport
+        with self.assertLogs('urllib3', level='DEBUG') as logs:
+            self.drive.list_files('root')
+        self.assertNotIn('unit-test-api-key', '\n'.join(logs.output))
+        self.assertIn('[REDACTED]', '\n'.join(logs.output))
+
+    @override_settings(GOOGLE_DRIVE_CREDENTIALS_FILE='/server/secret.json')
+    def test_service_account_takes_priority_over_api_key(self):
+        with patch('google.oauth2.service_account.Credentials.from_service_account_file'), patch(
+            'google.auth.transport.requests.AuthorizedSession') as session:
+            drive = DriveClient()
+            session.return_value.get.return_value = self.response()
+            drive.list_files('root')
+            self.assertFalse(drive.public_mode)
+            self.assertNotIn('key', session.return_value.get.call_args.kwargs['params'])
+            self.assertEqual(drive.api_key, '')
+            drive.close()
+
+
+@override_settings(GOOGLE_DRIVE_CREDENTIALS_FILE='', GOOGLE_DRIVE_API_KEY='unit-test-api-key')
+class PublicDriveSyncTests(TestCase):
+    """Exercise the real API-key client through sync, with only HTTP/parser mocked."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        config = override_settings(PRIVATE_KNOWLEDGE_ROOT=Path(self.tmp.name))
+        config.enable()
+        self.addCleanup(config.disable)
+        parser = patch('api.services.google_drive_knowledge.run_parser', side_effect=process_document)
+        parser.start()
+        self.addCleanup(parser.stop)
+        session_patch = patch('requests.Session')
+        self.session = session_patch.start().return_value
+        self.addCleanup(session_patch.stop)
+        self.session.get.side_effect = self.http_get
+        self.drive = DriveClient()
+        self.addCleanup(self.drive.close)
+        self.items = [{'id': 'public1', 'name': 'manual.txt', 'mimeType': 'text/plain', 'version': '1'}]
+        self.content = b'Primer drying at 20 degrees.'
+
+    def http_get(self, url, **kwargs):
+        self.assertEqual(kwargs['params']['key'], 'unit-test-api-key')
+        response = MagicMock(status_code=200)
+        response.__enter__.return_value = response
+        response.headers = {}
+        response.json.return_value = {'files': list(self.items)}
+        response.iter_content.return_value = [self.content]
+        return response
+
+    def sync(self):
+        return sync_folder(self.drive, 'public-root')
+
+    def test_new_file(self):
+        self.assertEqual(self.sync()['created'], 1)
+        self.assertTrue(retrieve('Primer drying'))
+        snapshot = json.dumps(list(KnowledgeDriveFile.objects.values()), default=str)
+        snapshot += json.dumps(list(KnowledgeDocument.objects.values()), default=str)
+        snapshot += json.dumps(list(KnowledgeChunk.objects.values()), default=str)
+        self.assertNotIn('unit-test-api-key', snapshot)
+
+    def test_unchanged_sync_does_not_download_or_update_database(self):
+        self.sync()
+        before = list(KnowledgeDriveFile.objects.values())
+        self.session.get.reset_mock()
+        self.assertEqual(self.sync()['unchanged'], 1)
+        self.assertEqual(self.session.get.call_count, 1)  # listing only
+        self.assertEqual(list(KnowledgeDriveFile.objects.values()), before)
+        self.assertEqual(KnowledgeDocument.objects.count(), 1)
+
+    def test_updated_file(self):
+        self.sync()
+        self.items[0]['version'] = '2'
+        self.content = b'Newprimer replacement instructions.'
+        self.assertEqual(self.sync()['updated'], 1)
+        self.assertTrue(retrieve('Newprimer'))
+        self.assertFalse(KnowledgeChunk.objects.filter(text__contains='20 degrees').exists())
+        self.assertEqual(KnowledgeDocument.objects.count(), 1)
+
+    def test_removed_file(self):
+        self.sync()
+        self.items.clear()
+        self.assertEqual(self.sync()['deactivated'], 1)
+        self.assertFalse(KnowledgeDriveFile.objects.get().active)
+        self.assertFalse(retrieve('Primer'))
+
+    def test_api_error_keeps_local_inventory_and_key_out_of_logs_and_error(self):
+        self.sync()
+        self.items[0]['version'] = '2'
+        get = self.http_get
+        def broken_download(url, **kwargs):
+            if url.endswith('/files'):
+                return get(url, **kwargs)
+            raise RuntimeError('GET /files/public1?key=unit-test-api-key')
+        self.session.get.side_effect = broken_download
+        with self.assertLogs('api.services.google_drive_knowledge', level='WARNING') as logs:
+            self.assertEqual(self.sync()['failed'], 1)
+        source = KnowledgeDriveFile.objects.get()
+        self.assertEqual(source.status, 'error')
+        self.assertEqual(source.error, 'drive_request_failed')
+        self.assertNotIn('unit-test-api-key', str(logs.output) + source.error)
+        self.session.get.side_effect = None
+        self.session.get.return_value = MagicMock(status_code=403)
+        with self.assertRaisesMessage(DriveError, 'drive_http_403'):
+            self.sync()
+        self.assertTrue(KnowledgeDriveFile.objects.get().active)
+
+    def test_workspace_files_marked_unsupported_and_other_files_continue(self):
+        self.items.extend([
+            {'id': 'docs', 'name': 'Google Doc', 'mimeType': 'application/vnd.google-apps.document'},
+            {'id': 'sheets', 'name': 'Google Sheet', 'mimeType': 'application/vnd.google-apps.spreadsheet'}])
+        stats = self.sync()
+        self.assertEqual(stats['created'], 1)
+        self.assertEqual(stats['failed'], 2)
+        for source in KnowledgeDriveFile.objects.exclude(file_id='public1'):
+            self.assertEqual(source.status, 'unsupported')
+            self.assertEqual(source.error, 'workspace_export_requires_oauth')
+            self.assertIsNone(source.document_id)
+        self.assertTrue(retrieve('Primer'))
+        self.assertEqual(self.sync()['unchanged'], 3)

@@ -99,41 +99,75 @@ fine-tuning. Для неверного ответа публикация без 
 Отдельный API feedback не открыт. Опубликованные материалы и история содержат
 пользовательские вопросы: доступ к этим данным предоставляется осознанно.
 
-## Google Cloud и доступ к папке
+## Google Cloud: основной режим public folder + API key
 
-1. Создайте/выберите Google Cloud project, включите **Google Drive API**.
-2. IAM & Admin → Service Accounts → Create service account. Проектные роли
-   Owner/Editor и domain-wide delegation для чтения выделенной папки не нужны.
-3. Создайте JSON-ключ этого service account. Из JSON возьмите `client_email`
-   вида `autoterra-knowledge@PROJECT_ID.iam.gserviceaccount.com`.
-4. В Google Drive откройте папку:
+Service account JSON больше **не обязателен**. Основной production режим:
+публичная папка Google Drive + серверный API key.
+
+1. В Google Cloud project включите **Google Drive API**.
+2. APIs & Services → Credentials → Create credentials → **API key**.
+   Ограничьте ключ Google Drive API и, если сервер имеет стабильный исходящий
+   IP, IP-адресом backend. HTTP-referrer ограничения браузерных ключей для
+   серверного sync не подходят.
+3. В Google Drive откройте папку
    https://drive.google.com/drive/folders/1mUIX2or26vC23eSw_ej9ZRf_AkZfAkaI
-   и добавьте **именно этот email** через «Поделиться» с ролью **Читатель / Viewer**.
-   Убедитесь, что наследование доступа позволяет читать вложенные файлы.
-   Публичный доступ «всем по ссылке» не требуется.
-5. Перенесите ключ на backend сервер вне репозитория, например
-   `/etc/autoterra/google-drive-service-account.json`. Владелец — пользователь
-   backend, права 0600, родительский каталог с ограниченным доступом.
-   Не используйте Firebase service account автоматически.
+   и включите **Anyone with the link / Все, у кого есть ссылка**, роль
+   **Viewer / Читатель**. Проверьте, что вложенные папки и нужные файлы также
+   доступны по ссылке без входа в аккаунт.
+4. Запишите ключ только в защищённый серверный `.env` как GOOGLE_DRIVE_API_KEY.
+   Для этого режима очистите GOOGLE_DRIVE_CREDENTIALS_FILE и в `.env`, и в
+   окружении service/systemd, если он был задан раньше.
 
-Код запрашивает только scope `https://www.googleapis.com/auth/drive.readonly`.
-В Drive не выполняются создание, изменение, удаление файлов или изменение прав.
-Если политика Workspace запрещает внешний service account, администратор
-Workspace должен разрешить доступ к выделенной папке; не расширяйте права на
-весь домен в качестве обходного решения.
+API key идентифицирует Google Cloud project и квоту, но не предоставляет доступ
+к закрытым файлам. Код использует только официальный Drive API:
+`GET /drive/v3/files` с key, parents-query, supportsAllDrives,
+includeItemsFromAllDrives и прежними fields; рекурсивный обход и пагинация
+сохранены. Обычные файлы скачиваются через `GET /drive/v3/files/{id}?alt=media`
+с тем же API key. HTML scraping страниц drive.google.com не используется.
+
+Google Workspace Docs/Sheets не являются обычными DOCX/XLSX. Для `files.export`
+официальный контракт требует OAuth scopes. В public/API-key режиме они
+помечаются **unsupported / workspace_export_requires_oauth** без попытки
+scraping или прерывания остальных файлов. Для основного режима экспортируйте
+такие материалы вручную в DOCX/XLSX/PDF и положите в папку обычными файлами.
+Другие неподдерживаемые Workspace типы получают unsupported_format.
+
+### Необязательный service account
+
+Если GOOGLE_DRIVE_CREDENTIALS_FILE непустой, он имеет приоритет над API key.
+Сохранён прежний read-only OAuth режим: Google Docs экспортируются в DOCX,
+Google Sheets — в XLSX; доступны файлы, расшаренные с service account.
+
+Для этого варианта создайте service account в IAM & Admin, получите JSON-ключ,
+добавьте его `client_email` к папке как Viewer и разместите JSON вне репозитория,
+например `/etc/autoterra/google-drive-service-account.json` (права 0600,
+владелец — backend user). Проектные роли Owner/Editor и domain-wide delegation
+для выделенной папки не нужны. Firebase credentials автоматически не используются.
+OAuth scope остаётся `https://www.googleapis.com/auth/drive.readonly`.
+Невалидный заданный JSON даёт invalid_credentials_file, без скрытого переключения
+на API key. Если не заданы ни файл, ни API key — credentials_not_configured.
+
+В обоих режимах в Drive не выполняются создание/изменение/удаление файлов или
+изменение прав. Ключ не записывается в модели, источники, ответы API или ошибки.
+Transport exceptions и Google error bodies не выводятся; query-параметр key
+также редактируется в диагностических DEBUG/retry логах urllib3.
 
 Официальные справочники:
 - https://developers.google.com/workspace/guides/create-credentials
+- https://developers.google.com/workspace/drive/api/reference/rest/v3/files/list
 - https://developers.google.com/workspace/drive/api/guides/manage-downloads
-- https://developers.google.com/workspace/drive/api/guides/ref-export-formats
+- https://developers.google.com/workspace/drive/api/reference/rest/v3/files/export
 
 ## Environment
 
-В `.env.example` есть безопасные примеры. На сервере задайте:
+В `.env.example` есть безопасные примеры. На сервере задайте (замените `<secret>`
+реальным ключом, не коммитьте его):
 
 ```dotenv
 GOOGLE_DRIVE_KNOWLEDGE_FOLDER_ID=1mUIX2or26vC23eSw_ej9ZRf_AkZfAkaI
-GOOGLE_DRIVE_CREDENTIALS_FILE=/etc/autoterra/google-drive-service-account.json
+GOOGLE_DRIVE_API_KEY=<secret>
+# Optional; empty selects public/API-key mode.
+GOOGLE_DRIVE_CREDENTIALS_FILE=
 GOOGLE_DRIVE_REQUEST_TIMEOUT=30
 GOOGLE_DRIVE_DOWNLOAD_TIMEOUT=120
 GOOGLE_DRIVE_MAX_FILES=10000
@@ -154,7 +188,8 @@ Celery, Redis или pgvector нет.
 .venv/bin/python manage.py sync_google_drive_knowledge --retry-failed
 ```
 
-Обход рекурсивный с пагинацией, поддерживает обычные и shared-drive папки.
+Обход рекурсивный с пагинацией. Доступ определяется выбранным режимом: публичная
+папка для API key, обычные/shared-drive папки с доступом service account для OAuth.
 Shortcuts не разыменовываются и помечаются unsupported. Сначала собирается
 полный inventory; incompleteSearch, повтор page token, превышение лимита
 inventory или ошибка listing прерывают запуск без массового удаления.
@@ -176,7 +211,9 @@ last_synced_at — время последней попытки применит
 Документы из этой папки **автоматически участвуют в общей базе ответов после
 успешной обработки**. Держите в ней только материалы, разрешённые для ответов
 клиентам. Это не зеркало произвольного личного Drive. Индивидуальные Drive ACL
-не переносятся в доступ к тексту через AI. Исходные файлы не раздаются публично.
+не переносятся в доступ к тексту через AI. Локальные копии оригиналов не
+раздаются публично через API AutoTerra; сами Drive-файлы в public mode доступны
+всем, у кого есть ссылка, согласно настройке владельца папки.
 
 При потере доступа ко всей корневой папке listing завершится ошибкой и сохранит
 последнюю локальную базу. Для срочного отзыва всей базы остановите sync и через
@@ -214,8 +251,9 @@ systemd/cron заметил проблему. Для файловых ошибо
 - TXT: UTF-8, UTF-16 BOM, Windows-1251.
 - HTML: только текст HTMLParser; script/style/iframe/object/template/svg скрыты,
   JS не выполняется, внешние ресурсы не скачиваются. UTF-8/UTF-16/CP1251.
-- Google Docs экспортируются в DOCX, Google Sheets — в XLSX. Ограничения export
-  Drive API применяются отдельно от нашего лимита (обычный files.export: 10 MB).
+- Google Docs/Sheets: в API-key режиме unsupported / workspace_export_requires_oauth;
+  в optional service-account режиме экспорт DOCX/XLSX. Ограничения export Drive
+  API применяются отдельно от нашего лимита (обычный files.export: 10 MB).
 - MP4/audio → unsupported / transcription_required. TODO: отдельная проверенная
   транскрибация, платные/тяжёлые сервисы не подключены. Другие форматы unsupported.
 
@@ -267,10 +305,8 @@ cd /srv/autoterra-backend
 git switch adilhan_new
 git pull --ff-only origin adilhan_new
 .venv/bin/python -m pip install -r requirements.txt
-# Создайте service account и установите credentials/env по инструкции выше.
+# Включите Drive API, создайте API key и настройте публичную папку/env выше.
 sudo install -d -m 0700 -o autoterra -g autoterra /var/lib/autoterra/knowledge
-sudo chown autoterra:autoterra /etc/autoterra/google-drive-service-account.json
-sudo chmod 0600 /etc/autoterra/google-drive-service-account.json
 .venv/bin/python manage.py check
 .venv/bin/python manage.py migrate
 .venv/bin/python manage.py makemigrations --check --dry-run
@@ -287,8 +323,37 @@ sudo systemctl enable --now autoterra-drive-knowledge.timer
 systemctl list-timers autoterra-drive-knowledge.timer
 ```
 
-Production автоматически не менялся. Первый реальный sync возможен только после
-предоставления server credentials и доступа service account к папке.
+Production автоматически не менялся. Первый реальный sync требует server API key
+и публичного доступа к папке (либо optional JSON и доступа service account).
+
+### Обновление с commit 6d39918: переход на public mode
+
+Новых зависимостей или миграций для этого изменения нет. Миграция 0061 из
+первого релиза AI должна быть уже применена. Заполните GOOGLE_DRIVE_API_KEY,
+очистите GOOGLE_DRIVE_CREDENTIALS_FILE в `.env` и других Environment/EnvironmentFile.
+После этого (пути/user/unit адаптируйте к серверу):
+
+```bash
+cd /srv/autoterra-backend
+git switch adilhan_new
+git pull --ff-only origin adilhan_new
+.venv/bin/python manage.py check
+.venv/bin/python manage.py makemigrations --check --dry-run
+.venv/bin/python manage.py migrate --check
+sudo systemctl restart autoterra-backend
+# При active sync сначала дождитесь его завершения; этот шаг не запускает HTTP job.
+sudo systemctl start autoterra-drive-knowledge.service
+sudo systemctl enable --now autoterra-drive-knowledge.timer
+sudo journalctl -u autoterra-drive-knowledge.service -n 50 --no-pager
+```
+
+Для ручного sync вместо systemd service:
+`sudo -u autoterra .venv/bin/python manage.py sync_google_drive_knowledge`.
+После смены режима используйте `--retry-failed`, если нужно повторить ранее
+неудавшиеся неизменившиеся файлы. Unsupported Docs/Sheets в public mode требуют
+обычного экспортированного файла или optional OAuth, а не повторных попыток.
+API key и JSON никогда не передавайте аргументами командной строки.
+
 
 ## Проверки и troubleshooting
 
@@ -303,11 +368,18 @@ DEBUG=True DB_ENGINE=sqlite3 DB_NAME=:memory: HF_API_TOKEN='' \
 Все новые тесты Drive и LLM используют mocks, не реальные Google API/credentials.
 Отдельно покрыты история, источники, provider errors, permissions, feedback,
 публикация/отзыв, новый/изменённый/удалённый файл, идемпотентность, сломанный PDF,
-unsupported, HTML, XLSX, PDF page, экспорт и пагинация.
+unsupported, HTML, XLSX, PDF page, экспорт и пагинация. Дополнительно проверены
+public/API-key listing/download, рекурсия, приоритет credentials, отсутствие ключа,
+public sync lifecycle и отсутствие ключа в БД, ошибках и transport/app логах.
 
-- credentials_not_configured / invalid_credentials_file: путь, права и JSON ключ.
-- drive_http_403: Drive API включён, папка расшарена на client_email как Viewer,
-  download/export разрешены политикой Workspace.
+- credentials_not_configured: задайте GOOGLE_DRIVE_API_KEY либо optional credentials file.
+- invalid_credentials_file: путь/права/JSON optional service account; очистите этот
+  параметр для переключения на API key.
+- drive_http_400 / drive_http_403: API key корректен, Drive API включён, ограничения
+  ключа разрешают server IP/Drive API, квота доступна. Для public mode папка/файлы
+  доступны Anyone with the link / Viewer; для OAuth — service account Viewer.
+- workspace_export_requires_oauth: Docs/Sheets загрузите как обычные DOCX/XLSX/PDF
+  либо используйте optional service account. Остальные файлы продолжат sync.
 - drive_http_404: неверный ID или нет доступа. Полный listing не деактивирует базу
   при ошибке: проверьте настройки, затем повторите.
 - sync_already_running: другой процесс держит lock; не запускайте параллельно.

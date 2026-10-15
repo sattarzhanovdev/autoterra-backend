@@ -240,8 +240,9 @@ KNOWLEDGE_MAX_FILE_SIZE = 25 * 1024 * 1024
 KNOWLEDGE_PROCESS_TIMEOUT = 120
 KNOWLEDGE_MAX_EXTRACTED_CHARS = 5_000_000
 
-# Read-only server-to-server Drive integration. Never use Firebase credentials here.
+# Public folder + API key by default; optional service-account file takes priority.
 GOOGLE_DRIVE_KNOWLEDGE_FOLDER_ID = os.environ.get('GOOGLE_DRIVE_KNOWLEDGE_FOLDER_ID', '')
+GOOGLE_DRIVE_API_KEY = os.environ.get('GOOGLE_DRIVE_API_KEY', '')
 GOOGLE_DRIVE_CREDENTIALS_FILE = os.environ.get('GOOGLE_DRIVE_CREDENTIALS_FILE', '')
 GOOGLE_DRIVE_REQUEST_TIMEOUT = int(os.environ.get('GOOGLE_DRIVE_REQUEST_TIMEOUT', '30'))
 GOOGLE_DRIVE_DOWNLOAD_TIMEOUT = int(os.environ.get('GOOGLE_DRIVE_DOWNLOAD_TIMEOUT', '120'))
