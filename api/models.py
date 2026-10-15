@@ -1855,6 +1855,10 @@ class KnowledgeDocument(models.Model):
     error_code = models.CharField(max_length=32, blank=True)
     claimed_at = models.DateTimeField(null=True, blank=True)
     processing_token = models.CharField(max_length=32, blank=True)
+    active = models.BooleanField("Использовать в AI", default=True, db_index=True)
+    source_type = models.CharField(max_length=24, default="manual",
+        choices=[("manual", "Загрузка"), ("google_drive", "Google Drive")])
+    source_url = models.URLField(blank=True, max_length=500)
 
     class Meta:
         ordering = ("-created_at", "-id")
@@ -1866,7 +1870,121 @@ class KnowledgeChunk(models.Model):
     page = models.PositiveIntegerField(null=True, blank=True)
     section = models.CharField(max_length=255, blank=True)
     text = models.TextField()
+    sheet = models.CharField(max_length=128, blank=True)
+    row_start = models.PositiveIntegerField(null=True, blank=True)
+    row_end = models.PositiveIntegerField(null=True, blank=True)
 
     class Meta:
         ordering = ("ordinal",)
         constraints = [models.UniqueConstraint(fields=("document", "ordinal"), name="unique_document_chunk")]
+
+
+class AIConversation(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="ai_conversations", verbose_name="Пользователь")
+    client = models.ForeignKey(ClientProfile, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Клиент")
+    created_at = models.DateTimeField("Создан", auto_now_add=True)
+    updated_at = models.DateTimeField("Последняя активность", auto_now=True)
+
+    class Meta:
+        verbose_name = "Диалог с ИИ"
+        verbose_name_plural = "История ИИ"
+        ordering = ("-updated_at", "-pk")
+        indexes = [models.Index(fields=("user", "-updated_at"), name="ai_conversation_user_date")]
+
+    def __str__(self):
+        return f"Диалог {self.pk} · {self.user}"
+
+
+class AIMessage(models.Model):
+    conversation = models.ForeignKey(AIConversation, on_delete=models.CASCADE, related_name="messages", verbose_name="Диалог")
+    role = models.CharField("Автор", max_length=16, choices=[("user", "Пользователь"), ("assistant", "ИИ")])
+    content = models.TextField("Оригинальный текст", blank=True)
+    in_reply_to = models.OneToOneField("self", null=True, blank=True, on_delete=models.CASCADE, related_name="response")
+    created_at = models.DateTimeField("Дата", auto_now_add=True)
+    provider = models.CharField(max_length=64, blank=True)
+    model = models.CharField(max_length=128, blank=True)
+    latency_ms = models.PositiveIntegerField("Время ответа, мс", null=True, blank=True)
+    status = models.CharField("Статус", max_length=32, default="completed", choices=[
+        ("pending", "Ожидается ответ"), ("completed", "Ответ модели"), ("excerpts", "Выдержки без модели"),
+        ("no_context", "Недостаточно знаний"), ("provider_error", "Ошибка модели"),
+        ("error", "Ошибка обработки"), ("invalid", "Некорректный вопрос")])
+    error = models.CharField("Код ошибки", max_length=64, blank=True)
+    sources = models.JSONField("Источники и использованные выдержки", default=list, blank=True)
+    insufficient = models.BooleanField(default=False)
+
+    class Meta:
+        verbose_name = "Сообщение ИИ"
+        verbose_name_plural = "Сообщения ИИ"
+        ordering = ("pk",)
+        indexes = [models.Index(fields=("conversation", "id"), name="ai_message_conversation_id")]
+        constraints = [models.CheckConstraint(condition=models.Q(role__in=["user", "assistant"]), name="ai_message_valid_role")]
+
+    def __str__(self):
+        return f"{self.get_role_display()} #{self.pk}: {self.content[:60]}"
+
+
+class AIMessageFeedback(models.Model):
+    message = models.OneToOneField(AIMessage, on_delete=models.CASCADE, related_name="feedback", verbose_name="Ответ ИИ",
+        limit_choices_to={"role": "assistant"})
+    verdict = models.CharField("Оценка", max_length=16, default="unreviewed", choices=[
+        ("unreviewed", "Не проверено"), ("correct", "Ответ правильный"), ("incorrect", "Ответ неправильный")])
+    corrected_answer = models.TextField("Правильный ответ", blank=True)
+    comment = models.TextField("Комментарий", blank=True)
+    reviewed_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, verbose_name="Проверил")
+    reviewed_at = models.DateTimeField("Проверено", null=True, blank=True)
+    approved_for_knowledge = models.BooleanField("Одобрить для базы знаний", default=False)
+    knowledge_card = models.OneToOneField(KnowledgeCard, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="ai_feedback", verbose_name="Опубликованная карточка")
+
+    class Meta:
+        verbose_name = "Проверка ответа ИИ"
+        verbose_name_plural = "Проверки ответов ИИ"
+
+    def clean(self):
+        try:
+            message = self.message if self.message_id else None
+        except AIMessage.DoesNotExist:
+            message = None
+        if message is None:
+            raise ValidationError({"message": "Выберите существующий ответ ИИ."})
+        if message.role != "assistant":
+            raise ValidationError({"message": "Можно проверять только ответы ИИ."})
+        if self.approved_for_knowledge:
+            if self.verdict == "unreviewed":
+                raise ValidationError({"approved_for_knowledge": "Сначала проверьте ответ."})
+            if self.verdict == "incorrect" and not self.corrected_answer.strip():
+                raise ValidationError({"corrected_answer": "Укажите правильный ответ перед публикацией."})
+            if not message.in_reply_to_id or not message.in_reply_to.content.strip():
+                raise ValidationError("Для публикации нужен исходный вопрос.")
+            if not (self.corrected_answer.strip() or message.content.strip()):
+                raise ValidationError({"corrected_answer": "Нельзя публиковать пустой ответ."})
+
+
+class KnowledgeDriveFile(models.Model):
+    file_id = models.CharField("Google Drive ID", max_length=200, unique=True)
+    folder_id = models.CharField("Корневая папка", max_length=200)
+    filename = models.CharField("Файл", max_length=255)
+    mime_type = models.CharField("MIME", max_length=255)
+    modified_time = models.DateTimeField("Изменён в Drive", null=True, blank=True)
+    version = models.CharField("Версия", max_length=128, blank=True)
+    checksum = models.CharField("Checksum Drive", max_length=128, blank=True)
+    fingerprint = models.CharField(max_length=64, blank=True)
+    drive_url = models.URLField("Оригинал", max_length=500)
+    last_synced_at = models.DateTimeField("Последняя синхронизация", null=True, blank=True)
+    status = models.CharField("Статус", max_length=24, default="pending", choices=[
+        ("pending", "Обрабатывается"), ("ready", "Готов"), ("error", "Ошибка"),
+        ("unsupported", "Формат не поддерживается"), ("inactive", "Удалён / недоступен")])
+    error = models.CharField("Ошибка", max_length=255, blank=True)
+    active = models.BooleanField("Активен", default=True, db_index=True)
+    document = models.OneToOneField(KnowledgeDocument, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="drive_file", verbose_name="Локальный документ")
+    pending_document = models.OneToOneField(KnowledgeDocument, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="pending_drive_file", verbose_name="Подготавливаемая версия")
+
+    class Meta:
+        verbose_name = "Документ Google Drive"
+        verbose_name_plural = "База знаний Google Drive"
+        ordering = ("filename",)
+
+    def __str__(self):
+        return self.filename

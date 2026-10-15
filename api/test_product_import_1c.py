@@ -293,7 +293,7 @@ class OneCUploadEndpointTests(TestCase):
     def test_repeat_import_updates_same_distributor_code_and_catalog_images(self):
         existing = Product.objects.create(distributor=self.distributor, sku='00023078', name='Старое название',
             category='Старый раздел', brand='Бренд', price=1, quantity=99)
-        other = Distributor.objects.create(name='Другой', inn='other-import-1c')
+        other = Distributor.objects.create(name='Другой', inn='901234567891')
         foreign = Product.objects.create(distributor=other, sku='00023078', name='Чужой товар',
             category='Категория', price=10, quantity=11)
         for _ in range(2):
@@ -492,7 +492,7 @@ class ExpandedOneCCategoryTests(TestCase):
 
     def test_expanded_groups_repeat_import_without_duplicates(self):
         from .services.product_import import upsert_products
-        distributor = Distributor.objects.create(name='Category audit', inn='category-audit')
+        distributor = Distributor.objects.create(name='Category audit', inn='901234567892')
         rows = [item(name='Шпатель фасадный', code='TOOL'),
                 item(name='Предфильтр для полумаски', code='SUPPLY'),
                 item(name='SRA для переходов', code='SOLVENT')]
@@ -523,7 +523,7 @@ class RealOneCWorkbookTests(TestCase):
         self.assertFalse(any('не удалось определить категорию' in error for error in errors))
         self.assertTrue(all(product['category'] in CANONICAL_PRODUCT_CATEGORIES for product in products))
         self.assertEqual(len({product['sku'] for product in products}), 3968)
-        distributor = Distributor.objects.create(name='Private real workbook test', inn='real-price-audit')
+        distributor = Distributor.objects.create(name='Private real workbook test', inn='901234567893')
         self.assertEqual(upsert_products(distributor, products), (3968, 0))
         self.assertEqual(upsert_products(distributor, products), (0, 3968))
         self.assertEqual(Product.objects.filter(distributor=distributor).count(), 3968)

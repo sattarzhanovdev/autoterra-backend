@@ -236,6 +236,9 @@ SCHEMAS = {
         "properties": {
             "answer": {"type": "string"},
             "sourceId": {"type": "string", "nullable": True},
+            "conversationId": {"type": "string"},
+            "messageId": {"type": "string"},
+            "sources": {"type": "array", "items": {"type": "object"}},
             "suggestEscalation": {"type": "boolean"},
         }
     },
@@ -312,7 +315,7 @@ PATHS = {
     "/ai/chat/": {
         "post": _secured({
             "tags": ["Support"],
-            "requestBody": _body({"type": "object", "properties": {"message": {"type": "string"}}}, "Вопрос к AI"),
+            "requestBody": _body({"type": "object", "properties": {"message": {"type": "string"}, "conversationId": {"type": "string"}}}, "Вопрос к AI"),
             "responses": {"200": _ok(_ref("AiChatResponse"))},
         })
     },

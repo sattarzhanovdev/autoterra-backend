@@ -27,6 +27,20 @@ def claim_document():
     return None
 
 
+def run_parser(document_id, token):
+    """Shared bounded parser entrypoint for uploads and Drive sync."""
+    try:
+        result = subprocess.run([sys.executable, str(Path(settings.BASE_DIR) / 'manage.py'),
+            'process_knowledge_documents', '--process', str(document_id), '--token', token],
+            timeout=settings.KNOWLEDGE_PROCESS_TIMEOUT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        failed = result.returncode != 0
+    except subprocess.TimeoutExpired:
+        failed = True
+    if failed:
+        KnowledgeDocument.objects.filter(pk=document_id, status='processing', processing_token=token).update(
+            status='failed', error_code='processing_limit', error='Превышены ограничения обработки. Проверьте файл и повторите попытку.')
+
+
 class Command(BaseCommand):
     help = 'Process private knowledge documents; run continuously as a service.'
 
@@ -48,16 +62,7 @@ class Command(BaseCommand):
             job = claim_document()
             if job:
                 document_id, token = job
-                try:
-                    result = subprocess.run([sys.executable, str(Path(settings.BASE_DIR) / 'manage.py'),
-                        'process_knowledge_documents', '--process', str(document_id), '--token', token],
-                        timeout=settings.KNOWLEDGE_PROCESS_TIMEOUT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    failed = result.returncode != 0
-                except subprocess.TimeoutExpired:
-                    failed = True
-                if failed:
-                    KnowledgeDocument.objects.filter(pk=document_id, status='processing', processing_token=token).update(
-                        status='failed', error_code='processing_limit', error='Превышены ограничения обработки. Проверьте файл и повторите попытку.')
+                run_parser(document_id, token)
                 self.stdout.write(f'Processed document {document_id}')
             elif options['once']:
                 break

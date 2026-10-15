@@ -1399,3 +1399,6 @@ class RankDiscountAdmin(admin.ModelAdmin):
 
 admin.site.register(ManagerTask)
 admin.site.register(ContactHistory)
+
+# Keep AI audit/review screens separate from the existing business admin classes.
+from . import ai_admin  # noqa: E402,F401

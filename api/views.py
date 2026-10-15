@@ -5667,27 +5667,20 @@ def ai_chat(request):
     is_expert_user = _resolve_role(user) in ["admin", "manager", "ai_expert"]
     
     payload = _json(request)
-    message = payload.get("message", "")
-    if not isinstance(message, str):
-        return JsonResponse({"detail": "message должен быть строкой."}, status=400)
-    question = message.strip()
-    
-    query_words = _normalize_words(question)
-    if not query_words:
-        return JsonResponse({"answer": "Пожалуйста, введите ваш вопрос.", "suggestEscalation": False, "sources": []})
-
-    from .services.knowledge_retrieval import retrieve, grounded_answer
-    if len(question) > 4000:
-        return JsonResponse({"detail": "Вопрос слишком длинный (максимум 4000 символов)."}, status=400)
-    contexts = retrieve(question)
-    answer, insufficient = grounded_answer(question, contexts)
-    sources = [item['source'] for item in contexts]
-    result = {"answer": answer, "sources": sources,
-              "suggestEscalation": insufficient and not is_expert_user}
-    first_card = next((source for source in sources if source['type'] == 'card'), None)
-    if first_card:
-        result['sourceId'] = first_card['id']
-    return JsonResponse(result)
+    from .models import AIConversation
+    from .services.ai_history import record_exchange
+    conversation = None
+    if payload.get("conversationId") is not None:
+        try:
+            conversation_id = int(str(payload["conversationId"]))
+            if 0 < conversation_id <= 9223372036854775807:
+                conversation = AIConversation.objects.filter(pk=conversation_id, user=user).first()
+        except (TypeError, ValueError, OverflowError):
+            conversation = None
+        if conversation is None:
+            return JsonResponse({"detail": "Диалог не найден"}, status=404)
+    result, status = record_exchange(user, conversation, payload.get("message", ""), expert=is_expert_user)
+    return JsonResponse(result, status=status)
 
 
 @csrf_exempt

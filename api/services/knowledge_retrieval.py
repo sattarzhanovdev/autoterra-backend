@@ -1,4 +1,5 @@
 """Retrieval interface: PostgreSQL FTS today; can be replaced by pgvector later."""
+from dataclasses import dataclass
 import json
 import re
 import ssl
@@ -39,11 +40,14 @@ def retrieve(question, limit=6, budget=8500):
     if not words:
         return []
     ranked = []
-    for chunk in candidates(KnowledgeChunk.objects.filter(document__status='ready').select_related('document'), ['text'], words):
+    for chunk in candidates(KnowledgeChunk.objects.filter(document__status='ready', document__active=True).select_related('document'), ['text'], words):
         score = float(getattr(chunk, 'rank', 0)) or sum(w in chunk.text.lower() for w in words) / len(words)
         ranked.append((score, chunk.text, {'type': 'document', 'id': str(chunk.document_id),
             'chunkId': str(chunk.pk), 'title': chunk.document.title, 'filename': chunk.document.original_name,
-            'page': chunk.page, 'section': chunk.section}))
+            'page': chunk.page, 'section': chunk.section, 'sheet': chunk.sheet,
+            'rowStart': chunk.row_start, 'rowEnd': chunk.row_end,
+            'url': chunk.document.source_url or f'/api/knowledge-documents/{chunk.document_id}/download/',
+            'sourceType': chunk.document.source_type}))
     for card in candidates(KnowledgeCard.objects.filter(status='approved'), ['title', 'problem', 'causes', 'solution', 'restrictions'], words):
         text = f'{card.title}\nПроблема: {card.problem}\nПричины: {card.causes}\nРешение: {card.solution}\nОграничения: {card.restrictions}'
         for index, fragment in enumerate(split_text(text)):
@@ -58,24 +62,38 @@ def retrieve(question, limit=6, budget=8500):
             if coverage:
                 score = coverage
                 ranked.append((score, fragment, {'type': 'card', 'id': str(card.pk), 'title': card.title or card.problem,
-                    'page': None, 'section': '', 'fragment': index}))
+                    'page': None, 'section': '', 'fragment': index,
+                    'url': f'/admin/api/knowledgecard/{card.pk}/change/'}))
     ranked.sort(key=lambda item: item[0], reverse=True)
     results = []
     for score, text, source in ranked:
         if len(results) >= limit or budget <= 0:
             break
         text = text[:budget]
-        results.append({'text': text, 'source': source})
+        results.append({'text': text, 'source': dict(source, score=round(score, 6))})
         budget -= len(text)
     return results
+
+
+@dataclass
+class AnswerResult:
+    answer: str
+    insufficient: bool
+    status: str = 'completed'
+    error: str = ''
+    attempted: bool = False
+
+    def __iter__(self):
+        # Keep existing two-value unpacking compatible.
+        return iter((self.answer, self.insufficient))
 
 
 def grounded_answer(question, contexts):
     """No context means no LLM call. Provider failure yields actual excerpts."""
     if not contexts:
-        return 'Недостаточно данных в базе знаний для точного ответа. Рекомендуем обратиться к эксперту.', True
+        return AnswerResult('Недостаточно данных в базе знаний для точного ответа. Рекомендуем обратиться к эксперту.', True, 'no_context')
     if not settings.HF_API_TOKEN:
-        return 'Найденные материалы базы знаний:\n\n' + '\n\n'.join(f'[{i}] {c["text"]}' for i, c in enumerate(contexts, 1)), False
+        return AnswerResult('Найденные материалы базы знаний:\n\n' + '\n\n'.join(f'[{i}] {c["text"]}' for i, c in enumerate(contexts, 1)), False, 'excerpts')
     context = '\n\n'.join(f'[{i}] {json.dumps(c, ensure_ascii=False)}' for i, c in enumerate(contexts, 1))
     body = {
         'model': settings.HF_CHAT_MODEL,
@@ -102,7 +120,7 @@ def grounded_answer(question, contexts):
         answer = json.loads(result['choices'][0]['message']['content'])
         if not isinstance(answer.get('answer'), str) or not isinstance(answer.get('insufficient'), bool):
             raise ValueError('Invalid provider response')
-        return answer['answer'], answer['insufficient']
+        return AnswerResult(answer['answer'], answer['insufficient'], attempted=True)
     except Exception:
-        return 'ИИ временно недоступен. Найденные выдержки из базы знаний:\n\n' + '\n\n'.join(
-            f'[{i}] {c["text"]}' for i, c in enumerate(contexts, 1)), False
+        return AnswerResult('ИИ временно недоступен. Найденные выдержки из базы знаний:\n\n' + '\n\n'.join(
+            f'[{i}] {c["text"]}' for i, c in enumerate(contexts, 1)), False, 'provider_error', 'provider_failed', True)

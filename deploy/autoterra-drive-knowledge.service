@@ -1,0 +1,18 @@
+# Adapt paths/user to the production installation before enabling.
+[Unit]
+Description=AutoTerra read-only Google Drive knowledge sync
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=autoterra
+Group=autoterra
+WorkingDirectory=/srv/autoterra-backend
+EnvironmentFile=/srv/autoterra-backend/.env
+ExecStart=/srv/autoterra-backend/.venv/bin/python manage.py sync_google_drive_knowledge
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryMax=1500M
+TimeoutStartSec=2h

@@ -8,6 +8,7 @@ class ApiConfig(AppConfig):
 
     def ready(self) -> None:
         import api.services.knowledge_documents  # noqa: F401 — private file cleanup
+        import api.services.ai_history  # noqa: F401 — feedback publication cleanup
         import api.signals  # noqa: F401 — registers all signal handlers
         from django.db import connection
         if connection.vendor == "sqlite":

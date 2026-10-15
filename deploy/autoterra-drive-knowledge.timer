@@ -1,0 +1,10 @@
+[Unit]
+Description=Sync AutoTerra Google Drive knowledge every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=15min
+Unit=autoterra-drive-knowledge.service
+
+[Install]
+WantedBy=timers.target

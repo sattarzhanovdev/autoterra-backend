@@ -207,7 +207,7 @@ class OrderAdminTests(_Base):
         self.assertEqual(history.created_by, self.staff)
 
     def test_distributor_change_requires_new_order_and_compatible_products_client(self):
-        other = Distributor.objects.create(name='Другой', inn='different-dist')
+        other = Distributor.objects.create(name='Другой', inn='901234567890')
         client = self._client('other-client', '1234567890')
         client.distributor = other
         client.save()
@@ -227,7 +227,7 @@ class OrderAdminTests(_Base):
 
     def test_client_from_other_distributor_rejected(self):
         other = self._client('other-client', '1234567890')
-        other.distributor = Distributor.objects.create(name='Чужой', inn='different-dist')
+        other.distributor = Distributor.objects.create(name='Чужой', inn='901234567890')
         other.save()
         with self.assertRaises(orders.OrderError):
             orders.update_metadata(self.order.pk, {'client': other}, actor=self.staff)

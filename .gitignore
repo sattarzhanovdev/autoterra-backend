@@ -26,3 +26,8 @@ htmlcov/
 
 firebase-service-account.json
 private_knowledge/
+
+# Server-only Google credentials; never store keys in this repository.
+google-drive-service-account.json
+*-service-account.json
+credentials*.json
