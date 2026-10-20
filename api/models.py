@@ -1988,3 +1988,13 @@ class KnowledgeDriveFile(models.Model):
 
     def __str__(self):
         return self.filename
+
+
+class RegistrationEmailDelivery(models.Model):
+    """Durable registration email outbox; SMTP failures remain retryable."""
+    client = models.OneToOneField(ClientProfile, on_delete=models.CASCADE, related_name="registration_email")
+    created_at = models.DateTimeField(auto_now_add=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+    attempts = models.PositiveIntegerField(default=0)
+    locked_until = models.DateTimeField(null=True, blank=True)
+    last_error = models.CharField(max_length=255, blank=True)

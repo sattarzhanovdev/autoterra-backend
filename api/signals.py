@@ -271,6 +271,9 @@ def _client_post_save(sender, instance, created, **kwargs):
     if kwargs.get("raw"):
         return
     old = getattr(instance, '_pre_client_status', None)
+    if created or old != instance.status:
+        from .services.client_profiles import synchronize_client_access
+        synchronize_client_access(instance)
     if created or old is None or old == instance.status:
         return
     from django.db import transaction

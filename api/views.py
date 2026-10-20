@@ -310,8 +310,8 @@ def _link_referral(client, code):
     return referral
 
 
-def _send_registration_email(client):
-    """Письмо о новой регистрации. Не бросает исключений.
+def _deliver_registration_email(client):
+    """Render and send a registration email; the outbox handles failures.
 
     Вызывается ПОСЛЕ коммита транзакции: SMTP держит соединение до
     EMAIL_TIMEOUT секунд, и письмо о клиенте, чья транзакция откатилась,
@@ -408,9 +408,15 @@ def _send_registration_email(client):
             to=recipients,
         )
         msg.attach_alternative(html_body, "text/html")
-        msg.send(fail_silently=False)
+        return msg.send(fail_silently=False)
     except Exception:
         logger.exception("Failed to send registration email for client %s", getattr(client, "id", None))
+        raise
+
+
+def _send_registration_email(client):
+    from .services.registration_emails import send_registration_email
+    return send_registration_email(client)
 
 
 def _send_order_status_email(order, old_status, new_status, recipients=None):
@@ -1402,6 +1408,9 @@ def register(request):
                 distributor=region.distributor,
                 manager=region.manager
             )
+
+            from .models import RegistrationEmailDelivery
+            RegistrationEmailDelivery.objects.create(client=client)
 
             # Создаем основной магазин/точку для клиента
             Store.objects.create(
@@ -5450,6 +5459,29 @@ def manager_client_remove(request, client_id):
 
 
 @csrf_exempt
+@require_POST
+@transaction.atomic
+def manager_client_approve(request, client_id):
+    # Approval is separate from financial settings and limited to regional scope.
+    client, _, error = _client_settings_scope(request, client_id)
+    if error:
+        return error
+    client = ClientProfile.objects.select_for_update(of=("self",)).select_related(
+        "user", "region", "distributor"
+    ).get(pk=client.pk)
+    _, _, error = _client_settings_scope(request, client_id)
+    if error:
+        return error
+    if client.status not in ("new", "under_review", "active"):
+        return JsonResponse({"detail": "Подтверждать можно только новую регистрацию"}, status=409)
+    distributor = client.distributor or (client.region.distributor if client.region_id else None)
+    if distributor is None or not distributor.is_active:
+        return JsonResponse({"detail": "Назначьте активного дистрибьютора перед подтверждением"}, status=409)
+    _apply_client_status(request, client, "active")
+    return JsonResponse({"client": _format_manager_client(client)})
+
+
+@csrf_exempt
 @require_http_methods(['POST', 'PUT', 'PATCH'])
 @transaction.atomic
 def manager_client_status(request, client_id):
@@ -5873,7 +5905,7 @@ def _client_settings_scope(request, client_id, *, write=False):
 def _apply_client_status(request, client, status):
     old = client.status
     client.status = status
-    if status == "active" and not client.distributor_id and client.region.distributor_id:
+    if status == "active" and not client.distributor_id and client.region_id and client.region.distributor_id:
         client.distributor = client.region.distributor
     client.save(update_fields=["status", "distributor"])
     from .services.client_profiles import synchronize_client_access
@@ -5910,6 +5942,7 @@ def client_settings(request, client_id):
             _apply_client_status(request, client, payload["status"])
     return JsonResponse({
         "client": _format_client(client), "canEdit": can_edit,
+        "canApprove": client.status in ("new", "under_review"),
         "statuses": [{"value": v, "label": label} for v, label in ClientProfile.STATUS_CHOICES],
         "categories": [{"value": v, "label": label} for v, label in ClientProfile.CATEGORY_CHOICES],
     })

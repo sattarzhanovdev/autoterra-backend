@@ -57,6 +57,7 @@ urlpatterns = [
     path("manager/clients/<int:client_id>/purchases/", views.manager_client_purchases),
     path("manager/clients/<int:client_id>/remove/", views.manager_client_remove),
     path("manager/clients/<int:client_id>/status/", views.manager_client_status),
+    path("manager/clients/<int:client_id>/approve/", views.manager_client_approve),
     path("manager/clients/<int:client_id>/history/", views.manager_client_history),
     path("manager/tasks/", views.manager_tasks),
     path("manager/tasks/<int:task_id>/", views.manager_update_task),

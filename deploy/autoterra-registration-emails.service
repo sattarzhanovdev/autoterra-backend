@@ -1,0 +1,11 @@
+# Replace /srv/autoterra-backend and autoterra with your installation path/user.
+[Unit]
+Description=AutoTerra retry registration emails
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=autoterra
+WorkingDirectory=/srv/autoterra-backend
+EnvironmentFile=/srv/autoterra-backend/.env
+ExecStart=/srv/autoterra-backend/.venv/bin/python manage.py retry_registration_emails
