@@ -3,12 +3,13 @@ import json
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth.models import User
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 
 from .models import (AIMessage, AuthToken, ClientProfile, ClientPriceOverride,
     Distributor, KnowledgeCard, KnowledgeChunk, KnowledgeDocument, Product, Region)
 from .services.ai_query import detect_intent, normalize_product_identifiers, plan_query
 from .services.ai_consultant import retrieve_consultation
+from .services.ai_answer_policy import _ratio_supported_by_technical, response_is_grounded
 from .services.knowledge_retrieval import grounded_answer, retrieve
 from .services.product_retrieval import catalog_access, retrieve_products, select_products
 
@@ -390,3 +391,68 @@ class AssortmentFamilyTests(TestCase):
         for product in products:
             product.category = 'Лаки'
         self.assertEqual(select_products(products, plan), products)
+
+
+class GroundedValidatorTests(SimpleTestCase):
+    table = """
+    Соотношение компонентов в смеси
+    Лак Отвердитель Разбавитель
+    Объёмная доля 2 1 5% -10%
+    """
+
+    def test_generic_sku_label_is_not_product_identifier(self):
+        self.assertEqual(normalize_product_identifiers('EU-100 (SKU 00-00013495)'), ('eu100',))
+
+    def test_generic_labels_are_case_insensitive_and_preserve_real_codes(self):
+        for label in ('SKU', 'sku', 'ART', 'art', 'АРТ', 'арт'):
+            with self.subTest(label=label):
+                self.assertEqual(normalize_product_identifiers(f'EU-100 ({label} 00-00013495), EU120'),
+                    ('eu100', 'eu120'))
+
+    def test_table_ratio_supports_colon_form(self):
+        self.assertTrue(_ratio_supported_by_technical('2:1', self.table))
+
+    def test_table_ratio_rejects_unsupported_ratio(self):
+        technical = 'Соотношение компонентов в смеси\nОбъёмная доля 2 1'
+        self.assertFalse(_ratio_supported_by_technical('4:1', technical))
+
+    def test_literal_ratios_still_supported(self):
+        for ratio in ('2:1', '4:1:1', '2/1'):
+            with self.subTest(ratio=ratio):
+                self.assertTrue(_ratio_supported_by_technical(ratio, f'Соотношение {ratio}'))
+                self.assertTrue(_ratio_supported_by_technical(ratio, f'Соотношение {ratio}. Сушка по TDS.'))
+
+    def test_english_table_decimal_and_three_component_ratios(self):
+        cases = [('2:1', 'Volume ratio 2 1'), ('2:1', 'Volume parts 2 1'),
+                 ('2:1:0.5', 'Объемная доля 2 1 0,5'), ('2:1:0,5', 'Volume parts 2 1 0.5')]
+        for ratio, technical in cases:
+            with self.subTest(ratio=ratio, technical=technical):
+                self.assertTrue(_ratio_supported_by_technical(ratio, technical))
+
+    def test_arbitrary_numbers_do_not_support_a_ratio(self):
+        self.assertFalse(_ratio_supported_by_technical('2:1', 'Температура 2 градуса, один слой: 1'))
+
+    def test_ratio_numbers_cannot_match_parts_of_larger_values(self):
+        for technical in ('Соотношение 12:10', 'Объёмная доля 2 10',
+                          'Объёмная доля 12 1', 'Объёмная доля 2 1.5'):
+            with self.subTest(technical=technical):
+                self.assertFalse(_ratio_supported_by_technical('2:1', technical))
+
+    def test_grounded_answer_accepts_sku_label_and_cited_table_ratio(self):
+        contexts = [{'text': 'EU-100\n' + self.table,
+                     'source': {'type': 'document', 'title': 'EU-100 TDS'}}]
+        self.assertTrue(response_is_grounded('EU-100 (SKU 00-00013495): смешивание 2:1 [1].',
+            contexts, 'Как смешивать EU-100?'))
+        self.assertFalse(response_is_grounded('EU-100: смешивание 4:1 [1].',
+            contexts, 'Как смешивать EU-100?'))
+        self.assertFalse(response_is_grounded('EU-999: смешивание 2:1 [1].',
+            contexts, 'Как смешивать EU-100?'))
+
+    def test_table_must_be_in_cited_technical_evidence(self):
+        contexts = [{'text': 'EU-100 — лак.', 'source': {'type': 'document', 'title': 'EU-100'}},
+                    {'text': self.table, 'source': {'type': 'document', 'title': 'EU-100 TDS'}}]
+        self.assertFalse(response_is_grounded('EU-100: смешивание 2:1 [1].',
+            contexts, 'Как смешивать EU-100?'))
+        contexts[1]['source']['type'] = 'product'
+        self.assertFalse(response_is_grounded('EU-100: смешивание 2:1 [2].',
+            contexts, 'Как смешивать EU-100?'))

@@ -40,9 +40,18 @@ WORKFLOW_STAGES = (
 CODE_RE = re.compile(r'(?<![^\W_])([a-zаеорстухвкмн]{1,5})[\s\-–_]*(\d{2,6})([a-z]?)(?![^\W_])', re.I)
 
 
+GENERIC_IDENTIFIER_LABELS = {'sku', 'art', 'арт'}
+
+
 def normalize_product_identifiers(value):
-    """EU620 / EU-620 / eu 620 share identity; bare numbers are not SKUs."""
-    return tuple(dict.fromkeys(compact_search_text(''.join(m.groups())) for m in CODE_RE.finditer(str(value or ''))))
+    """EU620 / EU-620 / eu 620 share identity; generic labels are not SKUs."""
+    result = []
+    for match in CODE_RE.finditer(str(value or '')):
+        prefix, number, suffix = match.groups()
+        if prefix.casefold() in GENERIC_IDENTIFIER_LABELS:
+            continue
+        result.append(compact_search_text(''.join((prefix, number, suffix))))
+    return tuple(dict.fromkeys(result))
 
 
 def words(value):

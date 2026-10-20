@@ -52,6 +52,29 @@ SYSTEM_PROMPT = '''Ты — опытный технолог по авторем�
 нет подтверждения, требуется уточнение или эксперт; это не повод скрыть уже найденные полезные сведения.'''
 
 
+def _ratio_supported_by_technical(ratio, technical):
+    canonical = re.sub(r'\s+', '', ratio).replace(',', '.')
+    normalized_technical = re.sub(r'\s+', '', technical).replace(',', '.')
+    # Match whole numbers: 2:1 must not match a literal 12:10.
+    if re.search(r'(?<![\d.])' + re.escape(canonical) + r'(?!\d|\.\d)', normalized_technical):
+        return True
+    numbers = re.findall(r'\d+(?:\.\d+)?', canonical)
+    if len(numbers) not in (2, 3):
+        return False
+    # PDF tables may flatten "Объёмная доля 2 1" instead of "2:1".
+    # Keep decimal/number boundaries so 2 10 cannot support 2:1 either.
+    joined = r'\D{1,10}'.join(
+        r'(?<![\d.])' + re.escape(number) + r'(?!\d|\.\d)'
+        for number in numbers
+    )
+    table_pattern = (
+        r'(?:объ[её]мн\w*\s+дол\w*|volume\s+(?:ratio|parts?))'
+        r'.{0,80}?'
+        + joined
+    )
+    return bool(re.search(table_pattern, technical.replace(',', '.'), re.I | re.S))
+
+
 def response_is_grounded(answer, contexts, question):
     """Reject checkable fabrications; semantic claims still depend on evidence.
 
@@ -96,8 +119,7 @@ def response_is_grounded(answer, contexts, question):
     if numeric_facts(answer) - numeric_facts(technical):
         return False
     for ratio in re.findall(r'(?<![\w-])\d+(?:[.,]\d+)?\s*[:/]\s*\d+(?:[.,]\d+)?(?:\s*[:/]\s*\d+(?:[.,]\d+)?)?\b', answer):
-        canonical = re.sub(r'\s+', '', ratio).replace(',', '.')
-        if canonical not in re.sub(r'\s+', '', technical).replace(',', '.'):
+        if not _ratio_supported_by_technical(ratio, technical):
             return False
     catalog = []
     for item in cited:
