@@ -3,7 +3,7 @@ import re
 import json
 from decimal import Decimal, InvalidOperation
 
-from .ai_query import normalize_product_identifiers, plan_query
+from .ai_query import normalize_product_identifiers, plan_query, UNICODE_DASH_TRANSLATION
 
 SYSTEM_PROMPT = '''Ты — опытный технолог по авторемонту и технический консультант по ассортименту AutoTerra.
 Отвечай профессионально, понятно и по-русски только по предоставленным материалам.
@@ -118,7 +118,8 @@ def response_is_grounded(answer, contexts, question):
         return facts
     if numeric_facts(answer) - numeric_facts(technical):
         return False
-    for ratio in re.findall(r'(?<![\w-])\d+(?:[.,]\d+)?\s*[:/]\s*\d+(?:[.,]\d+)?(?:\s*[:/]\s*\d+(?:[.,]\d+)?)?\b', answer):
+    ratio_scan_text = answer.translate(UNICODE_DASH_TRANSLATION)
+    for ratio in re.findall(r'(?<![\w-])\d+(?:[.,]\d+)?\s*[:/]\s*\d+(?:[.,]\d+)?(?:\s*[:/]\s*\d+(?:[.,]\d+)?)?\b', ratio_scan_text):
         if not _ratio_supported_by_technical(ratio, technical):
             return False
     catalog = []

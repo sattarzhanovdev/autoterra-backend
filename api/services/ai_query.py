@@ -40,13 +40,24 @@ WORKFLOW_STAGES = (
 CODE_RE = re.compile(r'(?<![^\W_])([a-zаеорстухвкмн]{1,5})[\s\-–_]*(\d{2,6})([a-z]?)(?![^\W_])', re.I)
 
 
+# Share one normalization between product identities and ratio scanning.
+UNICODE_DASH_TRANSLATION = str.maketrans({
+    '\u2010': '-',  # hyphen
+    '\u2011': '-',  # non-breaking hyphen
+    '\u2012': '-',  # figure dash
+    '\u2013': '-',  # en dash
+    '\u2014': '-',  # em dash
+    '\u2212': '-',  # minus sign
+})
+
 GENERIC_IDENTIFIER_LABELS = {'sku', 'art', 'арт'}
 
 
 def normalize_product_identifiers(value):
     """EU620 / EU-620 / eu 620 share identity; generic labels are not SKUs."""
+    value = str(value or '').translate(UNICODE_DASH_TRANSLATION)
     result = []
-    for match in CODE_RE.finditer(str(value or '')):
+    for match in CODE_RE.finditer(value):
         prefix, number, suffix = match.groups()
         if prefix.casefold() in GENERIC_IDENTIFIER_LABELS:
             continue

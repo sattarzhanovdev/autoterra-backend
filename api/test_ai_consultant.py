@@ -1,5 +1,6 @@
 """Technical-sales retrieval, evidence guards and catalog isolation regressions."""
 import json
+import re
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth.models import User
@@ -7,7 +8,7 @@ from django.test import SimpleTestCase, TestCase, override_settings
 
 from .models import (AIMessage, AuthToken, ClientProfile, ClientPriceOverride,
     Distributor, KnowledgeCard, KnowledgeChunk, KnowledgeDocument, Product, Region)
-from .services.ai_query import detect_intent, normalize_product_identifiers, plan_query
+from .services.ai_query import detect_intent, normalize_product_identifiers, plan_query, UNICODE_DASH_TRANSLATION
 from .services.ai_consultant import retrieve_consultation
 from .services.ai_answer_policy import _ratio_supported_by_technical, response_is_grounded
 from .services.knowledge_retrieval import grounded_answer, retrieve
@@ -399,6 +400,51 @@ class GroundedValidatorTests(SimpleTestCase):
     Лак Отвердитель Разбавитель
     Объёмная доля 2 1 5% -10%
     """
+
+    dashes = ('-', '\u2010', '\u2011', '\u2012', '\u2013', '\u2014', '\u2212')
+
+    def test_unicode_dash_product_code_is_identifier(self):
+        for dash in self.dashes:
+            with self.subTest(dash=repr(dash)):
+                self.assertEqual(normalize_product_identifiers(f'EU{dash}160/4'), ('eu160',))
+
+    def test_unicode_dash_sku_variant_is_not_ratio(self):
+        for dash in self.dashes:
+            with self.subTest(dash=repr(dash)):
+                text = f'EU{dash}160/4 Extra Fast Drying Clear Coat, смешивание 2:1 [1].'
+                normalized = text.translate(UNICODE_DASH_TRANSLATION)
+                ratios = re.findall(
+                    r'(?<![\w-])\d+(?:[.,]\d+)?\s*[:/]\s*\d+(?:[.,]\d+)?(?:\s*[:/]\s*\d+(?:[.,]\d+)?)?\b',
+                    normalized,
+                )
+                self.assertEqual(ratios, ['2:1'])
+
+    def test_unicode_dash_variant_keeps_grounding_and_ratio_checks(self):
+        contexts = [{'text': 'EU-160/4\n' + self.table,
+                     'source': {'type': 'document', 'title': 'EU-160 TDS'}}]
+        for dash in self.dashes:
+            with self.subTest(dash=repr(dash)):
+                self.assertTrue(response_is_grounded(f'EU{dash}160/4: смешивание 2:1 [1].',
+                    contexts, 'Как смешивать EU-160?'))
+                self.assertFalse(response_is_grounded(f'EU{dash}160/4: смешивание 4:1 [1].',
+                    contexts, 'Как смешивать EU-160?'))
+                self.assertFalse(response_is_grounded(f'EU{dash}999/4: смешивание 2:1 [1].',
+                    contexts, 'Как смешивать EU-160?'))
+
+    @override_settings(HF_API_TOKEN='fake')
+    def test_unicode_dash_variant_completes_provider_answer(self):
+        contexts = [{'text': 'EU-160/4\n' + self.table,
+                     'source': {'type': 'document', 'title': 'EU-160 TDS'}}]
+        answer = 'EU\u2011160/4 Extra Fast Drying Clear Coat, смешивание 2:1 [1].'
+        provider = MagicMock()
+        provider.__enter__.return_value.read.return_value = json.dumps({'choices': [{'message': {
+            'content': json.dumps({'answer': answer, 'insufficient': False})}}]}).encode()
+        with patch('api.services.knowledge_retrieval.urllib.request.urlopen', return_value=provider):
+            result = grounded_answer('Как смешивать EU-160?', contexts)
+        self.assertEqual(result.status, 'completed')
+        self.assertEqual(result.error, '')
+        self.assertFalse(result.insufficient)
+        self.assertEqual(result.answer, answer)
 
     def test_generic_sku_label_is_not_product_identifier(self):
         self.assertEqual(normalize_product_identifiers('EU-100 (SKU 00-00013495)'), ('eu100',))
