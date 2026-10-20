@@ -7,10 +7,10 @@ from django.test import TestCase, override_settings
 
 from .models import (AIMessage, AuthToken, ClientProfile, ClientPriceOverride,
     Distributor, KnowledgeCard, KnowledgeChunk, KnowledgeDocument, Product, Region)
-from .services.ai_query import detect_intent, normalize_product_identifiers
+from .services.ai_query import detect_intent, normalize_product_identifiers, plan_query
 from .services.ai_consultant import retrieve_consultation
 from .services.knowledge_retrieval import grounded_answer, retrieve
-from .services.product_retrieval import catalog_access
+from .services.product_retrieval import catalog_access, retrieve_products, select_products
 
 
 @override_settings(HF_API_TOKEN='', SECURE_SSL_REDIRECT=False, ELASTICSEARCH_URL='')
@@ -343,3 +343,50 @@ class IntentTests(TestCase):
         for question, expected in cases.items():
             with self.subTest(question=question):
                 self.assertEqual(detect_intent(question), expected)
+
+
+@override_settings(HF_API_TOKEN='', ELASTICSEARCH_URL='')
+class AssortmentFamilyTests(TestCase):
+    question = 'Какие лаки EUMATCH есть в ассортименте и какой для чего подходит?'
+    models = ('EU-100', 'EU-120', 'EU-130', 'EU-160', 'EU-180')
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user('assortment-supplier')
+        cls.user.profile.role = 'distributor'
+        cls.user.profile.save()
+        cls.distributor = Distributor.objects.create(name='EUMATCH supplier', inn='1234567890', user=cls.user)
+        for code in cls.models:
+            for suffix, size in (('', 1), ('/4', 4)):
+                Product.objects.create(distributor=cls.distributor, sku=code + suffix,
+                    name=f'Лак EUMATCH {code} {size}л', brand='EUMATCH', category='Лаки',
+                    description='Лак для ремонтной окраски.', volume=size, price=1000, quantity=10)
+
+    def test_focused_assortment_retrieves_beyond_four_category_rows(self):
+        plan = plan_query(self.question)
+        self.assertEqual(plan.intent, 'assortment')
+        self.assertIn('clearcoat', plan.groups)
+        candidates = retrieve_products(plan, catalog_access(self.user))
+        self.assertEqual(len(candidates), 10)
+        selected = select_products(candidates, plan)
+        self.assertEqual([p.sku for p in selected], list(self.models))
+        contexts = retrieve_consultation(self.question, self.user)
+        self.assertEqual([c['source']['sku'] for c in contexts if c['source']['type'] == 'product'], list(self.models))
+
+    def test_general_brand_overview_keeps_category_diversification(self):
+        plan = plan_query('Что можешь рассказать про EUMATCH?')
+        candidates = retrieve_products(plan, catalog_access(self.user))
+        self.assertEqual(len(candidates), 4)
+
+    def test_pack_variants_remain_available_for_product_lookup(self):
+        plan = plan_query('Что такое EU-100?')
+        candidates = retrieve_products(plan, catalog_access(self.user))
+        self.assertEqual([p.sku for p in select_products(candidates, plan)], ['EU-100', 'EU-100/4'])
+
+    def test_assortment_does_not_merge_products_without_model_codes(self):
+        products = [Product(pk=i, sku=str(i), name=f'Лак {i}') for i in range(1, 4)]
+        # Same category/brand alone is not a product-family identity.
+        plan = plan_query('Какие лаки есть?')
+        for product in products:
+            product.category = 'Лаки'
+        self.assertEqual(select_products(products, plan), products)

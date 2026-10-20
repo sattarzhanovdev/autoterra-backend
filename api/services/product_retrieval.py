@@ -109,7 +109,14 @@ def retrieve_products(plan, access, *, related_codes=(), limit=MAX_CANDIDATES):
     found = qs.filter(predicate).annotate(_ai_rank=relevance,
         _ai_exact=Case(When(exact, then=Value(1)), default=Value(0), output_field=IntegerField())
     )
-    if plan.broad:
+    material_groups = {
+        'primer', 'clearcoat', 'basecoat', 'hardener',
+        'thinner', 'degreaser', 'abrasive',
+    }
+    focused_material = bool(set(plan.groups) & material_groups)
+    # Diversify a general brand overview, but do not truncate a requested
+    # material type (e.g. EUMATCH lacquers) to four rows in one category.
+    if plan.broad and not focused_material:
         found = found.annotate(_ai_category_row=Window(RowNumber(), partition_by=[F('category')],
             order_by=['-_ai_exact', '-_ai_rank', 'pk'])).filter(_ai_category_row__lte=4)
     candidates = list(found.order_by('-_ai_exact', '-_ai_rank', 'pk')[:min(limit, MAX_CANDIDATES)])
@@ -178,9 +185,28 @@ def select_products(candidates, plan, limit=MAX_PRODUCTS, *, related_codes=()):
     if plan.intent == 'alternatives' and selected:
         primary = selected[0]
         candidates = [p for p in candidates if p == primary or same_purpose(primary, p)]
+    seen_families = set()
     for p in candidates:
-        if (plan.intent in ('application', 'compatibility') and any(product_matches_identifier(p, code) for code in related_codes)) or not plan.identifiers or plan.intent in ('alternatives', 'workflow') or p.pk in requested:
-            add(p)
+        allowed = (
+            (
+                plan.intent in ('application', 'compatibility')
+                and any(product_matches_identifier(p, code) for code in related_codes)
+            )
+            or not plan.identifiers
+            or plan.intent in ('alternatives', 'workflow')
+            or p.pk in requested
+        )
+        if not allowed:
+            continue
+        # Different pack sizes must not fill the assortment's model slots.
+        if plan.intent == 'assortment':
+            codes = normalize_product_identifiers(p.name)
+            family = codes[0] if codes else None
+            if family and family in seen_families:
+                continue
+            if family:
+                seen_families.add(family)
+        add(p)
     return selected
 
 
