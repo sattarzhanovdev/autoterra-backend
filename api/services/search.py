@@ -33,7 +33,7 @@ def index_name() -> str:
     return getattr(settings, "ELASTICSEARCH_INDEX", "autoterra-products")
 
 
-def search_products(queryset, query: str):
+def search_products(queryset, query: str, *, rank_external=True):
     """Сужает ``queryset`` до товаров, подходящих под ``query``.
 
     Пустой запрос возвращает queryset без изменений. Если Elasticsearch
@@ -47,7 +47,7 @@ def search_products(queryset, query: str):
     matches = _database_search(queryset, query)
     # The database defines membership, including partial matches and all tenants.
     # ES is an optional ranking aid; stale/limited hits cannot hide matches.
-    if is_elasticsearch_enabled():
+    if rank_external and is_elasticsearch_enabled():
         try:
             ids = _elasticsearch_ids(query)
             if ids:

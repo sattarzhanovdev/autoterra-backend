@@ -493,7 +493,7 @@ def validate_product_images(value):
 
 
 class ProductQuerySet(models.QuerySet):
-    SEARCH_FIELDS = {"name", "sku", "brand", "category", "synonyms"}
+    SEARCH_FIELDS = {"name", "sku", "brand", "category", "synonyms", "group_name", "description"}
 
     def bulk_create(self, objs, **kwargs):
         from api.services.product_names import normalize_product_synonyms, product_search_text
@@ -607,11 +607,11 @@ class Product(models.Model):
         self.images = normalize_product_images(self.images)
         self.synonyms = normalize_product_synonyms(self.synonyms)
         fields = kwargs.get("update_fields")
-        if fields is None or set(fields) & {"name", "sku", "brand", "category", "synonyms"}:
+        if fields is None or set(fields) & ProductQuerySet.SEARCH_FIELDS:
             if fields is not None:
                 # Partial saves must index persisted values of untouched fields.
                 stored = type(self).objects.get(pk=self.pk)
-                for field in ("name", "sku", "brand", "category", "synonyms"):
+                for field in ProductQuerySet.SEARCH_FIELDS:
                     if field in fields:
                         setattr(stored, field, getattr(self, field))
                 self.search_text = product_search_text(stored)

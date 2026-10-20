@@ -1,4 +1,5 @@
 import os
+import json
 from decimal import Decimal
 from pathlib import Path
 
@@ -247,3 +248,15 @@ GOOGLE_DRIVE_CREDENTIALS_FILE = os.environ.get('GOOGLE_DRIVE_CREDENTIALS_FILE', 
 GOOGLE_DRIVE_REQUEST_TIMEOUT = int(os.environ.get('GOOGLE_DRIVE_REQUEST_TIMEOUT', '30'))
 GOOGLE_DRIVE_DOWNLOAD_TIMEOUT = int(os.environ.get('GOOGLE_DRIVE_DOWNLOAD_TIMEOUT', '120'))
 GOOGLE_DRIVE_MAX_FILES = int(os.environ.get('GOOGLE_DRIVE_MAX_FILES', '10000'))
+
+
+# Optional domain vocabulary extension, e.g. {"brand_alias": ["alias", "brand"]}.
+# These are retrieval aliases, never technical facts or product recommendations.
+AI_DOMAIN_SYNONYMS = json.loads(os.environ.get('AI_DOMAIN_SYNONYMS', '{}'))
+if not isinstance(AI_DOMAIN_SYNONYMS, dict) or any(
+    not isinstance(key, str) or not isinstance(values, list) or not values
+    or len(values) > 20 or any(not isinstance(value, str) or not value.strip() or len(value) > 100 for value in values)
+    for key, values in AI_DOMAIN_SYNONYMS.items()
+):
+    from django.core.exceptions import ImproperlyConfigured
+    raise ImproperlyConfigured('AI_DOMAIN_SYNONYMS must map names to nonempty lists of short strings')

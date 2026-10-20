@@ -40,8 +40,22 @@ def record_exchange(user, conversation, message, *, expert=False):
         reply.status = 'invalid'
     else:
         try:
-            contexts = retrieve(question)
-            outcome = grounded_answer(question, contexts)
+            # Prior user turns only resolve references; previous assistant
+            # prices/claims never become fresh evidence. Retrieval is scoped anew.
+            history = list(conversation.messages.filter(role='user', pk__lt=question_message.pk)
+                           .order_by('-pk').values_list('content', flat=True)[:4])
+            retrieval_question = question
+            import re
+            from .ai_query import normalize_product_identifiers, plan_query
+            plan = plan_query(question)
+            followup = bool(re.search(r'\b(?:его|ее|её|этот|этого|эту|них|ним|него)\b', question, re.I))
+            followup = followup or (plan.intent in ('alternatives', 'application') and not plan.groups)
+            if not plan.identifiers and followup:
+                anchor = next((text for text in history if normalize_product_identifiers(text)), '')
+                if anchor:
+                    retrieval_question += '\nКонтекст вопроса: ' + anchor[:600]
+            contexts = retrieve(retrieval_question, user=user)
+            outcome = grounded_answer(question, contexts, history=[text[:1000] for text in reversed(history)])
             answer, insufficient = outcome
             reply.status = outcome.status
             reply.error = outcome.error

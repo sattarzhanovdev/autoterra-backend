@@ -35,6 +35,7 @@ def product_search_text(product):
     lines = [normalize_search_text(value) for value in (
         product.name, product.sku, product.brand, product.category, *product.synonyms,
     )]
+    lines.extend(normalize_search_text(value) for value in (product.group_name, product.description) if value)
     return "\n".join([compact_search_text(product.sku), *lines, compact_search_text(product.name)])
 
 

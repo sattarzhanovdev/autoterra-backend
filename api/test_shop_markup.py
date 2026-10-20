@@ -59,7 +59,9 @@ class ShopMarkupTests(_Base):
         for status in ('new', 'under_review', 'blocked', 'archived'):
             self.client_profile.status = status
             self.client_profile.save()
-            self.assertEqual(self.save_markup(10).status_code, 403)
+            # Archival revokes authentication tokens; other restricted states
+            # keep the token so the app can still refresh account status.
+            self.assertEqual(self.save_markup(10).status_code, 401 if status == 'archived' else 403)
 
     def test_cannot_change_another_shop(self):
         other = self._client('other-shop', '1111111111')
