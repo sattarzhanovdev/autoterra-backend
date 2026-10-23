@@ -1832,10 +1832,16 @@ def my_markup(request):
 
 @require_GET
 def products(request):
-    client, err = _require_client(request)
-    if err:
-        return err
-    qs = Product.objects.filter(distributor=client.distributor, is_active=True)
+    client = None
+    if (request.headers.get("Authorization") or "").strip():
+        client, err = _require_client(request)
+        if err:
+            return err
+    if client is not None:
+        base_qs = Product.objects.filter(distributor=client.distributor, is_active=True)
+    else:
+        base_qs = Product.objects.filter(is_active=True, distributor__is_active=True)
+    qs = base_qs
     category = (request.GET.get("category") or "").strip()
     search = (request.GET.get("search") or "").strip()
     brand = (request.GET.get("brand") or "").strip()
@@ -1852,8 +1858,7 @@ def products(request):
     # попадает в SELECT ради сортировки и DISTINCT перестаёт схлопывать
     # одинаковые категории.
     categories = list(
-        Product.objects.filter(distributor=client.distributor, is_active=True)
-        .order_by("category")
+        base_qs.order_by("category")
         .values_list("category", flat=True)
         .distinct()
     )

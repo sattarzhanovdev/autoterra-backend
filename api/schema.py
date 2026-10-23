@@ -278,6 +278,40 @@ PATHS = {
             "responses": {"200": _ok(_ref("LoginResponse"))},
         }
     },
+    "/products/": {
+        "get": {
+            "tags": ["Catalog"],
+            "summary": "Публичный каталог товаров",
+            "description": (
+                "Bearer token опциональный. Без Authorization возвращаются активные товары "
+                "активных дистрибьюторов с базовыми ценами. С валидным токеном клиента "
+                "возвращается только ассортимент его дистрибьютора с персональными ценами "
+                "и скидками. Переданный неверный токен возвращает 401, недоступный клиент — 403."
+            ),
+            "security": [{}, {"BearerAuth": []}],
+            "parameters": [
+                {"name": name, "in": "query", "schema": schema}
+                for name, schema in (
+                    ("page", {"type": "integer", "minimum": 1, "default": 1}),
+                    ("page_size", {"type": "integer", "minimum": 1, "maximum": 100, "default": 20}),
+                    ("category", {"type": "string"}),
+                    ("brand", {"type": "string"}),
+                    ("search", {"type": "string"}),
+                    ("inStock", {"type": "boolean", "description": "Включает товары под заказ."}),
+                )
+            ],
+            "responses": {
+                "200": _ok({"type": "object", "properties": {
+                    "results": _array({"type": "object"}),
+                    "pagination": {"type": "object"},
+                    "count": {"type": "integer"},
+                    "categories": _array({"type": "string"}),
+                }}),
+                "401": _error("Передан неверный Bearer token."),
+                "403": _error("Нет доступа клиента или его дистрибьютор недоступен."),
+            },
+        }
+    },
     "/auth/me/": {
         "get": _secured({
             "tags": ["Auth"],
