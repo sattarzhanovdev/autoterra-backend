@@ -66,7 +66,8 @@ from .serializers import RegistrationSerializer, PurchaseSerializer, coerce_deci
 from .services.bonuses import balance as bonus_balance
 from .services import referral_bonus
 from .services.exports import EXPORTERS as EXPORT_FORMATS, ExportUnavailable, export_clients
-from .services.pricing import price_details, price_for_client
+from .services.pricing import MAX_DISCOUNT_PERCENT, price_details
+from .services.order_discounts import order_discount_config, quote_order
 from .services.tiers import sync_client_tier
 
 try:
@@ -952,6 +953,7 @@ def _format_product(product, client=None):
         payload["price"] = float(details["price"])
         payload["basePrice"] = float(details["base_price"])
         payload["discountPercent"] = float(details["discount_percent"])
+        payload["effectiveDiscountPercent"] = float(details["effective_discount_percent"])
         payload["hasDiscount"] = details["has_discount"]
         payload["personalPrice"] = float(details["personal_price"]) if details["personal_price"] is not None else None
         payload["priceSource"] = details["price_source"]
@@ -1883,6 +1885,42 @@ def product_quote(request):
     return JsonResponse({"results": [_format_product(p, client) for p in products]})
 
 
+@csrf_exempt
+@require_POST
+def order_quote(request):
+    """Authenticated basket quote; only product IDs and quantities are trusted."""
+    client, error = _require_client(request)
+    if error:
+        return error
+    payload = _json(request)
+    try:
+        rows = payload['items']
+        if not isinstance(rows, list) or not rows or len(rows) > 1000:
+            raise ValueError
+        quantities = {}
+        for row in rows:
+            pid, qty = row['productId'], row['quantity']
+            if (isinstance(pid, bool) or not str(pid).isdigit() or len(str(pid)) > 18
+                    or isinstance(qty, bool) or str(qty) != str(int(qty)) or not 0 < int(qty) <= 1000000):
+                raise ValueError
+            pid = int(pid)
+            quantities[pid] = quantities.get(pid, 0) + int(qty)
+            if quantities[pid] > 1000000:
+                raise ValueError
+    except (ValueError, KeyError, TypeError, OverflowError):
+        return JsonResponse({'detail': 'Передайте товары и положительные целые количества'}, status=400)
+    products = {p.pk: p for p in Product.objects.filter(
+        pk__in=quantities, distributor=client.distributor, is_active=True)}
+    if len(products) != len(quantities):
+        return JsonResponse({'detail': 'Товар недоступен у вашего дистрибьютора'}, status=400)
+    prices, summary = quote_order(client, products, quantities)
+    if coerce_decimal(summary['total'], 12, 2) is None:
+        return JsonResponse({'detail': 'Некорректная сумма заказа'}, status=400)
+    return JsonResponse({'orderDiscount': summary, 'items': [
+        {'productId': str(pid), 'quantity': quantities[pid], 'price': str(price),
+         'total': str(price * quantities[pid])} for pid, price in prices.items()]})
+
+
 @require_GET
 def order_config(request):
     client, err = _require_client(request)
@@ -1908,6 +1946,7 @@ def order_config(request):
         # Баланс нужен уже в корзине: клиент должен видеть, сколько бонусов
         # закроет собираемый заказ, а не узнавать об этом на шаге оплаты.
         "bonusBalance": float(bonus_balance(client)),
+        "orderDiscount": order_discount_config(),
     })
 
 
@@ -2024,7 +2063,8 @@ def create_order(request, replace_order_id=None):
                 return JsonResponse({"detail": "Заказ не найден"}, status=404)
             if replaced.payments.filter(status__in=["pending", "waiting_for_capture"]).exists():
                 return JsonResponse({"detail": "Дождитесь завершения платежа"}, status=409)
-            if not replaced.can_transition_to("cancelled"):
+            from .services.orders import is_editable_order
+            if not is_editable_order(replaced):
                 return JsonResponse({"detail": "Нельзя изменить заказ на текущем этапе"}, status=400)
         # The same client lock is used by discount/override updates: online and
         # cash orders both read current pricing and access permissions.
@@ -2046,7 +2086,7 @@ def create_order(request, replace_order_id=None):
         if len(products_by_id) != len(quantities):
             transaction.set_rollback(True)
             return JsonResponse({"detail": "Товар недоступен у вашего дистрибьютора"}, status=400)
-        prices = {pid: price_for_client(client, product) for pid, product in products_by_id.items()}
+        prices, order_discount = quote_order(client, products_by_id, quantities)
         total = coerce_decimal(sum(prices[pid] * qty for pid, qty in quantities.items()), 12, 2)
         if total is None or total < 0:
             transaction.set_rollback(True)
@@ -2077,7 +2117,7 @@ def create_order(request, replace_order_id=None):
 
     _notify_operator_order(order, f"Новый заказ ORD-{order.pk:05d}", f"{client.company_name} оформила заказ на {order.total_amount} ₽")
     _send_order_email(order)
-    return JsonResponse({"order": _format_order(order)}, status=201)
+    return JsonResponse({"order": _format_order(order), "orderDiscount": order_discount}, status=201)
 
 
 @csrf_exempt
@@ -6006,6 +6046,7 @@ def _format_client_price(client, product, override=None):
         'rankPrice': str(apply_discount(product.price, discount_percent(client, product))),
         'price': str(details['price']), 'priceSource': details['price_source'],
         'discountPercent': str(details['discount_percent']),
+        'effectiveDiscountPercent': str(details['effective_discount_percent']),
         'overrideId': str(override.pk) if override else None,
         'personalPrice': str(override.price) if override else None,
         'isActive': override.is_active if override else False,
@@ -6063,6 +6104,9 @@ def client_price_detail(request, client_id, product_id):
     if (isinstance(raw_price, bool) or price is None or price <= 0
             or price != Decimal(str(raw_price))):
         return JsonResponse({'detail': 'Цена должна быть больше нуля, до 9 999 999 999,99 ₽, не более двух знаков после запятой'}, status=400)
+    from .services.pricing import apply_discount
+    if price < apply_discount(product.price, MAX_DISCOUNT_PERCENT):
+        return JsonResponse({'detail': 'Максимальная скидка — 40%'}, status=400)
     active = payload.get('isActive', existing.is_active if existing else True)
     if not isinstance(active, bool):
         return JsonResponse({'detail': 'isActive должен быть true или false'}, status=400)
@@ -6090,10 +6134,10 @@ def client_discount(request, client_id):
         raw = payload["personalDiscountPercent"]
         value = None if raw is None else coerce_decimal(raw, 5, 2)
         if raw is not None and (
-            isinstance(raw, bool) or value is None or not 0 <= value <= 100
+            isinstance(raw, bool) or value is None or not 0 <= value <= MAX_DISCOUNT_PERCENT
             or value != Decimal(str(raw))
         ):
-            return JsonResponse({"detail": "Скидка должна быть от 0 до 100%, не более двух знаков после запятой"}, status=400)
+            return JsonResponse({"detail": "Скидка должна быть от 0 до 40%, не более двух знаков после запятой"}, status=400)
         client = ClientProfile.objects.select_for_update(of=("self",)).get(pk=client.pk)
         # Recheck regional permissions after acquiring the client row lock.
         _, _, error = _client_settings_scope(request, client_id, write=True)
@@ -6261,8 +6305,8 @@ def client_brand_discounts(request, client_id):
             key = normalize_brand(item["brand"])
             raw = item["percent"]
             value = coerce_decimal(raw, 5, 2)
-            if isinstance(raw, bool) or value is None or not 0 <= value <= 100 or value != Decimal(str(raw)):
-                return JsonResponse({"detail": "Скидка: от 0 до 100%, до двух знаков после запятой"}, status=400)
+            if isinstance(raw, bool) or value is None or not 0 <= value <= MAX_DISCOUNT_PERCENT or value != Decimal(str(raw)):
+                return JsonResponse({"detail": "Скидка: от 0 до 40%, до двух знаков после запятой"}, status=400)
             if not key or len(key) > 128 or key not in labels and key not in existing:
                 return JsonResponse({"detail": "Бренд не найден в ассортименте дистрибьютора клиента"}, status=400)
             if key in updates:

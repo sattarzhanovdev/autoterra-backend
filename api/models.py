@@ -359,7 +359,7 @@ class ClientProfile(models.Model):
     personal_discount_percent = models.DecimalField(
         "Персональная скидка, %", max_digits=5, decimal_places=2,
         null=True, blank=True,
-        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))],
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("40"))],
         help_text="Не задана — скидка по рангу; 0 — явно без скидки по рангу.",
     )
     # Личный код для приглашений. По нему новый сервис при регистрации
@@ -384,7 +384,7 @@ class ClientProfile(models.Model):
             models.UniqueConstraint(fields=("inn", "region"), name="unique_client_inn_region"),
             models.CheckConstraint(
                 condition=models.Q(personal_discount_percent__isnull=True) |
-                    models.Q(personal_discount_percent__gte=0, personal_discount_percent__lte=100),
+                    models.Q(personal_discount_percent__gte=0, personal_discount_percent__lte=40),
                 name="client_personal_discount_range",
             ),
         ]
@@ -628,7 +628,7 @@ class ClientBrandDiscount(models.Model):
     client = models.ForeignKey(ClientProfile, on_delete=models.CASCADE, related_name="brand_discounts", verbose_name="Клиент")
     brand = models.CharField("Бренд", max_length=128, help_text="Регистр и лишние пробелы не учитываются")
     percent = models.DecimalField("Скидка, %", max_digits=5, decimal_places=2,
-        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("100"))])
+        validators=[MinValueValidator(Decimal("0")), MaxValueValidator(Decimal("40"))])
     updated_at = models.DateTimeField("Дата изменения", auto_now=True)
 
     class Meta:
@@ -637,7 +637,7 @@ class ClientBrandDiscount(models.Model):
         ordering = ("brand",)
         constraints = [
             models.UniqueConstraint(fields=("client", "brand"), name="unique_client_brand_discount"),
-            models.CheckConstraint(condition=models.Q(percent__gte=0, percent__lte=100), name="client_brand_discount_range"),
+            models.CheckConstraint(condition=models.Q(percent__gte=0, percent__lte=40), name="client_brand_discount_range"),
         ]
 
     def clean(self):
@@ -674,8 +674,16 @@ class ClientPriceOverride(models.Model):
 
     def clean(self):
         super().clean()
+        if self.product_id and self.price is not None:
+            from .services.pricing import apply_discount, MAX_DISCOUNT_PERCENT
+            if self.price < apply_discount(self.product.price, MAX_DISCOUNT_PERCENT):
+                raise ValidationError({"price": "Максимальная скидка — 40%"})
         if self.client_id and self.product_id and self.client.distributor_id != self.product.distributor_id:
             raise ValidationError({"product": "Товар должен принадлежать дистрибьютору клиента"})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.client} · {self.product} · {self.price} ₽"
@@ -723,7 +731,7 @@ class RankDiscount(models.Model):
         max_digits=5,
         decimal_places=2,
         default=0,
-        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        validators=[MinValueValidator(0), MaxValueValidator(40)],
     )
     is_active = models.BooleanField("Активно", default=True)
     comment = models.CharField("Комментарий", max_length=255, blank=True)
@@ -734,6 +742,7 @@ class RankDiscount(models.Model):
         verbose_name_plural = "Скидки по рангам"
         unique_together = ("distributor", "tier", "product_category")
         ordering = ("tier__threshold", "product_category")
+        constraints = [models.CheckConstraint(condition=models.Q(percent__gte=0, percent__lte=40), name="rank_discount_range")]
 
     def __str__(self):
         scope = self.product_category or "весь ассортимент"

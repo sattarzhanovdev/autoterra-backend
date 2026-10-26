@@ -137,6 +137,8 @@ class AuditRegressionTests(_Base):
     def test_oversized_adjustment_rolls_back_items_and_stock(self):
         admin = User.objects.create_superuser(username='adjust-admin', password='password')
         AuthToken.objects.create(user=admin, key='adjust-audit')
+        self.product.price = Decimal('9999999999.99')
+        self.product.save()
         order = self._order(Decimal('9999999999.99'), status='new')
         item = order.items.get()
         response = self.http.post(f'/api/orders/{order.pk}/adjust/', {

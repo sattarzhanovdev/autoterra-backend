@@ -114,19 +114,19 @@ class ClientDiscountTests(_ClientDiscountBase):
 
     def test_validation_and_database_constraints(self):
         self.set_discount("15")
-        for value in (-1, 101, True, {}, [], "", "NaN", "Infinity", "1.001", "1e10000"):
+        for value in (-1, 40.01, 100, 101, True, {}, [], "", "NaN", "Infinity", "1.001", "1e10000"):
             with self.subTest(value=value):
                 self.assertEqual(self.set_discount(value).status_code, 400)
         self.assertEqual(self.fresh().personal_discount_percent, 15)
-        for value in (-1, 101):
+        for value in (-1, 40.01, 100, 101):
             client = self.fresh()
             client.personal_discount_percent = value
             with self.assertRaises(ValidationError):
                 client.save()
             with self.assertRaises(IntegrityError), transaction.atomic():
                 ClientProfile.objects.filter(pk=client.pk).update(personal_discount_percent=value)
-        self.assertEqual(self.set_discount("100").status_code, 200)
-        self.assertEqual(price_for_client(self.fresh(), self.product), 0)
+        self.assertEqual(self.set_discount("40").status_code, 200)
+        self.assertEqual(price_for_client(self.fresh(), self.product), 600)
 
     def test_audit_includes_actor_old_and_new_values_and_reset(self):
         self.set_discount("20")
@@ -138,20 +138,12 @@ class ClientDiscountTests(_ClientDiscountBase):
         self.assertEqual(logs[1].changes, {"oldPersonalDiscountPercent": "20.00", "personalDiscountPercent": "15.00"})
         self.assertIsNone(logs[2].changes["personalDiscountPercent"])
 
-    def test_hundred_percent_order_and_payment(self):
-        self.set_discount("100")
+    def test_hundred_percent_cannot_create_free_order(self):
+        self.assertEqual(self.set_discount('100').status_code, 400)
         result = self.create_order()
         self.assertEqual(result.status_code, 201, result.content)
-        order = Order.objects.get(pk=result.json()["order"]["id"])
-        order.status = "confirmed"
-        order.save()
-        from .views import _prepare_order_payment
-        result = _prepare_order_payment(self.fresh(), order.pk, {})
-        self.assertEqual(result.status_code, 201, result.content)
-        order.refresh_from_db()
-        self.assertEqual(order.status, "paid")
-        self.assertEqual(order.payments.get().provider, "discount")
-        self.assertEqual(order.payments.get().amount, 0)
+        order = Order.objects.get(pk=result.json()['order']['id'])
+        self.assertEqual(order.total_amount, Decimal('1800'))
 
     def test_empty_order_cannot_be_paid(self):
         from .views import _prepare_order_payment

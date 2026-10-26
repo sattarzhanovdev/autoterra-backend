@@ -193,8 +193,9 @@ class OrderAdminTests(_Base):
     def test_change_client_reprices_and_records_history(self):
         other = self._client('other-client', '1234567890')
         store = Store.objects.create(client=other, name='Новая точка', address='Адрес')
-        with patch('api.services.orders.price_for_client', return_value=Decimal('800')):
-            response = self.metadata(client=other.pk, store=store.pk, adjustment_reason='Смена клиента')
+        other.personal_discount_percent = Decimal('20')
+        other.save()
+        response = self.metadata(client=other.pk, store=store.pk, adjustment_reason='Смена клиента')
         self.assertEqual(response.status_code, 302, response.content)
         self.order.refresh_from_db()
         self.item.refresh_from_db()

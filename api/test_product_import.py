@@ -221,7 +221,7 @@ class ProductSynonymImportTests(TestCase):
         foreign = Product.objects.create(distributor=other, sku="FILM", name="Чужой", category="Материалы", synonyms=["чужой"])
         client = ClientProfile.objects.create(user=User.objects.create_user(username="buyer"),
             distributor=self.distributor, region=Region.objects.filter(distributor=self.distributor).first(), inn="1234567890", company_name="Buyer", city="Москва", contact_name="Buyer", phone="123")
-        override = ClientPriceOverride.objects.create(client=client, product=product, price=500)
+        override = ClientPriceOverride.objects.create(client=client, product=product, price=600)
         for value, include, expected in (
             ("укрывной материал; пленка; защитная плёнка", True, ["укрывной материал", "пленка", "защитная плёнка"]),
             (None, False, ["укрывной материал", "пленка", "защитная плёнка"]),
@@ -236,7 +236,7 @@ class ProductSynonymImportTests(TestCase):
             self.assertEqual(product.price, Decimal("999"))
             self.assertEqual(product.quantity, 7)
             self.assertEqual(product.images, ["https://example.com/a.jpg"])
-            self.assertEqual(ClientPriceOverride.objects.get(pk=override.pk).price, Decimal("500"))
+            self.assertEqual(ClientPriceOverride.objects.get(pk=override.pk).price, Decimal("600"))
         foreign.refresh_from_db()
         self.assertEqual(foreign.synonyms, ["чужой"])
         self.assertEqual(Product.objects.count(), 2)

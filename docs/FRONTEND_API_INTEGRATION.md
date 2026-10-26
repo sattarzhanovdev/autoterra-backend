@@ -1,5 +1,7 @@
 # AutoTerra Backend — документация для интеграции фронтенда
 
+> Обновление pricing: [скидки текущего заказа и POST /api/orders/quote/](../ORDER_DISCOUNTS.md). Итоги и progress корзины берите с backend; effectiveDiscountPercent отражает фактическую скидку от прайса.
+
 Дата сверки: **14 октября 2026**. Репозиторий: `sattarzhanovdev/autoterra-backend`, ветка `adilhan_new`, commit `4555a42823b092005a546c7c79e194146a3f83a0`.
 
 Документ описывает код этого commit, а не подтверждённую конфигурацию production. Обновления сервера не выполнялись. URL production для клиента: `https://autoterra.shop/api/`; локально обычно `http://127.0.0.1:8000/api/` при `DEBUG=True`. Все примеры ID и данных ниже условные — подставляйте значения из ответов API.
@@ -158,7 +160,7 @@ Query: `page` от 1; `page_size` (alias `pageSize`) default 20, максиму�
 | Endpoint | Доступ / изменение |
 |---|---|
 | `/clients/{client_id}/settings/` GET/PATCH | Свой дистрибьютор/admin чтение и запись; региональный менеджер только чтение. PATCH: `status` и/или `category`; никаких иных ключей |
-| `/clients/{client_id}/discount/` GET/PATCH | Та же матрица. PATCH строго `{personalDiscountPercent:"10.00"}` или `null`; 0–100%, до 2 знаков |
+| `/clients/{client_id}/discount/` GET/PATCH | Та же матрица. PATCH строго `{personalDiscountPercent:"10.00"}` или `null`; 0–40%, до 2 знаков |
 | `/clients/{client_id}/brand-discounts/` GET/PATCH/DELETE | Та же матрица. Query `search`, `discountsOnly=true`. PATCH `{discounts:[{brand:"HiQ",percent:"5.00"}]}`, 1–200 уникальных нормализованных брендов. DELETE `{brand:"HiQ"}` |
 | `/clients/{client_id}/prices/` GET | Менеджер/admin доступны по региону; дистрибьютор читает своих клиентов. Query `overridesOnly` default `true`, `search` |
 | `/clients/{client_id}/prices/{product_id}/` PUT/PATCH/DELETE | Запись только менеджер/admin. `{price:"500.00",isActive:true}`; положительная цена ≤9 999 999 999,99, 2 знака. Первый override → 201, обновление → 200. DELETE возвращает `status` и `item` с текущей ценой без override |
@@ -1347,7 +1349,7 @@ Choices описывают канонические значения. Налич
 | 400 | {detail: "Укажите корректный бренд"} |
 | 400 | {detail: "Передайте discounts: от 1 до 200 скидок"} |
 | 400 | {detail: "Укажите brand и percent для каждой скидки"} |
-| 400 | {detail: "Скидка: от 0 до 100%, до двух знаков после запятой"} |
+| 400 | {detail: "Скидка: от 0 до 40%, до двух знаков после запятой"} |
 | 400 | {detail: "Бренд не найден в ассортименте дистрибьютора клиента"} |
 | 400 | {detail: "Бренд повторяется в запросе"} |
 
@@ -2434,7 +2436,7 @@ HTML, не подтверждение успешной оплаты.
 |---|---|
 | 200 | {clientId: string, personalDiscountPercent: string \| null, canEdit: значение сервера} |
 | 400 | {detail: "Передайте personalDiscountPercent"} |
-| 400 | {detail: "Скидка должна быть от 0 до 100%, не более двух знаков после запятой"} |
+| 400 | {detail: "Скидка должна быть от 0 до 40%, не более двух знаков после запятой"} |
 
 ### 72. `/api/clients/{client_id}/prices/`
 **Методы:** GET. **Доступ:** manager / admin; distributor чтение. [Исходный контракт](https://github.com/sattarzhanovdev/autoterra-backend/blob/4555a42823b092005a546c7c79e194146a3f83a0/api/views.py#L6226).

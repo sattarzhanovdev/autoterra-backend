@@ -11,6 +11,7 @@ from django.utils import timezone
 from api.models import AuditLog, ClientProfile, Order, OrderAdjustment, OrderItem, Product, Store, Distributor
 from api.serializers import coerce_decimal
 from api.services.pricing import price_for_client
+from api.services.order_discounts import quote_order
 from api.services.stock import reserve_product, release_product, restore_order_stock
 
 EDITABLE_STATUSES = {'new', 'confirmed', 'adjusted', 'accepted'}
@@ -176,6 +177,17 @@ def _adjustment_maps(payload):
     return quantities, new_quantities, payload.get('reason', '').strip()
 
 
+def _reprice_items(order, products):
+    items = list(OrderItem.objects.filter(order=order))
+    quantities = {}
+    for item in items:
+        quantities[item.product_id] = quantities.get(item.product_id, 0) + item.quantity
+    prices, _ = quote_order(order.client, products, quantities)
+    for item in items:
+        item.price = prices[item.product_id]
+        item.save(update_fields=['price'])
+
+
 def _valid_total(order):
     total = coerce_decimal(sum(item.total for item in OrderItem.objects.filter(order=order)), 12, 2)
     if total is None or total < 0:
@@ -199,6 +211,7 @@ def _record_adjustment(order, original, actor, reason, old_status, source):
 def adjust_order(order_id, payload, *, actor=None, source='api'):
     order = locked_order(order_id)
     ensure_editable_order(order)
+    order.client = ClientProfile.objects.select_for_update(of=('self',)).get(pk=order.client_id)
     quantities, additions, reason = _adjustment_maps(payload)
     item_ids = set(order.items.values_list('pk', flat=True))
     if set(quantities) - item_ids:
@@ -250,6 +263,7 @@ def adjust_order(order_id, payload, *, actor=None, source='api'):
                 price=price_for_client(order.client, product), quantity=quantity, reserved_quantity=reserved)
     if not order.items.exists():
         raise OrderError('После корректировки в заказе не осталось позиций. Отклоните заказ.')
+    _reprice_items(order, products)
     _valid_total(order)
     if items_snapshot(order) != original:
         _record_adjustment(order, original, actor, reason, order.status, source)
@@ -332,9 +346,7 @@ def update_metadata(order_id, changes, *, actor=None, reason='Изменение
         items = list(order.items.all())
         products = {p.pk: p for p in Product.objects.select_for_update(of=('self',)).filter(
             pk__in=[item.product_id for item in items]).order_by('pk')}
-        for item in items:
-            item.price = price_for_client(order.client, products[item.product_id])
-            item.save(update_fields=['price'])
+        _reprice_items(order, products)
         _valid_total(order)
         _record_adjustment(order, original, actor, reason, old_status, 'admin')
     else:

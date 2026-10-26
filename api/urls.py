@@ -32,6 +32,7 @@ urlpatterns = [
     path("stores/<int:store_id>/", views.store_detail),
     path("me/markup/", views.my_markup),
     path("products/", views.products),
+    path("orders/quote/", views.order_quote),
     path("order-config/", views.order_config),
     path("orders/", views.orders),
     path("orders/create/", views.create_order),

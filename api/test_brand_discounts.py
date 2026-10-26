@@ -68,8 +68,8 @@ class BrandDiscountTests(fixtures._ClientDiscountBase):
         foreign = Product.objects.create(distributor=other_distributor, sku='bosch', brand='Bosch', price=1000)
         self.assertEqual(price_for_client(self.fresh(), foreign), 950)
 
-    def test_zero_hundred_and_fractional_discount(self):
-        for percent, price in (('0', 1000), ('100', 0), ('7.50', 925)):
+    def test_zero_forty_and_fractional_discount(self):
+        for percent, price in (('0', 1000), ('40', 600), ('7.50', 925)):
             self.assertEqual(self.save_brand(percent).status_code, 200)
             self.assertEqual(price_for_client(self.fresh(), self.product), price)
         self.assertEqual(ClientBrandDiscount.objects.count(), 1)
@@ -95,7 +95,7 @@ class BrandDiscountTests(fixtures._ClientDiscountBase):
 
     def test_invalid_batch_is_atomic_and_constraints_enforced(self):
         self.save_brand('10')
-        for percent in (-1, 101, True, 'NaN', 'Infinity', '1.001', None, [], {}, '1e10000'):
+        for percent in (-1, 40.01, 100, 101, True, 'NaN', 'Infinity', '1.001', None, [], {}, '1e10000'):
             self.assertEqual(self.save_brand(percent).status_code, 400, percent)
         for body in ([], {}, {'discounts': []}, {'discounts': [{'brand': 'Bosch', 'percent': 5}, {'brand': 'BOSCH', 'percent': 6}]}, {'discounts': [{'brand': 'Bosch', 'percent': 5}, {'brand': 'foreign', 'percent': 6}]}):
             result = self.http.patch(self.url, body, content_type='application/json', **self.auth('admin'))

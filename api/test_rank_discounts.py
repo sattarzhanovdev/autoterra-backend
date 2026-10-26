@@ -98,7 +98,7 @@ class RankDiscountTests(TestCase):
 
     def test_rule_of_another_distributor_ignored(self):
         RankDiscount.objects.create(
-            tier=self.platinum, distributor=self.other_distributor, percent=Decimal("50")
+            tier=self.platinum, distributor=self.other_distributor, percent=Decimal("40")
         )
         salon, _ = self._client("salon", "Platinum")
         self.assertEqual(price_for_client(salon, self.paint), Decimal("10000.00"))
@@ -116,8 +116,8 @@ class RankDiscountTests(TestCase):
     def test_rounding_to_kopecks(self):
         self.assertEqual(apply_discount(Decimal("999.99"), Decimal("7.5")), Decimal("924.99"))
 
-    def test_full_discount_is_free_not_negative(self):
-        self.assertEqual(apply_discount(Decimal("100"), Decimal("100")), Decimal("0.00"))
+    def test_full_discount_is_capped(self):
+        self.assertEqual(apply_discount(Decimal("100"), Decimal("100")), Decimal("60.00"))
 
     def test_percent_lookup_without_client(self):
         self.assertEqual(discount_percent(None, self.paint), Decimal("0"))
@@ -187,8 +187,8 @@ class RankDiscountTests(TestCase):
 
         order = Order.objects.get(id=response.json()["order"]["id"])
         item = order.items.first()
-        self.assertEqual(item.price, Decimal("8000.00"))
-        self.assertEqual(item.total, Decimal("16000.00"))
+        self.assertEqual(item.price, Decimal("7650.00"))
+        self.assertEqual(item.total, Decimal("15300.00"))
 
     def test_two_ranks_pay_differently_for_same_product(self):
         RankDiscount.objects.create(tier=self.platinum, percent=Decimal("20"))
@@ -220,7 +220,7 @@ class RankDiscountTests(TestCase):
         )
         order_id = response.json()["order"]["id"]
 
-        RankDiscount.objects.all().update(percent=Decimal("50"))
+        RankDiscount.objects.all().update(percent=Decimal("40"))
 
         item = Order.objects.get(id=order_id).items.first()
         self.assertEqual(item.price, Decimal("8000.00"))

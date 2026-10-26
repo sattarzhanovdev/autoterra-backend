@@ -149,7 +149,7 @@ class ClientPriceTests(_Base):
         self.region.manager = None
         self.region.save()
         for _ in range(2):
-            response = self.http.put(self.url, {'price': '400.00'}, content_type='application/json', **self.auth('admin'))
+            response = self.http.put(self.url, {'price': '600.00'}, content_type='application/json', **self.auth('admin'))
             self.assertIn(response.status_code, (200, 201))
         self.assertEqual(ClientPriceOverride.objects.count(), 1)
         self.assertEqual(AuditLog.objects.filter(model_name='ClientPriceOverride').count(), 2)
@@ -173,7 +173,7 @@ class ClientPriceTests(_Base):
     def test_database_prevents_duplicate_or_nonpositive_override(self):
         self.save_price()
         with self.assertRaises(IntegrityError), transaction.atomic():
-            ClientPriceOverride.objects.create(client=self.client_profile, product=self.product, price=10)
+            ClientPriceOverride.objects.bulk_create([ClientPriceOverride(client=self.client_profile, product=self.product, price=600)])
         with self.assertRaises(IntegrityError), transaction.atomic():
             ClientPriceOverride.objects.update(price=0)
 
@@ -186,7 +186,7 @@ class ClientPriceTests(_Base):
         before = count()
         for n in range(8):
             product = Product.objects.create(distributor=self.distributor, sku=f'P-{n+2}', price=100)
-            ClientPriceOverride.objects.create(client=self.client_profile, product=product, price=50)
+            ClientPriceOverride.objects.create(client=self.client_profile, product=product, price=60)
         self.assertEqual(count(), before)
 
     def test_moved_client_does_not_use_previous_distributor_override(self):
@@ -218,7 +218,7 @@ class ClientPriceTests(_Base):
         self.save_price()
         for n in range(3):
             product = Product.objects.create(distributor=self.distributor, sku=f'NEW-{n}', name=f'Товар {n}', price=100)
-            ClientPriceOverride.objects.create(client=self.client_profile, product=product, price=50)
+            ClientPriceOverride.objects.create(client=self.client_profile, product=product, price=60)
         seen = []
         for page in (1, 2):
             response = self.http.get(self.list_url, {'page': page, 'pageSize': 2}, **self.auth())

@@ -5,11 +5,14 @@
 а если они не заданы — расчёт
 по рангу ClientProfile.partner_status (PartnerTier и RankDiscount).
 
-Единственная точка расчёта — ``price_for_client``. И витрина, и оформление
-заказа зовут её, поэтому цена в каталоге и цена в заказе не могут разойтись.
+``price_details`` / ``price_for_client`` задают клиентскую цену до скидки
+за объём заказа. ``order_discounts.quote_order`` дополняет этот расчёт
+одинаково для корзины, создания и корректировки заказа.
 """
 
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, ROUND_CEILING, Decimal
+
+MAX_DISCOUNT_PERCENT = Decimal("40")
 
 TWO_PLACES = Decimal("0.01")
 
@@ -85,11 +88,12 @@ def discount_percent(client, product) -> Decimal:
 def apply_discount(price, percent) -> Decimal:
     """Цена со скидкой, округлённая до копеек."""
     base = Decimal(str(price or 0))
-    pct = Decimal(str(percent or 0))
+    pct = min(MAX_DISCOUNT_PERCENT, max(Decimal("0"), Decimal(str(percent or 0))))
     if pct <= 0:
         return base.quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
     result = base * (Decimal("100") - pct) / Decimal("100")
-    return max(Decimal("0"), result).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+    floor = (base * (100 - MAX_DISCOUNT_PERCENT) / 100).quantize(TWO_PLACES, rounding=ROUND_CEILING)
+    return max(floor, result.quantize(TWO_PLACES, rounding=ROUND_HALF_UP))
 
 
 def price_for_client(client, product) -> Decimal:
@@ -131,16 +135,18 @@ def price_details(client, product) -> dict:
     brand_discount = brand_discount_percent(client, product)
     percent = brand_discount if brand_discount is not None else personal_discount if personal_discount is not None else discount_percent(client, product)
     base = Decimal(str(product.price or 0)).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+    percent = min(MAX_DISCOUNT_PERCENT, max(Decimal("0"), Decimal(str(percent))))
     final = apply_discount(product.price, percent)
     override = personal_price(client, product)
     if override is not None:
-        final = override
+        final = max(override, (base * (100 - MAX_DISCOUNT_PERCENT) / 100).quantize(TWO_PLACES, rounding=ROUND_CEILING))
         percent = Decimal("0")  # Percentage discounts never stack with an override.
     return {
         "price": final,
         "base_price": base,
         "discount_percent": percent,
-        "has_discount": final < base if override is not None else percent > 0,
+        "has_discount": final < base,
+        "effective_discount_percent": max(Decimal("0"), (base - final) / base * 100) if base > 0 else Decimal("0"),
         "personal_price": override,
         "price_source": "personal" if override is not None else "brand_discount" if brand_discount is not None else "personal_discount" if personal_discount is not None else "rank" if percent > 0 else "base",
     }
