@@ -185,7 +185,7 @@ class AIHistoryTests(TestCase):
         self.chat('Second question', conversationId=data['conversationId'])
         self.client.force_login(self.staff)
         url = reverse('admin:api_aiconversation_changelist')
-        response = self.client.get(url, {'q': '20 degrees', 'review': 'unreviewed'})
+        response = self.client.get(url, {'q': 'Primer drying', 'review': 'unreviewed'})
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, 'chat-expert')
         response = self.client.get(reverse('admin:api_aiconversation_change', args=[data['conversationId']]))

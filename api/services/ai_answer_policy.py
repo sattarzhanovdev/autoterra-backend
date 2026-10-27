@@ -147,8 +147,11 @@ def response_is_grounded(answer, contexts, question):
     return True
 
 
-def evidence_fallback(contexts, *, prefix='Найденные материалы AutoTerra:'):
-    return prefix + '\n\n' + '\n\n'.join(f'[{i}] {c["text"]}' for i, c in enumerate(contexts, 1))
+def evidence_fallback(contexts):
+    """Raw retrieval text and metadata are internal evidence, never UI copy."""
+    return ('Не удалось сформировать достаточно подтверждённый ответ. '
+            'Попробуйте уточнить вопрос: укажите название товара, артикул '
+            'или задачу, с которой нужна помощь.')
 
 
 def clean_client_answer(answer, sources=()):

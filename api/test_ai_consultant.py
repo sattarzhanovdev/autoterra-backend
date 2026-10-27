@@ -107,7 +107,7 @@ class ConsultantTests(TestCase):
                 outcome = grounded_answer('Как смешивать EU-620?', contexts)
         self.assertEqual(outcome.error, 'ungrounded_response')
         self.assertNotIn('9:1', outcome.answer)
-        self.assertIn('4:1:1', outcome.answer)
+        self.assertIn('Не удалось сформировать достаточно подтверждённый ответ.', outcome.answer)
 
     def test_05_plastic_primer_is_selected_by_purpose(self):
         self.assertEqual(self.catalog(self.contexts('Мне нужен грунт для пластика')), ['PL-10'])
@@ -262,7 +262,8 @@ class ConsultantTests(TestCase):
         second = self.client.post('/api/ai/chat/', {'message': 'Как его смешивать?', 'conversationId': first['conversationId']}, content_type='application/json', **auth)
         self.assertEqual(second.status_code, 200)
         self.assertIn('EU-620', [s['sku'] for s in second.json()['sources'] if s['type'] == 'product'])
-        self.assertIn('4:1:1', second.json()['answer'])
+        reply = AIMessage.objects.get(pk=second.json()['messageId'])
+        self.assertTrue(any('4:1:1' in source['excerpt'] for source in reply.sources))
         self.assertEqual(AIMessage.objects.get(pk=second.json()['messageId']).in_reply_to.content, 'Как его смешивать?')
         third = self.client.post('/api/ai/chat/', {'message': 'Есть аналог?', 'conversationId': first['conversationId']}, content_type='application/json', **auth)
         self.assertIn('EU-620', [s['sku'] for s in third.json()['sources'] if s['type'] == 'product'])

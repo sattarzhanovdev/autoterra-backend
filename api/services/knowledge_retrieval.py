@@ -230,7 +230,7 @@ class AnswerResult:
 
 
 def grounded_answer(question, contexts, *, history=()):
-    """No context means no LLM call. Provider failure yields actual excerpts."""
+    """No context means no LLM call. Unusable answers yield safe user-facing copy."""
     from .ai_answer_policy import SYSTEM_PROMPT, evidence_fallback, response_is_grounded
     plan = plan_query(question)
     available_codes = set(code for item in contexts for code in normalize_product_identifiers(
@@ -245,7 +245,7 @@ def grounded_answer(question, contexts, *, history=()):
         return AnswerResult('В доступном ассортименте и технической базе не нашёл подтверждённых материалов для этого запроса. '
             'Уточните название материала или задачу; при необходимости подключим эксперта.', True, 'no_context')
     if not settings.HF_API_TOKEN:
-        return AnswerResult(evidence_fallback(contexts), False, 'excerpts')
+        return AnswerResult(evidence_fallback(contexts), True, 'excerpts')
     context = '\n\n'.join(f'[{i}] {json.dumps(c, ensure_ascii=False)}' for i, c in enumerate(contexts, 1))
     body = {
         'model': settings.HF_CHAT_MODEL,
@@ -275,10 +275,10 @@ def grounded_answer(question, contexts, *, history=()):
             raise ValueError('Invalid answer length')
         if not response_is_grounded(answer['answer'], contexts, question):
             logger.warning('AI provider answer rejected by evidence checks')
-            return AnswerResult(evidence_fallback(contexts, prefix='Ответ модели не прошёл проверку источников. Подтверждённые материалы:'),
+            return AnswerResult(evidence_fallback(contexts),
                 True, 'excerpts', 'ungrounded_response', True)
         return AnswerResult(answer['answer'], answer['insufficient'], attempted=True)
     except Exception:
         logger.warning('AI provider request failed')
-        return AnswerResult(evidence_fallback(contexts, prefix='ИИ временно недоступен. Найденные выдержки из базы знаний:'),
-            False, 'provider_error', 'provider_failed', True)
+        return AnswerResult(evidence_fallback(contexts),
+            True, 'provider_error', 'provider_failed', True)

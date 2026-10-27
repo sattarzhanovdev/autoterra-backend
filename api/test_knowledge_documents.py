@@ -208,11 +208,13 @@ class KnowledgeDocumentTests(TestCase):
         call.assert_not_called()
         self.assertEqual(response.json()['sources'], [])
 
-    def test_provider_failure_returns_excerpts(self):
+    def test_provider_failure_returns_safe_fallback(self):
         self.processed()
         with override_settings(HF_API_TOKEN='test-token'), patch('api.services.knowledge_retrieval.urllib.request.urlopen', side_effect=TimeoutError):
             response = self.client.post('/api/ai/chat/', json.dumps({'message': 'Primer drying'}), content_type='application/json', **self.auth)
-        self.assertIn('20 degrees', response.json()['answer'])
+        self.assertIn('Не удалось сформировать достаточно подтверждённый ответ.', response.json()['answer'])
+        self.assertNotIn('20 degrees', response.json()['answer'])
+        self.assertNotIn('manual.txt', response.json()['answer'])
 
     def test_batch_error_does_not_block_next_file(self):
         self.assertEqual(self.upload('bad.exe', b'MZ', 'application/octet-stream').status_code, 400)

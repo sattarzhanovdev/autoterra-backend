@@ -40,33 +40,44 @@ def record_exchange(user, conversation, message, *, expert=False):
         reply.status = 'invalid'
     else:
         try:
-            # Prior user turns only resolve references; previous assistant
-            # prices/claims never become fresh evidence. Retrieval is scoped anew.
-            history = list(conversation.messages.filter(role='user', pk__lt=question_message.pk)
-                           .order_by('-pk').values_list('content', flat=True)[:4])
-            retrieval_question = question
-            import re
-            from .ai_query import normalize_product_identifiers, plan_query
+            from .ai_query import normalize_product_identifiers, plan_query, words
             plan = plan_query(question)
-            followup = bool(re.search(r'\b(?:его|ее|её|этот|этого|эту|них|ним|него)\b', question, re.I))
-            followup = followup or (plan.intent in ('alternatives', 'application') and not plan.groups)
-            if not plan.identifiers and followup:
-                anchor = next((text for text in history if normalize_product_identifiers(text)), '')
-                if anchor:
-                    retrieval_question += '\nКонтекст вопроса: ' + anchor[:600]
-            contexts = retrieve(retrieval_question, user=user)
-            outcome = grounded_answer(question, contexts, history=[text[:1000] for text in reversed(history)])
-            answer, insufficient = outcome
-            reply.status = outcome.status
-            reply.error = outcome.error
-            reply.insufficient = insufficient
-            if outcome.attempted:
-                reply.provider, reply.model = 'huggingface_router', settings.HF_CHAT_MODEL
-            result = {'answer': answer, 'sources': [item['source'] for item in contexts],
-                      'suggestEscalation': insufficient and not expert}
-            first_card = next((s for s in result['sources'] if s['type'] == 'card'), None)
-            if first_card:
-                result['sourceId'] = first_card['id']
+            if plan.intent == 'smalltalk':
+                if {'спасибо', 'благодарю'}.intersection(words(question)):
+                    answer = ('Пожалуйста! Если понадобится помощь с подбором материалов, товарами '
+                              'или технологией ремонта — спрашивайте.')
+                else:
+                    answer = ('Привет! Я AI-помощник AutoTerra. Могу помочь подобрать товар, найти '
+                              'материал по артикулу, рассказать о применении, сравнить продукты '
+                              'или помочь с техническим вопросом по авторемонту.')
+                result = {'answer': answer, 'sources': [], 'suggestEscalation': False}
+                reply.status = 'completed'
+            else:
+                # Prior user turns only resolve references; previous assistant
+                # prices/claims never become fresh evidence. Retrieval is scoped anew.
+                history = list(conversation.messages.filter(role='user', pk__lt=question_message.pk)
+                               .order_by('-pk').values_list('content', flat=True)[:4])
+                retrieval_question = question
+                import re
+                followup = bool(re.search(r'\b(?:его|ее|её|этот|этого|эту|них|ним|него)\b', question, re.I))
+                followup = followup or (plan.intent in ('alternatives', 'application') and not plan.groups)
+                if not plan.identifiers and followup:
+                    anchor = next((text for text in history if normalize_product_identifiers(text)), '')
+                    if anchor:
+                        retrieval_question += '\nКонтекст вопроса: ' + anchor[:600]
+                contexts = retrieve(retrieval_question, user=user)
+                outcome = grounded_answer(question, contexts, history=[text[:1000] for text in reversed(history)])
+                answer, insufficient = outcome
+                reply.status = outcome.status
+                reply.error = outcome.error
+                reply.insufficient = insufficient
+                if outcome.attempted:
+                    reply.provider, reply.model = 'huggingface_router', settings.HF_CHAT_MODEL
+                result = {'answer': answer, 'sources': [item['source'] for item in contexts],
+                          'suggestEscalation': insufficient and not expert}
+                first_card = next((s for s in result['sources'] if s['type'] == 'card'), None)
+                if first_card:
+                    result['sourceId'] = first_card['id']
         except Exception:
             # No exception strings: database/provider errors may contain private text.
             logger.error('AI exchange processing failed; message_id=%s', reply.pk)

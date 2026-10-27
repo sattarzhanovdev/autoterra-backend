@@ -91,8 +91,20 @@ def matched_groups(value, *, fuzzy=False):
     return tuple(found)
 
 
+# Match the entire utterance, never just a greeting prefix: a greeting can
+# introduce a technical question or an article that still needs retrieval.
+SMALLTALK_RE = re.compile(
+    r'(?:привет|здравствуйте|добрый день|доброе утро|добрый вечер|спасибо|'
+    r'благодарю|кто ты|что ты умеешь|помоги)'
+    r'(?: (?:привет|здравствуйте|добрый день|доброе утро|добрый вечер|спасибо|'
+    r'благодарю|кто ты|что ты умеешь|помоги|пожалуйста))*'
+)
+
+
 def detect_intent(question):
     q = ' '.join(words(question))
+    if SMALLTALK_RE.fullmatch(q):
+        return 'smalltalk'
     if re.search(r'отлич|сравн|разниц|versus|\bvs\b', q):
         return 'comparison'
     if re.search(r'совмест|можно ли.*(?:нанос|лак|баз|грунт)|поверх|сочета', q):
