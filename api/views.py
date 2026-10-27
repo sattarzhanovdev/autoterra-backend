@@ -1303,7 +1303,7 @@ def _format_referral(item):
         "confirmation": item.confirmation,
         # Ставка по достигнутой ступени и сколько уже начислено за этого
         # приглашённого — иначе цифра на бонусном счёте берётся ниоткуда.
-        "bonusRate": float(referral_bonus.rate_for(item.purchase_amount)),
+        "bonusRate": float(referral_bonus.rate_for(item.purchase_amount, referral_bonus.current_rule())),
         "bonusEarned": float(referral_bonus.accrued_for(item)),
         "createdAt": item.created_at.isoformat(),
     }
@@ -1866,12 +1866,14 @@ def products(request):
         .values_list("category", flat=True)
         .distinct()
     )
-    return JsonResponse(paginated_response(
+    response = JsonResponse(paginated_response(
         request,
         qs if search else qs.order_by("category", "name"),
         lambda product: _format_product(product, client),
         extra={"categories": categories},
     ))
+    response["Cache-Control"] = "private, no-store"
+    return response
 
 
 @require_GET
@@ -1933,6 +1935,7 @@ def order_config(request):
     client, err = _require_client(request)
     if err:
         return err
+    from .services.catalog_sync import catalog_revision
     stores_qs = client.stores.filter(is_active=True)
     products_qs = Product.objects.filter(distributor=client.distributor, is_active=True)
     # Здесь только справочники для формы заказа. Сам ассортимент отдаёт
@@ -1945,6 +1948,7 @@ def order_config(request):
         products_qs.order_by("brand").values_list("brand", flat=True).distinct()
     )
     return JsonResponse({
+        "catalogRevision": catalog_revision(client.distributor),
         "client": _format_client(client),
         "distributor": _format_distributor(client.distributor),
         "stores": [_format_store(s) for s in stores_qs],
@@ -3363,6 +3367,7 @@ def erp_stock_update(request):
     if not isinstance(payload, list):
         return JsonResponse({"detail": "Expected a JSON array"}, status=400)
         
+    started_at = timezone.now()
     updated_count = 0
     errors = []
     results = []
@@ -3390,16 +3395,21 @@ def erp_stock_update(request):
 
                 if product:
                     if not dry_run:
+                        if isinstance(quantity, bool) or str(quantity) != str(int(quantity)) or int(quantity) < 0:
+                            raise ValueError("Некорректный остаток")
                         product.quantity = int(quantity)
                         if price is not None:
-                            product.price = Decimal(str(price))
-                        
-                        if product.quantity > 5:
-                            product.status = "inStock"
-                        elif product.quantity > 0:
-                            product.status = "low"
-                        else:
-                            product.status = "outOfStock"
+                            parsed_price = coerce_decimal(price, 12, 2)
+                            if parsed_price is None or parsed_price < 0:
+                                raise ValueError("Некорректная цена")
+                            product.price = parsed_price
+                        product.status = item.get("status", "inStock" if product.quantity > 5 else "low" if product.quantity else "outOfStock")
+                        if product.status not in dict(Product.STOCK_CHOICES):
+                            raise ValueError("Некорректный статус")
+                        if "is_active" in item:
+                            if not isinstance(item["is_active"], bool):
+                                raise ValueError("is_active должен быть boolean")
+                            product.is_active = item["is_active"]
                         product.save()
                     
                     updated_count += 1
@@ -3419,6 +3429,9 @@ def erp_stock_update(request):
             status = f"dry_run_{status}"
 
         details = {
+            "created": 0, "updated": updated_count, "deactivated": 0, "errors": errors,
+            "startedAt": started_at.isoformat(), "finishedAt": timezone.now().isoformat(),
+            "distributorId": distributor.pk, "syncType": "stock_update",
             "updated_count": updated_count,
             "error_count": len(errors),
             "dry_run": dry_run,
@@ -3463,66 +3476,13 @@ def erp_catalog_sync(request):
     if not token:
         return JsonResponse({"detail": "Invalid token"}, status=401)
     
-    distributor = token.distributor
     payload = _json(request)
-    if not isinstance(payload, list):
-        return JsonResponse({"detail": "Expected a JSON array"}, status=400)
-    
-    created_count = 0
-    updated_count = 0
-    errors = []
-    
-    for item in payload:
-        external_id = item.get("external_id")
-        sku = item.get("sku")
-        if not (external_id or sku):
-            errors.append(f"Missing both external_id and sku in item: {item}")
-            continue
-            
-        try:
-            # Try to find existing product
-            product = None
-            if external_id:
-                product = Product.objects.filter(distributor=distributor, external_id=external_id).first()
-            if not product and sku:
-                product = Product.objects.filter(distributor=distributor, sku=sku).first()
-            
-            defaults = {
-                "name": item.get("name", "Новый товар"),
-                "category": item.get("category", "Без категории"),
-                "brand": item.get("brand", "AutoTerra"),
-                "price": Decimal(str(item.get("price", 0))),
-                "quantity": int(item.get("quantity", 0)),
-                "is_active": True,
-            }
-            if external_id: defaults["external_id"] = external_id
-            if sku: defaults["sku"] = sku
-
-            if product:
-                for key, value in defaults.items():
-                    setattr(product, key, value)
-                product.save()
-                updated_count += 1
-            else:
-                Product.objects.create(distributor=distributor, **defaults)
-                created_count += 1
-                
-        except Exception as e:
-            errors.append(f"Error processing {sku or external_id}: {str(e)}")
-
-    SyncLog.objects.create(
-        distributor=distributor,
-        sync_type="catalog_sync",
-        status="success" if not errors else "partial",
-        details={"created": created_count, "updated": updated_count, "errors": errors}
-    )
-    
-    return JsonResponse({
-        "status": "success" if not errors else "partial",
-        "created": created_count,
-        "updated": updated_count,
-        "errors": errors
-    })
+    full_sync = payload.get("fullSync", False) if isinstance(payload, dict) else request.GET.get("fullSync", "false") == "true"
+    items = payload.get("items") if isinstance(payload, dict) else payload
+    if not isinstance(items, list) or not isinstance(full_sync, bool):
+        return JsonResponse({"detail": "Ожидается список items и boolean fullSync"}, status=400)
+    from .services.catalog_sync import sync_catalog
+    return JsonResponse(sync_catalog(token.distributor, items, full_sync=full_sync))
 
 
 @csrf_exempt
@@ -4625,7 +4585,7 @@ def referrals(request):
             # чтобы экран не пересказывал зашитые в него цифры.
             "bonusTiers": [
                 {"from": float(threshold), "rate": float(rate)}
-                for threshold, rate in referral_bonus.tiers()
+                for threshold, rate in referral_bonus.tiers(referral_bonus.current_rule())
             ],
             "activityMin": float(referral_bonus.activity_min()),
             "bonusBalance": float(bonus_balance(client)),
@@ -4730,6 +4690,7 @@ def confirm_referral(request, referral_id):
     if confirmed:
         # Покупки могли быть и до подтверждения — пересчитываем сразу.
         referral.sync_from_invitee()
+        referral_bonus.accrue(referral)
     return JsonResponse({"referral": _format_referral(referral)})
 
 
@@ -6366,3 +6327,14 @@ def android_version(request):
         "latestBuildNumber": release.latest_build_number, "minimumSupportedBuildNumber": release.minimum_supported_build_number,
         "updateAvailable": installed < release.latest_build_number, "forceUpdate": installed < release.minimum_supported_build_number,
         "storeUrl": release.store_url, "message": release.message})
+
+
+@require_GET
+def catalog_state(request):
+    client, error = _require_client(request)
+    if error:
+        return error
+    from .services.catalog_sync import catalog_revision
+    response = JsonResponse({"catalogRevision": catalog_revision(client.distributor)})
+    response["Cache-Control"] = "private, no-store"
+    return response

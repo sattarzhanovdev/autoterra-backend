@@ -19,7 +19,11 @@ class ApiStatelessMiddleware:
                     '/api/integration/erp/stock-update/',
                     '/api/integration/erp/catalog-sync/',
                 }
-                valid = (isinstance(payload, list) and all(isinstance(item, dict) for item in payload)
+                if request.path == '/api/integration/erp/catalog-sync/' and isinstance(payload, dict):
+                    rows = payload.get('items')
+                    valid = isinstance(rows, list) and all(isinstance(item, dict) for item in rows)
+                else:
+                    valid = (isinstance(payload, list) and all(isinstance(item, dict) for item in payload)
                          if request.path in array_endpoints else isinstance(payload, dict))
                 if not valid:
                     return JsonResponse({'detail': 'Некорректная структура запроса'}, status=400)

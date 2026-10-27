@@ -55,9 +55,9 @@ class Command(BaseCommand):
                 continue
 
             volume = referral.purchase_amount
-            should_have = rb.earned_for(volume)
             already = rb.accrued_for(referral)
-            delta = should_have - already
+            delta = sum((row["amount"] for row in rb.accrual_plan(referral)), rb.ZERO)
+            should_have = already + delta
             if delta > 0:
                 planned.append((referral, volume, should_have, already, delta))
 

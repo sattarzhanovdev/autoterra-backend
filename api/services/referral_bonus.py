@@ -1,27 +1,5 @@
-"""Начисление реферального бонуса процентом от закупок приглашённого.
-
-Прежняя схема была плоской: приглашённый набрал 30 000 ₽ — пригласивший получил
-сертификат на 5 000 ₽. Это 16,7% от оборота, что заметно выше маржи, поэтому
-её заменили ставкой по ступеням.
-
-Как считается
-─────────────
-Ступень определяется накопленным оборотом **каждого приглашённого СТО по
-отдельности**, а ставка применяется ко всему его обороту, а не к остатку сверх
-ступени. Приглашённый закупил на 300 000 ₽ → ступень 200 000 (1,5%) → бонус
-4 500 ₽.
-
-Начисляем разницей: при переходе на следующую ступень ставка растёт задним
-числом на весь оборот, и пригласившему доначисляется только то, чего не
-хватает до новой суммы. Так повторный вызов ничего не задваивает — сколько
-уже начислено, видно по реестру BonusTransaction.
-
-Сгорание
-────────
-Пригласивший должен закупаться сам: если за календарный месяц его собственные
-подтверждённые закупки не дотянули до REFERRAL_ACTIVITY_MIN, весь накопленный
-бонусный баланс сгорает. Сгорание — такая же операция в реестре, поэтому по
-счёту всегда видно, что и когда списали.
+"""Immutable referral accruals: each confirmed operation uses its effective rules.
+Historical transactions and processed source events are never repriced.
 """
 
 import logging
@@ -51,8 +29,8 @@ DEFAULT_TIERS = (
 DEFAULT_ACTIVITY_MIN = Decimal(10000)
 
 
-def tiers() -> tuple[tuple[Decimal, Decimal], ...]:
-    raw = getattr(settings, "REFERRAL_BONUS_TIERS", None)
+def tiers(version=None) -> tuple[tuple[Decimal, Decimal], ...]:
+    raw = version.tiers if version is not None else getattr(settings, "REFERRAL_BONUS_TIERS", None)
     if not raw:
         return DEFAULT_TIERS
     parsed = tuple(
@@ -61,15 +39,24 @@ def tiers() -> tuple[tuple[Decimal, Decimal], ...]:
     return tuple(sorted(parsed, key=lambda item: item[0]))
 
 
-def activity_min() -> Decimal:
-    return Decimal(str(getattr(settings, "REFERRAL_ACTIVITY_MIN", DEFAULT_ACTIVITY_MIN)))
+def current_rule(at=None):
+    from django.utils import timezone
+    from api.models import ReferralRuleVersion
+    rule = ReferralRuleVersion.objects.filter(effective_from__lte=at or timezone.now()).order_by("-effective_from").first()
+    if rule is None:
+        raise ValueError("Не настроена версия реферальных условий")
+    return rule
 
 
-def rate_for(volume) -> Decimal:
+def activity_min(at=None) -> Decimal:
+    return current_rule(at).activity_min
+
+
+def rate_for(volume, version=None) -> Decimal:
     """Ставка в процентах для накопленного оборота приглашённого."""
     volume = Decimal(volume or 0)
     rate = ZERO
-    for threshold, tier_rate in tiers():
+    for threshold, tier_rate in tiers(version):
         if volume >= threshold:
             rate = tier_rate
         else:
@@ -108,44 +95,51 @@ def accrued_for(referral) -> Decimal:
     return Decimal(total or 0).quantize(CENTS)
 
 
-def accrue(referral) -> Decimal:
-    """Доначислить пригласившему то, чего не хватает до текущей ступени.
+def source_operations(referral):
+    from api.models import ClientProfile
+    client = ClientProfile.objects.filter(inn=referral.invitee_inn).first()
+    if client is None:
+        return []
+    operations = [(p.verified_at or p.created_at, "purchase", p.pk, Decimal(p.total_amount))
+                  for p in client.purchases.filter(status="verified")]
+    operations += [(o.confirmed_at or o.created_at, "order", o.pk, Decimal(o.total_amount))
+                   for o in client.orders.filter(status="fulfilled").prefetch_related("items")]
+    return sorted(operations, key=lambda row: (row[0], row[1], row[2]))
 
-    Возвращает начисленную сумму. Повторный вызов без новых закупок вернёт 0.
-    """
-    from api.models import BonusTransaction, ClientProfile
 
+def accrual_plan(referral):
+    from api.models import ReferralAccrual
+    turnover = ZERO
+    planned = []
     if not referral.counts_toward_bonus:
-        # Заявку ещё не подтвердил приглашённый — платить не за что.
-        return ZERO
+        return planned
+    for confirmed, kind, source_id, volume in source_operations(referral):
+        turnover += volume
+        lookup = {f"{kind}_id": source_id, "referral": referral}
+        if ReferralAccrual.objects.filter(**lookup).exists():
+            continue
+        rule = current_rule(confirmed)
+        amount = (volume * rate_for(turnover, rule) / Decimal(100)).quantize(CENTS, rounding=ROUND_HALF_UP)
+        planned.append(dict(lookup=lookup, rule=rule, confirmed=confirmed, turnover=turnover, amount=amount, volume=volume, kind=kind, source_id=source_id))
+    return planned
 
-    volume = Decimal(referral.purchase_amount or 0)
-    should_have = earned_for(volume)
 
+def accrue(referral) -> Decimal:
+    from api.models import BonusTransaction, ClientProfile, Referral, ReferralAccrual
     with transaction.atomic():
-        # Блокируем пригласившего: две оплаты приглашённого, пришедшие разом,
-        # иначе прочитают одну и ту же «уже начислено» и доначислят дважды.
         ClientProfile.objects.select_for_update().get(pk=referral.inviter_id)
-
-        delta = (should_have - accrued_for(referral)).quantize(CENTS)
-        if delta <= ZERO:
+        referral = Referral.objects.select_for_update().get(pk=referral.pk)
+        if not referral.counts_toward_bonus:
             return ZERO
-
-        BonusTransaction.objects.create(
-            client=referral.inviter,
-            amount=delta,
-            kind="referral",
-            referral=referral,
-            comment=(
-                f"{rate_for(volume)}% от закупок «{referral.invitee_name}» "
-                f"({volume.quantize(CENTS)} ₽)"
-            ),
-        )
-        logger.info(
-            "Реферальный бонус: +%s пригласившему %s за %s",
-            delta, referral.inviter_id, referral.invitee_inn,
-        )
-        return delta
+        credited = ZERO
+        for row in accrual_plan(referral):
+            event = ReferralAccrual.objects.create(**row['lookup'], version=row['rule'], confirmed_at=row['confirmed'], turnover=row['turnover'], amount=row['amount'])
+            if row['amount'] > ZERO:
+                BonusTransaction.objects.create(client=referral.inviter, referral=referral, referral_event=event,
+                    order_id=row['source_id'] if row['kind'] == "order" else None, kind="referral", amount=row['amount'],
+                    comment=f"{rate_for(row['turnover'], row['rule'])}% за подтверждённую покупку «{referral.invitee_name}» ({row['volume']:.2f} ₽)")
+                credited += row['amount']
+        return credited
 
 
 def monthly_purchases(client, year: int, month: int) -> Decimal:
@@ -175,7 +169,11 @@ def expire_if_inactive(client, year: int, month: int) -> Decimal:
     from api.models import BonusTransaction, ClientProfile
     from api.services.bonuses import balance
 
-    if monthly_purchases(client, year, month) >= activity_min():
+    from datetime import datetime, timedelta
+    from django.utils import timezone
+    next_month = datetime(year + (month == 12), 1 if month == 12 else month + 1, 1)
+    period_end = timezone.make_aware(next_month, timezone.get_current_timezone()) - timedelta(microseconds=1)
+    if monthly_purchases(client, year, month) >= activity_min(period_end):
         return ZERO
 
     marker = f"Сгорание за {month:02d}.{year}"

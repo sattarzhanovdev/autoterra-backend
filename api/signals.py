@@ -229,6 +229,9 @@ def _purchase_pre_save(sender, instance, **kwargs) -> None:
     if kwargs.get("raw"):
         return
     _stash_status(instance, sender, "_pre_status")
+    if instance.status == "verified" and getattr(instance, "_pre_status", None) != "verified":
+        from django.utils import timezone
+        instance.verified_at = timezone.now()
 
 
 @receiver(post_save, sender="api.Purchase")

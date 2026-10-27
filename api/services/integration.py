@@ -88,51 +88,19 @@ class IntegrationService:
     def __init__(self, strategy: IntegrationStrategy):
         self.strategy = strategy
 
-    def sync_products(self, distributor: Distributor):
-        """
-        Synchronize product catalog from 1C.
-        Matches by external_id or SKU.
-        """
-        data = self.strategy.fetch_products()
-        processed = 0
-        for item in data:
-            defaults = {
-                "sku": item.get("sku"),
-                "name": item.get("name"),
-                "category": item.get("category"),
-                "brand": item.get("brand"),
-                "price": item.get("price"),
-                "is_active": True,
-            }
-            # Фото (ссылки) — только если 1С их прислала, иначе сохраняем то,
-            # что загружено из Excel.
-            if "images" in item:
-                defaults["images"] = normalize_product_images(item.get("images"))
-            with transaction.atomic():
-                Product.objects.update_or_create(
-                    distributor=distributor,
-                    external_id=item.get("external_id"),
-                    defaults=defaults,
-                )
-            processed += 1
-        return processed
+    def sync_products(self, distributor: Distributor, *, full_sync=False):
+        from .catalog_sync import sync_catalog
+        result = sync_catalog(distributor, self.strategy.fetch_products(), full_sync=full_sync)
+        if result["errors"]:
+            logger.error("Catalog sync errors: %s", result["errors"])
+        return result["created"] + result["updated"]
 
     def sync_stock(self, distributor: Distributor):
-        """
-        Update stock levels (quantity and status) from 1C.
-        """
-        data = self.strategy.fetch_stock()
-        processed = 0
-        for item in data:
-            Product.objects.filter(
-                distributor=distributor,
-                external_id=item.get("external_id")
-            ).update(
-                quantity=item.get("quantity", 0),
-                status=item.get("status", "inStock")
-            )
-            processed += 1
-        return processed
+        from .catalog_sync import sync_catalog
+        result = sync_catalog(distributor, self.strategy.fetch_stock(), allow_create=False, sync_type="stock_update")
+        if result["errors"]:
+            logger.error("Stock sync errors: %s", result["errors"])
+        return result["updated"]
 
     def sync_clients(self, distributor: Distributor):
         """

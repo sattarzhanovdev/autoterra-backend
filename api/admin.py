@@ -1446,3 +1446,21 @@ from .models import AndroidRelease
 @admin.register(AndroidRelease)
 class AndroidReleaseAdmin(admin.ModelAdmin):
     list_display = ("store", "latest_version_name", "latest_build_number", "minimum_supported_build_number")
+
+
+from .models import ReferralRuleVersion, ReferralAccrual
+
+@admin.register(ReferralRuleVersion)
+class ReferralRuleVersionAdmin(admin.ModelAdmin):
+    list_display = ("effective_from", "tiers", "activity_min")
+    def has_delete_permission(self, request, obj=None):
+        return False
+    def has_change_permission(self, request, obj=None):
+        return super().has_change_permission(request, obj) and (obj is None or obj.effective_from > timezone.now())
+
+@admin.register(ReferralAccrual)
+class ReferralAccrualAdmin(admin.ModelAdmin):
+    list_display = ("id", "referral", "version", "confirmed_at", "turnover", "amount", "legacy_snapshot")
+    def has_add_permission(self, request): return False
+    def has_change_permission(self, request, obj=None): return False
+    def has_delete_permission(self, request, obj=None): return False

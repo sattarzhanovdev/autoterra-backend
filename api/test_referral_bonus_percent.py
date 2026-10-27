@@ -117,8 +117,8 @@ class AccrualTests(_Base):
         self.assertEqual(rb.accrue(referral), Decimal("0.00"))
         self.assertEqual(balance(self.inviter), Decimal("4500.00"))
 
-    def test_tier_upgrade_tops_up_retroactively(self):
-        """Ставка растёт на весь оборот, доначисляем только разницу."""
+    def test_tier_upgrade_only_applies_to_new_confirmed_operation(self):
+        """Подтверждённые операции сохраняют ранее зафиксированные ставки."""
         self._referral()
         self._purchase(self.invitee, 100_000)
         self.assertEqual(balance(self.inviter), Decimal("1000.00"))  # 1% от 100k
@@ -127,7 +127,7 @@ class AccrualTests(_Base):
         # Доначислить должно ровно 2 000, а не начислить 3 000 поверх старого.
         self._purchase(self.invitee, 100_000)
 
-        self.assertEqual(balance(self.inviter), Decimal("3000.00"))
+        self.assertEqual(balance(self.inviter), Decimal("2500.00"))
 
     def test_accrue_computes_delta_when_called_directly(self):
         """Связку могли завести уже после закупок — тогда считаем всё разом."""
@@ -219,7 +219,7 @@ class ExpiryTests(_Base):
         # Приглашённый закупает ещё — начисляем только прирост, не всё заново.
         self._purchase(self.invitee, 100_000)
 
-        self.assertEqual(balance(self.inviter), Decimal("2000.00"))
+        self.assertEqual(balance(self.inviter), Decimal("1500.00"))
 
     def test_expiry_leaves_a_trace_in_the_ledger(self):
         self._earn()

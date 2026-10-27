@@ -515,6 +515,8 @@ class ProductQuerySet(models.QuerySet):
             return result
 
     def update(self, **kwargs):
+        from django.utils import timezone
+        kwargs["updated_at"] = timezone.now()
         if not self.SEARCH_FIELDS.intersection(kwargs):
             return super().update(**kwargs)
         from api.services.product_names import normalize_product_synonyms, product_search_text
@@ -618,6 +620,8 @@ class Product(models.Model):
                 kwargs["update_fields"] = set(fields) | {"search_text"}
             else:
                 self.search_text = product_search_text(self)
+        if kwargs.get("update_fields") is not None:
+            kwargs["update_fields"] = set(kwargs["update_fields"]) | {"updated_at"}
         super().save(*args, **kwargs)
 
     def __str__(self):
@@ -928,6 +932,8 @@ class Payment(models.Model):
 
 
 class Purchase(models.Model):
+    verified_at = models.DateTimeField("Дата подтверждения", null=True, blank=True)
+
     STATUS_CHOICES = [
         ("new", "Новая"),
         ("pending", "На проверке"),
@@ -949,6 +955,14 @@ class Purchase(models.Model):
     document_hash = models.CharField("Хэш документа", max_length=64, blank=True, db_index=True)
     rejection_reason = models.TextField("Причина отклонения", blank=True)
     created_at = models.DateTimeField("Создана", auto_now_add=True)
+
+    def save(self, *args, **kwargs):
+        if self.status == "verified" and self.verified_at is None:
+            from django.utils import timezone
+            self.verified_at = timezone.now()
+        if kwargs.get("update_fields") is not None and self.verified_at is not None:
+            kwargs["update_fields"] = set(kwargs["update_fields"]) | {"verified_at"}
+        return super().save(*args, **kwargs)
 
     class Meta:
         verbose_name = "Покупка"
@@ -1643,6 +1657,8 @@ class BonusTransaction(models.Model):
         ("manual", "Ручная корректировка"),
     ]
 
+    referral_event = models.OneToOneField("ReferralAccrual", on_delete=models.PROTECT, null=True, blank=True, related_name="transaction")
+
     client = models.ForeignKey(
         ClientProfile,
         on_delete=models.CASCADE,
@@ -2032,3 +2048,56 @@ class AndroidRelease(models.Model):
     class Meta:
         verbose_name = "Версия Android (после публикации в магазине)"
         constraints = [models.CheckConstraint(condition=models.Q(minimum_supported_build_number__lte=models.F("latest_build_number")), name="android_min_lte_latest")]
+
+
+class ReferralRuleVersion(models.Model):
+    effective_from = models.DateTimeField("Действует с", unique=True)
+    tiers = models.JSONField("Ступени: [[оборот, процент], ...]")
+    activity_min = models.DecimalField("Минимум активности", max_digits=12, decimal_places=2, default=10000)
+
+    def clean(self):
+        from django.utils import timezone
+        from decimal import InvalidOperation
+        try:
+            parsed = [(Decimal(str(a)), Decimal(str(b))) for a, b in self.tiers]
+            if not parsed or parsed[0][0] != 0 or any(not a.is_finite() or not b.is_finite() or a < 0 or not 0 <= b <= 100 for a, b in parsed) or any(parsed[i][0] >= parsed[i+1][0] for i in range(len(parsed)-1)):
+                raise ValueError
+            if self.activity_min < 0:
+                raise ValueError
+        except (TypeError, ValueError, InvalidOperation):
+            raise ValidationError("Укажите возрастающие ступени от нуля и корректные проценты")
+        if self.pk:
+            old = type(self).objects.get(pk=self.pk)
+            if old.effective_from <= timezone.now() or old.accruals.exists():
+                if any(getattr(old, f) != getattr(self, f) for f in ("effective_from", "tiers", "activity_min")):
+                    raise ValidationError("Вступившие в силу правила неизменяемы. Создайте новую версию.")
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"Условия с {self.effective_from:%d.%m.%Y %H:%M}"
+
+    class Meta:
+        ordering = ("-effective_from",)
+        verbose_name = "Версия реферальных условий"
+        verbose_name_plural = "Версии реферальных условий"
+
+
+class ReferralAccrual(models.Model):
+    referral = models.ForeignKey(Referral, on_delete=models.PROTECT, related_name="accrual_events")
+    version = models.ForeignKey(ReferralRuleVersion, on_delete=models.PROTECT, related_name="accruals")
+    purchase = models.ForeignKey(Purchase, on_delete=models.PROTECT, null=True, blank=True)
+    order = models.ForeignKey(Order, on_delete=models.PROTECT, null=True, blank=True)
+    confirmed_at = models.DateTimeField()
+    turnover = models.DecimalField(max_digits=16, decimal_places=2)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    legacy_snapshot = models.BooleanField(default=False)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["referral", "purchase"], condition=models.Q(purchase__isnull=False), name="unique_referral_purchase_accrual"),
+            models.UniqueConstraint(fields=["referral", "order"], condition=models.Q(order__isnull=False), name="unique_referral_order_accrual"),
+            models.CheckConstraint(condition=(models.Q(purchase__isnull=False, order__isnull=True) | models.Q(purchase__isnull=True, order__isnull=False)), name="referral_accrual_one_source"),
+        ]
