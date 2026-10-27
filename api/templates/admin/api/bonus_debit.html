@@ -1,0 +1,1 @@
+{% extends "admin/base_site.html" %}{% block content %}<form method="post">{% csrf_token %}{{ form.as_p }}<p>Текущий баланс: {{ balance|default_if_none:"Выберите клиента и нажмите «Показать баланс»" }} ₽</p><button type="submit" name="preview" value="1" formnovalidate>Показать баланс</button><button type="submit">Подтвердить списание</button></form>{% endblock %}

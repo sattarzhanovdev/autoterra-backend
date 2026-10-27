@@ -73,6 +73,9 @@ def record_exchange(user, conversation, message, *, expert=False):
             reply.status, reply.error, http_status = 'error', 'processing_failed', 503
             result = {'answer': 'ИИ временно недоступен. Попробуйте позже или обратитесь к эксперту.',
                       'sources': [], 'suggestEscalation': not expert}
+    if 'answer' in result:
+        from .ai_answer_policy import clean_client_answer
+        result['answer'] = clean_client_answer(result['answer'], result.get('sources', []))
     reply.content = result.get('answer', result.get('detail', ''))
     reply.sources = [dict(item['source'], excerpt=item['text']) for item in contexts]
     reply.latency_ms = max(0, round((time.monotonic() - started) * 1000))

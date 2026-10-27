@@ -750,6 +750,8 @@ class RankDiscount(models.Model):
 
 
 class Order(models.Model):
+    bonus_requested = models.DecimalField("Выбранные бонусы", max_digits=12, decimal_places=2, default=0)
+
     STATUS_CHOICES = [
         ("new", "Новый"),                # клиент оформил, ждёт проверки оператором
         ("confirmed", "Подтверждён"),    # оператор подтвердил наличие, готов к оплате
@@ -1410,9 +1412,9 @@ class Referral(models.Model):
         
         # Order.total_amount is a property, sum it manually from the queryset
         orders = invitee.orders.filter(status="fulfilled").prefetch_related("items")
-        order_total = sum((o.total_amount for o in orders), start=0)
+        order_total = sum((o.total_amount for o in orders), start=Decimal("0.00"))
         
-        amount = float(purchase_total) + float(order_total)
+        amount = Decimal(purchase_total) + Decimal(order_total)
 
         updates = []
         if not self.is_registered:
@@ -1423,7 +1425,7 @@ class Referral(models.Model):
             self.has_purchase = True
             updates.append("has_purchase")
             
-        if float(self.purchase_amount) != amount:
+        if self.purchase_amount != amount:
             self.purchase_amount = amount
             updates.append("purchase_amount")
             
@@ -2007,3 +2009,26 @@ class RegistrationEmailDelivery(models.Model):
     attempts = models.PositiveIntegerField(default=0)
     locked_until = models.DateTimeField(null=True, blank=True)
     last_error = models.CharField(max_length=255, blank=True)
+
+
+class AndroidRelease(models.Model):
+    store = models.CharField("Магазин", max_length=20, unique=True, choices=[("google_play", "Google Play"), ("rustore", "RuStore")])
+    latest_version_name = models.CharField("Последняя опубликованная версия", max_length=40)
+    latest_build_number = models.PositiveIntegerField("Опубликованный build number")
+    minimum_supported_build_number = models.PositiveIntegerField("Минимальный build number", default=0)
+    store_url = models.URLField("Ссылка на приложение")
+    message = models.TextField("Текст обновления", blank=True)
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+        from urllib.parse import urlsplit
+        host = urlsplit(self.store_url).hostname
+        allowed = {"google_play": {"play.google.com"}, "rustore": {"rustore.ru", "www.rustore.ru"}}
+        if urlsplit(self.store_url).scheme != "https" or host not in allowed.get(self.store, set()):
+            raise ValidationError({"store_url": "Укажите HTTPS-ссылку соответствующего магазина"})
+        if self.minimum_supported_build_number > self.latest_build_number:
+            raise ValidationError("Минимальная версия не может превышать опубликованную")
+
+    class Meta:
+        verbose_name = "Версия Android (после публикации в магазине)"
+        constraints = [models.CheckConstraint(condition=models.Q(minimum_supported_build_number__lte=models.F("latest_build_number")), name="android_min_lte_latest")]

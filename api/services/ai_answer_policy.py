@@ -149,3 +149,18 @@ def response_is_grounded(answer, contexts, question):
 
 def evidence_fallback(contexts, *, prefix='Найденные материалы AutoTerra:'):
     return prefix + '\n\n' + '\n\n'.join(f'[{i}] {c["text"]}' for i, c in enumerate(contexts, 1))
+
+
+def clean_client_answer(answer, sources=()):
+    """Presentation only: retrieval, grounding and stored evidence remain intact."""
+    answer = re.split(r"(?im)^\s*#{0,6}\s*\*{0,2}(?:Источники|Sources|References)\*{0,2}\s*:?.*$", answer)[0]
+    answer = re.sub(r"\[\^?\d+(?:\s*[,;–-]\s*\d+)*\]", "", answer)
+    answer = re.sub(r"【[^】]*】|<cite[^>]*>.*?</cite>", "", answer, flags=re.S)
+    answer = re.sub(r"\[([^]]+)\]\(https?://[^)]+\)", r"\1", answer)
+    answer = re.sub(r"https?://\S+", "", answer)
+    for source in sources:
+        for key in ("filename", "title"):
+            name = source.get(key)
+            if name and source.get("type") != "product":
+                answer = answer.replace(name, "")
+    return re.sub(r"[ \t]+([.,;:!?])", r"\1", answer).strip()

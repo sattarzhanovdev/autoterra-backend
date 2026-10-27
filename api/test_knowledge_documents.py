@@ -200,7 +200,7 @@ class KnowledgeDocumentTests(TestCase):
         body = json.loads(request.data)
         self.assertIn('20 degrees', body['messages'][1]['content'])
         self.assertIn('только по предоставленным', body['messages'][0]['content'])
-        self.assertEqual(response.json()['answer'], 'Температура 20 градусов [1].')
+        self.assertEqual(response.json()['answer'], 'Температура 20 градусов.')
 
     def test_chat_without_context_never_calls_provider(self):
         with override_settings(HF_API_TOKEN='test-token'), patch('api.services.knowledge_retrieval.urllib.request.urlopen') as call:

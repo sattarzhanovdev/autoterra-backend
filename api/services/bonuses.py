@@ -12,7 +12,7 @@
 """
 
 import logging
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 
 from django.db import transaction
 from django.db.models import Sum
@@ -37,18 +37,21 @@ def spendable_for_order(client, order_total: Decimal) -> Decimal:
     available = balance(client)
     if available <= ZERO or order_total <= ZERO:
         return ZERO
-    return min(available, Decimal(order_total)).quantize(Decimal("0.01"))
+    return min(available, (Decimal(order_total) * Decimal("0.10")).quantize(Decimal("0.01"), rounding=ROUND_DOWN)).quantize(Decimal("0.01"))
 
 
 def debit_for_order(client, order, requested: Decimal):
     """Списать бонусы в счёт заказа. Возвращает фактически списанную сумму.
 
-    Списываем не больше баланса и не больше суммы заказа — переплатить
-    бонусами нельзя, остаток должен оставаться на счёте.
+    Списываем не больше баланса и 10% итоговой суммы заказа после скидок.
+    Остаток остаётся на бонусном счёте.
     """
     from api.models import BonusTransaction, ClientProfile
 
-    requested = min(Decimal(requested or 0), Decimal(order.total_amount)).quantize(Decimal("0.01"))
+    requested = Decimal(requested or 0)
+    if not requested.is_finite() or requested < ZERO:
+        raise ValueError("Некорректная сумма бонусов")
+    requested = requested.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
     if requested <= ZERO:
         return ZERO
 
@@ -112,3 +115,32 @@ def refund_for_order(order):
         )
         logger.info("Бонус возвращён по заказу %s: %s", order.pk, amount)
         return amount
+
+
+def quote(client, total, requested=ZERO):
+    requested = Decimal(str(requested))
+    if not requested.is_finite() or requested < ZERO or requested > Decimal("9999999999.99") or requested.as_tuple().exponent < -2:
+        raise ValueError("Некорректная сумма бонусов")
+    maximum = spendable_for_order(client, total)
+    applied = min(requested, maximum)
+    return {"balance": str(balance(client)), "maxAllowed": str(maximum),
+            "requested": str(requested), "applied": str(applied),
+            "payableTotal": str((Decimal(total) - applied).quantize(Decimal("0.01")))}
+
+
+def manual_debit(client, amount, reason, actor):
+    from api.models import BonusTransaction, ClientProfile, AuditLog
+    if not actor.is_active or not actor.is_staff or not actor.has_perm("api.add_bonustransaction"):
+        from django.core.exceptions import PermissionDenied
+        raise PermissionDenied
+    amount = Decimal(str(amount))
+    reason = reason.strip()
+    if not amount.is_finite() or amount <= ZERO or amount.as_tuple().exponent < -2 or not reason or len(reason) > 255:
+        raise ValueError("Укажите положительную сумму и причину (до 255 символов)")
+    with transaction.atomic():
+        ClientProfile.objects.select_for_update().get(pk=client.pk)
+        if amount > balance(client):
+            raise ValueError("Нельзя списать больше текущего баланса")
+        entry = BonusTransaction.objects.create(client=client, amount=-amount, kind="manual", comment=reason)
+        AuditLog.objects.create(user=actor, action="Manual bonus debit", model_name="BonusTransaction", object_id=str(entry.pk), changes={"amount": str(-amount), "reason": reason, "clientId": client.pk})
+        return entry

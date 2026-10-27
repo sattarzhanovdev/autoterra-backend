@@ -171,14 +171,14 @@ class PaymentTests(_Base):
                          Decimal(body["amount"]["value"]))
         self.assertTrue(all(Decimal(item["amount"]["value"]) > 0 for item in items))
 
-    def test_unrepresentable_bonus_payment_rolls_back_bonus(self):
+    def test_tiny_order_bonus_stays_within_ten_percent_and_keeps_receipt_valid(self):
         self.order.items.update(price=Decimal("1.00"), quantity=2)
         self._credit(Decimal("1.99"))
-        with patch.object(payments, "create_payment") as create:
-            self.assertEqual(self.pay(useBonus="1.99").status_code, 400)
-            create.assert_not_called()
-        self.assertEqual(bonuses.balance(self.client_profile), Decimal("1.99"))
-        self.assertFalse(Payment.objects.exists())
+        with patch.object(payments, "create_payment", return_value=self.response(amount="1.80")) as create:
+            self.assertEqual(self.pay(useBonus="1.99").status_code, 201)
+            self.assertEqual(create.call_args.kwargs["amount"], Decimal("1.80"))
+        self.assertEqual(bonuses.balance(self.client_profile), Decimal("1.79"))
+        self.assertEqual(Payment.objects.count(), 1)
 
     def webhook(self, event="payment.succeeded"):
         return self.http.post("/api/payments/yookassa/webhook/",
@@ -228,29 +228,29 @@ class PaymentTests(_Base):
         with patch.object(payments, "create_payment", side_effect=payments.PaymentUncertainError("timeout")) as create:
             self.assertEqual(self.pay(useBonus=200).status_code, 503)
             first = create.call_args.kwargs.copy()
-        self.assertEqual(bonuses.balance(self.client_profile), Decimal("0"))
-        with patch.object(payments, "create_payment", return_value=self.response(amount="800.00")) as create:
+        self.assertEqual(bonuses.balance(self.client_profile), Decimal("100"))
+        with patch.object(payments, "create_payment", return_value=self.response(amount="900.00")) as create:
             self.assertEqual(self.pay(useBonus=0).status_code, 201)
             self.assertEqual(create.call_args.kwargs["idempotence_key"], first["idempotence_key"])
             self.assertEqual(create.call_args.kwargs["request_body"], first["request_body"])
             receipt = first["request_body"]["receipt"]
-            self.assertEqual(receipt["items"][0]["amount"]["value"], "800.00")
+            self.assertEqual(receipt["items"][0]["amount"]["value"], "900.00")
             self.assertEqual(sum(Decimal(item["amount"]["value"]) * item["quantity"]
-                                 for item in receipt["items"]), Decimal("800.00"))
+                                 for item in receipt["items"]), Decimal("900.00"))
         self.assertEqual(Payment.objects.count(), 1)
         self.assertEqual(BonusTransaction.objects.filter(kind="order").count(), 1)
 
     def test_cancellation_refunds_once_and_retry_debits_again(self):
         self._credit(200)
         bonuses.debit_for_order(self.client_profile, self.order, Decimal(200))
-        self.pending(800)
-        with patch.object(payments, "fetch_payment", return_value=self.response("canceled", amount="800.00")):
+        self.pending(900)
+        with patch.object(payments, "fetch_payment", return_value=self.response("canceled", amount="900.00")):
             self.webhook("payment.canceled")
             self.webhook("payment.canceled")
         self.assertEqual(bonuses.balance(self.client_profile), Decimal(200))
-        with patch.object(payments, "create_payment", return_value=self.response(amount="800.00", id="provider-2")):
+        with patch.object(payments, "create_payment", return_value=self.response(amount="900.00", id="provider-2")):
             self.assertEqual(self.pay(useBonus=200).status_code, 201)
-        self.assertEqual(bonuses.balance(self.client_profile), Decimal(0))
+        self.assertEqual(bonuses.balance(self.client_profile), Decimal(100))
 
     def test_pending_payment_blocks_cancellation(self):
         self.pending()
@@ -323,20 +323,20 @@ class PaymentTests(_Base):
         with patch.object(payments, "create_payment", side_effect=payments.PaymentProviderError("401")):
             self.assertEqual(self.pay().status_code, 503)
         self.assertEqual(Payment.objects.get(order=self.order).status, "pending")
-        self.assertEqual(bonuses.balance(self.client_profile), Decimal(0))
+        self.assertEqual(bonuses.balance(self.client_profile), Decimal(100))
 
     def test_malformed_provider_response_preserves_attempt_and_bonus(self):
         self._credit(200)
-        invalid = [None, [], "invalid", self.response(amount="800.00", id=123),
-                   self.response(amount="800.00", confirmation=["broken"]),
-                   self.response(amount="800.00", confirmation={"confirmation_url": "javascript:alert(1)"}),
-                   self.response(amount="800.00", confirmation={"confirmation_url": 123})]
+        invalid = [None, [], "invalid", self.response(amount="900.00", id=123),
+                   self.response(amount="900.00", confirmation=["broken"]),
+                   self.response(amount="900.00", confirmation={"confirmation_url": "javascript:alert(1)"}),
+                   self.response(amount="900.00", confirmation={"confirmation_url": 123})]
         for response in invalid:
             with self.subTest(response=response), patch.object(payments, "create_payment", return_value=response):
                 self.assertEqual(self.pay(useBonus=200).status_code, 503)
         self.assertEqual(Payment.objects.count(), 1)
         self.assertEqual(Payment.objects.get().status, "pending")
-        self.assertEqual(bonuses.balance(self.client_profile), Decimal(0))
+        self.assertEqual(bonuses.balance(self.client_profile), Decimal(100))
 
     def test_refresh_without_confirmation_preserves_payment_link(self):
         payment = self.pending()

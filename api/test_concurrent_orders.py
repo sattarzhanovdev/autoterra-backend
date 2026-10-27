@@ -83,6 +83,6 @@ class ConcurrentOrderTests(TransactionTestCase):
 
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(refund, range(2)))
-        self.assertEqual(sorted(results), [0, 200])
+        self.assertEqual(sorted(results), [0, 20])
         self.assertEqual(bonuses.balance(self.customer), 200)
         self.assertEqual(BonusTransaction.objects.filter(kind='refund').count(), 1)

@@ -79,9 +79,9 @@ class BonusSpendTests(_Base):
 
         applied = bonuses.debit_for_order(self.client_profile, order, Decimal("5000"))
 
-        self.assertEqual(applied, Decimal("2000.00"))
+        self.assertEqual(applied, Decimal("200.00"))
         # Остаток должен уцелеть, а не сгореть.
-        self.assertEqual(bonuses.balance(self.client_profile), Decimal("3000.00"))
+        self.assertEqual(bonuses.balance(self.client_profile), Decimal("4800.00"))
 
     def test_bonus_cannot_exceed_the_balance(self):
         self._credit(1000)
@@ -89,8 +89,8 @@ class BonusSpendTests(_Base):
 
         applied = bonuses.debit_for_order(self.client_profile, order, Decimal("5000"))
 
-        self.assertEqual(applied, Decimal("1000.00"))
-        self.assertEqual(bonuses.balance(self.client_profile), Decimal("0.00"))
+        self.assertEqual(applied, Decimal("900.00"))
+        self.assertEqual(bonuses.balance(self.client_profile), Decimal("100.00"))
 
     def test_second_debit_for_same_order_is_ignored(self):
         """Повторный тап «Оплатить» не должен списать бонус дважды."""
@@ -100,7 +100,7 @@ class BonusSpendTests(_Base):
         bonuses.debit_for_order(self.client_profile, order, Decimal("3000"))
         bonuses.debit_for_order(self.client_profile, order, Decimal("2000"))
 
-        self.assertEqual(bonuses.balance(self.client_profile), Decimal("2000.00"))
+        self.assertEqual(bonuses.balance(self.client_profile), Decimal("4100.00"))
 
     def test_refund_returns_bonus_after_cancelled_payment(self):
         self._credit(5000)
@@ -152,7 +152,7 @@ class PayOrderWithBonusTests(_Base):
              patch("api.services.payments.create_payment") as create:
             create.return_value = {
                 "id": "pay-1", "status": "pending",
-                "amount": {"value": "25000.00", "currency": "RUB"},
+                "amount": {"value": "27000.00", "currency": "RUB"},
                 "metadata": {"order_id": str(order.pk)},
                 "recipient": {"account_id": ""},
                 "confirmation": {"confirmation_url": "https://pay.example/1"},
@@ -160,8 +160,8 @@ class PayOrderWithBonusTests(_Base):
             response = self._pay(order, useBonus=5000)
 
         self.assertEqual(response.status_code, 201, response.content)
-        self.assertEqual(create.call_args.kwargs["amount"], Decimal("25000.00"))
-        self.assertEqual(response.json()["bonusApplied"], 5000.0)
+        self.assertEqual(create.call_args.kwargs["amount"], Decimal("27000.00"))
+        self.assertEqual(response.json()["bonusApplied"], 3000.0)
 
     def test_without_bonus_full_amount_goes_to_provider(self):
         self._credit(5000)
@@ -189,30 +189,33 @@ class PayOrderWithBonusTests(_Base):
              patch("api.services.payments.create_payment") as create:
             create.return_value = {
                 "id": "pay-3", "status": "pending",
-                "amount": {"value": "25000.00", "currency": "RUB"},
+                "amount": {"value": "27000.00", "currency": "RUB"},
                 "metadata": {"order_id": str(order.pk)},
                 "recipient": {"account_id": ""},
                 "confirmation": {"confirmation_url": "https://pay.example/3"},
             }
             self._pay(order, useBonus=True)
 
-        self.assertEqual(create.call_args.kwargs["amount"], Decimal("25000.00"))
+        self.assertEqual(create.call_args.kwargs["amount"], Decimal("27000.00"))
 
-    def test_bonus_covering_the_order_skips_the_provider(self):
-        """Платить нечего — в ЮKassa идти незачем, заказ сразу оплачен."""
+    def test_bonus_cannot_cover_order_even_with_large_balance(self):
         self._credit(5000)
         order = self._order(4000)
-
-        with patch("api.services.payments.create_payment") as create:
+        with patch("api.services.payments.is_configured", return_value=True), \
+             patch("api.services.payments.create_payment") as create:
+            create.return_value = {
+                "id": "pay-limited", "status": "pending",
+                "amount": {"value": "3600.00", "currency": "RUB"},
+                "metadata": {"order_id": str(order.pk)},
+                "recipient": {"account_id": ""},
+                "confirmation": {"confirmation_url": "https://pay.example/limited"},
+            }
             response = self._pay(order, useBonus=True)
-
         self.assertEqual(response.status_code, 201, response.content)
-        create.assert_not_called()
-
+        self.assertEqual(create.call_args.kwargs["amount"], Decimal("3600.00"))
         order.refresh_from_db()
-        self.assertEqual(order.status, "paid")
-        self.assertIsNotNone(order.paid_at)
-        self.assertEqual(bonuses.balance(self.client_profile), Decimal("1000.00"))
+        self.assertEqual(order.status, "confirmed")
+        self.assertEqual(bonuses.balance(self.client_profile), Decimal("4600.00"))
 
     def test_provider_failure_returns_the_bonus(self):
         from api.services.payments import PaymentProviderError
@@ -271,7 +274,7 @@ class BonusAccountEndpointTests(_Base):
         data = response.json()
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(data["balance"], 3000.0)
+        self.assertEqual(data["balance"], 4800.0)
         self.assertEqual(len(data["results"]), 2)
 
     def test_balance_is_visible_on_the_dashboard(self):

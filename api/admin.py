@@ -1119,11 +1119,42 @@ class BonusTransactionAdmin(admin.ModelAdmin):
     list_filter = ("kind", "created_at")
     search_fields = ("client__company_name", "client__inn", "comment")
     readonly_fields = ("created_at",)
+    change_list_template = "admin/api/bonus_list.html"
+
+    def get_urls(self):
+        return [path("debit/", self.admin_site.admin_view(self.debit_view), name="api_bonus_debit")] + super().get_urls()
+
+    def debit_view(self, request):
+        if not self.has_add_permission(request):
+            raise PermissionDenied
+        from .services.bonuses import balance, manual_debit
+        preview = request.method == "POST" and request.POST.get("preview")
+        form = BonusDebitForm(initial=request.POST if preview else None) if preview else BonusDebitForm(request.POST or None)
+        current = None
+        if not preview and form.is_valid():
+            current = balance(form.cleaned_data["client"])
+            if request.method == "POST" and not request.POST.get("preview"):
+                try:
+                    manual_debit(form.cleaned_data["client"], form.cleaned_data["amount"], form.cleaned_data["reason"], request.user)
+                except ValueError as exc:
+                    form.add_error(None, str(exc))
+                else:
+                    self.message_user(request, "Бонусы списаны")
+                    return redirect("admin:api_bonustransaction_changelist")
+        elif request.POST.get("client", "").isdigit():
+            client = ClientProfile.objects.filter(pk=request.POST["client"]).first()
+            if client:
+                current = balance(client)
+        return TemplateResponse(request, "admin/api/bonus_debit.html", dict(self.admin_site.each_context(request), form=form, balance=current, title="Списать бонусы"))
 
     def has_change_permission(self, request, obj=None):
-        # Задним числом баланс не переписывают: ошибку исправляют новой
-        # операцией с типом «Ручная корректировка».
         return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def add_view(self, request, form_url="", extra_context=None):
+        return redirect("admin:api_bonus_debit")
 
 
 @admin.register(LearningMaterial)
@@ -1402,3 +1433,16 @@ admin.site.register(ContactHistory)
 
 # Keep AI audit/review screens separate from the existing business admin classes.
 from . import ai_admin  # noqa: E402,F401
+
+
+class BonusDebitForm(forms.Form):
+    client = forms.ModelChoiceField(queryset=ClientProfile.objects.all(), label="Клиент")
+    amount = forms.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal("0.01"), label="Сумма списания")
+    reason = forms.CharField(max_length=255, label="Причина", widget=forms.Textarea)
+
+
+from .models import AndroidRelease
+
+@admin.register(AndroidRelease)
+class AndroidReleaseAdmin(admin.ModelAdmin):
+    list_display = ("store", "latest_version_name", "latest_build_number", "minimum_supported_build_number")

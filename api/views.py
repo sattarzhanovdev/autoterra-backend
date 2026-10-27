@@ -63,7 +63,7 @@ from .models import (
 )
 from .pagination import paginate, paginated_response
 from .serializers import RegistrationSerializer, PurchaseSerializer, coerce_decimal
-from .services.bonuses import balance as bonus_balance
+from .services.bonuses import balance as bonus_balance, spendable_for_order
 from .services import referral_bonus
 from .services.exports import EXPORTERS as EXPORT_FORMATS, ExportUnavailable, export_clients
 from .services.pricing import MAX_DISCOUNT_PERCENT, price_details
@@ -1046,6 +1046,8 @@ def _format_order(order):
         # это до нажатия «Оплатить».
         "bonusAvailable": float(bonus_balance(order.client)),
         "bonusApplied": float(_bonus_applied(order)),
+        "bonusRequested": str(order.bonus_requested),
+        "bonusMaxAllowed": str(spendable_for_order(order.client, order.total_amount)),
         "adjustments": [_format_adjustment(a) for a in order.adjustments.all()],
         "pendingPayment": _format_pending_payment(order),
         "items": items,
@@ -1916,7 +1918,12 @@ def order_quote(request):
     prices, summary = quote_order(client, products, quantities)
     if coerce_decimal(summary['total'], 12, 2) is None:
         return JsonResponse({'detail': 'Некорректная сумма заказа'}, status=400)
-    return JsonResponse({'orderDiscount': summary, 'items': [
+    from .services import bonuses
+    try:
+        bonus = bonuses.quote(client, Decimal(summary['total']), payload.get('bonusAmount', '0'))
+    except (ValueError, TypeError, InvalidOperation):
+        return JsonResponse({'detail': 'Некорректная сумма бонусов'}, status=400)
+    return JsonResponse({'orderDiscount': summary, 'bonus': bonus, 'items': [
         {'productId': str(pid), 'quantity': quantities[pid], 'price': str(price),
          'total': str(price * quantities[pid])} for pid, price in prices.items()]})
 
@@ -2096,7 +2103,14 @@ def create_order(request, replace_order_id=None):
             if product.status == "outOfStock" or (product.status != "onOrder" and product.quantity < qty):
                 transaction.set_rollback(True)
                 return JsonResponse({"detail": f"Недостаточно товара '{product.name}'. Доступно: {product.quantity}"}, status=400)
+        from .services import bonuses
+        try:
+            bonus = bonuses.quote(client, total, payload.get("bonusAmount", "0"))
+        except (ValueError, TypeError, InvalidOperation):
+            transaction.set_rollback(True)
+            return JsonResponse({"detail": "Некорректная сумма бонусов"}, status=400)
         order = Order.objects.create(
+            bonus_requested=Decimal(bonus['applied']) if payment_method != "cash" else Decimal(0),
             client=client, store=store, distributor=client.distributor,
             delivery_method=payload.get("deliveryMethod", "courier"),
             payment_method=payment_method,
@@ -2377,7 +2391,7 @@ def _prepare_order_payment(client, order_id, payload):
     # к провайдеру: платить нужно уже остаток.
     from api.services import bonuses
 
-    raw_bonus = payload.get("useBonus")
+    raw_bonus = payload.get("bonusAmount", payload.get("useBonus", order.bonus_requested))
     if raw_bonus is True:
         # true — «списать сколько можно», чтобы приложению не считать самому.
         requested_bonus = bonuses.spendable_for_order(client, order.total_amount)
@@ -2389,7 +2403,11 @@ def _prepare_order_payment(client, order_id, payload):
     if not requested_bonus.is_finite() or requested_bonus < 0:
         return JsonResponse({"detail": "Сумма бонусов не может быть отрицательной"}, status=400)
 
-    applied_bonus = bonuses.debit_for_order(client, order, requested_bonus)
+    try:
+        selected = bonuses.quote(client, total, requested_bonus)
+    except (InvalidOperation, ValueError, TypeError):
+        return JsonResponse({"detail": "Некорректная сумма бонусов"}, status=400)
+    applied_bonus = bonuses.debit_for_order(client, order, Decimal(selected["applied"]))
     payable = (Decimal(order.total_amount) - applied_bonus).quantize(Decimal("0.01"))
 
     # Бонус или скидка покрыли заказ целиком — внешний платёж не нужен.
@@ -4589,7 +4607,8 @@ def referrals(request):
         # у приглашённого прошла подтверждённая покупка. Считаем связки,
         # по которым начисление уже идёт.
         "giftCount": qs.filter(condition_met=True).count(),
-        "purchaseAmount": float(sum(r.purchase_amount for r in qs)),
+        "purchaseAmount": float(sum((r.purchase_amount for r in qs if r.counts_toward_bonus), Decimal(0))),
+        "totalEarned": str(client.bonus_transactions.filter(kind="referral").aggregate(total=Sum("amount"))["total"] or Decimal(0)),
     }
     base_url = getattr(settings, "REFERRAL_INVITE_BASE_URL", "https://autoterra.shop/register")
     return JsonResponse(paginated_response(
@@ -5757,6 +5776,9 @@ def ai_chat(request):
         if conversation is None:
             return JsonResponse({"detail": "Диалог не найден"}, status=404)
     result, status = record_exchange(user, conversation, payload.get("message", ""), expert=is_expert_user)
+    if "answer" in result:
+        from .services.ai_answer_policy import clean_client_answer
+        result["answer"] = clean_client_answer(result["answer"], result.get("sources", []))
     return JsonResponse(result, status=status)
 
 
@@ -6325,3 +6347,22 @@ def client_brand_discounts(request, client_id):
     if request.GET.get("discountsOnly") == "true":
         rows = [row for row in rows if row["percent"] is not None]
     return JsonResponse(paginated_response(request, rows, lambda row: row, extra={"canEdit": can_edit}))
+
+
+@require_GET
+def android_version(request):
+    from .models import AndroidRelease
+    store = request.GET.get("store", "google_play")
+    try:
+        installed = int(request.GET.get("build", "0"))
+        if installed < 0 or store not in ("google_play", "rustore"):
+            raise ValueError
+    except ValueError:
+        return JsonResponse({"detail": "Некорректный магазин или build"}, status=400)
+    release = AndroidRelease.objects.filter(store=store).first()
+    if release is None:
+        return JsonResponse({"store": store, "updateAvailable": False, "forceUpdate": False})
+    return JsonResponse({"store": store, "latestVersionName": release.latest_version_name,
+        "latestBuildNumber": release.latest_build_number, "minimumSupportedBuildNumber": release.minimum_supported_build_number,
+        "updateAvailable": installed < release.latest_build_number, "forceUpdate": installed < release.minimum_supported_build_number,
+        "storeUrl": release.store_url, "message": release.message})
