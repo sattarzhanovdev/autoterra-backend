@@ -119,6 +119,10 @@ def _send_order_email(order):
     try:
         from django.core.mail import EmailMultiAlternatives
 
+        from .services.order_email_actions import confirmation_url, issue_confirm_token
+        from django.utils.html import escape
+
+        action_url = confirmation_url(issue_confirm_token(order))
         client = order.client
         store_name = order.store.name if order.store else "—"
         delivery = dict(Order.DELIVERY_CHOICES).get(order.delivery_method, order.delivery_method)
@@ -148,6 +152,8 @@ def _send_order_email(order):
             )
         lines.append("")
         lines.append(f"Итого: {order.total_amount} ₽")
+        lines.extend(["", f"Подтвердить заказ: {action_url}",
+                      "Ссылка действует 24 часа и может быть использована один раз."])
         text_body = "\n".join(lines)
 
         # ── HTML version ───────────────────────────────────────────────────────
@@ -155,8 +161,8 @@ def _send_order_email(order):
             f"""
             <tr>
               <td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:16px;color:#222;">
-                <strong>{item.name}</strong><br>
-                <span style="color:#888;font-size:14px;">Артикул: {item.sku}</span>
+                <strong>{escape(item.name)}</strong><br>
+                <span style="color:#888;font-size:14px;">Артикул: {escape(item.sku)}</span>
               </td>
               <td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:16px;color:#222;text-align:center;">{item.quantity}&nbsp;шт.</td>
               <td style="padding:12px 16px;border-bottom:1px solid #eee;font-size:16px;color:#222;text-align:right;white-space:nowrap;">{item.price} ₽</td>
@@ -168,7 +174,7 @@ def _send_order_email(order):
         info_row = lambda label, value: f"""
             <tr>
               <td style="padding:6px 0;font-size:16px;color:#888;width:190px;">{label}</td>
-              <td style="padding:6px 0;font-size:16px;color:#222;"><strong>{value}</strong></td>
+              <td style="padding:6px 0;font-size:16px;color:#222;"><strong>{escape(value)}</strong></td>
             </tr>"""
 
         comment_row = info_row("Комментарий", order.comment) if order.comment else ""
@@ -224,6 +230,12 @@ def _send_order_email(order):
           </td>
         </tr>
         <tr>
+          <td style="padding:0 32px 28px;text-align:center;">
+            <a href="{escape(action_url)}" style="display:block;background:#f01d2c;color:#fff;padding:18px 16px;border-radius:10px;font-size:18px;font-weight:700;text-decoration:none;">Подтвердить заказ</a>
+            <p style="font-size:13px;color:#777;line-height:1.5;">Ссылка действует 24 часа и может быть использована один раз.</p>
+          </td>
+        </tr>
+        <tr>
           <td style="background:#111111;padding:18px 32px;text-align:center;font-size:13px;color:#bbbbbb;">
             Это письмо сформировано автоматически платформой <span style="color:#f01d2c;font-weight:700;">AutoTerra</span>.
           </td>
@@ -243,7 +255,7 @@ def _send_order_email(order):
         msg.attach_alternative(html_body, "text/html")
         msg.send(fail_silently=False)
     except Exception:
-        logger.exception("Failed to send order email for order %s", getattr(order, "id", None))
+        logger.error("Failed to send order email for order %s", getattr(order, "id", None))
 
 
 def _link_referral(client, code):

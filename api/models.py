@@ -844,6 +844,20 @@ class Order(models.Model):
         return sum(item.total for item in self.items.all())
 
 
+class OrderEmailActionToken(models.Model):
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name="email_action_tokens")
+    token_hash = models.CharField(max_length=64, unique=True)
+    action = models.CharField(max_length=16, choices=[("confirm", "Confirm")], default="confirm")
+    expires_at = models.DateTimeField()
+    used_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(
+            fields=["order", "action"], condition=models.Q(used_at__isnull=True),
+            name="one_active_order_email_action")]
+
+
 class OrderItem(models.Model):
     order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name="items", verbose_name="Заказ")
     product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name="order_items", verbose_name="Товар")

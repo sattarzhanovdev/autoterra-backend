@@ -260,3 +260,10 @@ if not isinstance(AI_DOMAIN_SYNONYMS, dict) or any(
 ):
     from django.core.exceptions import ImproperlyConfigured
     raise ImproperlyConfigured('AI_DOMAIN_SYNONYMS must map names to nonempty lists of short strings')
+
+# Public Django origin; route /order-action/ to the backend at the proxy.
+ORDER_EMAIL_ACTION_BASE_URL = os.environ.get("ORDER_EMAIL_ACTION_BASE_URL", "https://autoterra.shop")
+
+# Enable only behind a trusted proxy that overwrites X-Forwarded-Proto.
+if os.environ.get("TRUST_PROXY_HTTPS", "False").lower() == "true":
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")

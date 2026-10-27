@@ -358,6 +358,20 @@ def update_metadata(order_id, changes, *, actor=None, reason='Изменение
     return order
 
 
+def validate_confirmation(order, *, source='operator'):
+    if has_active_payment(order):
+        raise OrderError(PENDING_MESSAGE, 409)
+    if order.paid_at or order.payments.filter(status='succeeded').exists():
+        raise OrderError('Оплаченный заказ нельзя изменить или отменить')
+    if source == 'client':
+        if order.status != 'adjusted':
+            raise OrderError('Заказ не в статусе корректировки')
+    elif order.status not in ('new', 'accepted'):
+        raise OrderError('Изменения должен принять клиент')
+    if not order.can_transition_to('confirmed'):
+        raise OrderError('Недопустимый переход статуса заказа')
+
+
 @transaction.atomic
 def transition_order(order_id, target, *, actor=None, source='operator', reason='', delivery_updates=None):
     order = locked_order(order_id)
@@ -366,11 +380,7 @@ def transition_order(order_id, target, *, actor=None, source='operator', reason=
     if target not in ('confirmed', 'rejected', 'cancelled', 'shipped', 'fulfilled'):
         raise OrderError('Недопустимый переход статуса заказа')
     if target == 'confirmed':
-        if source == 'client':
-            if order.status != 'adjusted':
-                raise OrderError('Заказ не в статусе корректировки')
-        elif order.status not in ('new', 'accepted'):
-            raise OrderError('Изменения должен принять клиент')
+        validate_confirmation(order, source=source)
     if target in ('confirmed', 'rejected', 'cancelled') and (order.paid_at or order.payments.filter(status='succeeded').exists()):
         raise OrderError('Оплаченный заказ нельзя изменить или отменить')
     if not order.can_transition_to(target):
@@ -399,6 +409,8 @@ def transition_order(order_id, target, *, actor=None, source='operator', reason=
     _sync_delivery(order, actor)
     event = {'confirmed': 'accept' if source == 'client' else 'confirm',
              'rejected': 'reject', 'cancelled': 'cancel', 'shipped': 'ship', 'fulfilled': 'fulfill'}[target]
-    _audit(order, actor, f'Order {event}: {old_status} -> {target}', {'reason': reason, 'source': source})
+    _audit(order, actor, 'Order confirmed from email' if source == 'email' and target == 'confirmed'
+           else f'Order {event}: {old_status} -> {target}',
+           {'reason': reason, 'source': source, **({'orderId': order.pk} if source == 'email' else {})})
     _notify_event(order, old_status, event, reason)
     return order

@@ -1,0 +1,64 @@
+# Подтверждение заказа из email
+
+Новый заказ: `_send_order_email` создаёт 256-битный случайный токен и добавляет
+кнопку в HTML и ссылку в текстовую версию письма. Письмо получает существующий
+список `ORDER_NOTIFICATION_EMAILS`. Это bearer-ссылка: получатель пересланного
+письма тоже сможет подтвердить заказ до истечения срока действия.
+
+В БД хранится только SHA-256. Срок — 24 часа. Повторная отправка погашает старый
+токен через `used_at`. Частичный unique constraint оставляет один непогашенный
+токен на заказ/действие. Истёкшие строки сохраняются для понятного сообщения.
+
+`GET /order-action/confirm/?token=...` только показывает детали и форму.
+`POST /order-action/confirm/` принимает form body `token=...`; URL формы не
+содержит секрет. Авторизация — токен, login/session не нужны. Только этот view
+освобождён от CSRF; секрет не берётся из cookies. Никакого изменения заказа на GET.
+
+POST блокирует сначала заказ, потом токен, повторно проверяет токен после
+блокировки и использует `services.orders.transition_order(source='email')`.
+Изменение статуса, аудит и `used_at` входят в одну транзакцию. Уведомления,
+письмо клиенту и синхронизация доставки остаются в существующем сервисе.
+Повторный POST и мобильное подтверждение сериализуются по блокировке заказа.
+`source=email` и `orderId` попадают в аудит; токен — нет.
+
+Страница запрещает кэширование, referrer, индексацию и внешние ресурсы. Ошибки
+не содержат токен или traceback даже при DEBUG=True. Django/Gunicorn log filters
+маскируют query `token`. Лог отправки письма не включает текст исключения.
+
+## Развёртывание
+
+1. Применить закоммиченную миграцию `0069_order_email_action_token` обычным
+   deployment-процессом (`manage.py migrate`), не генерировать её на production.
+2. Задать `ORDER_EMAIL_ACTION_BASE_URL=https://autoterra.shop` — HTTPS-origin
+   Django (без пути). Настроить SMTP и существующий список получателей.
+   Console email backend предназначен только для разработки: он печатает письмо
+   целиком, включая ссылку.
+3. Проксировать `/order-action/confirm/` к Django, а не к SPA. Включить блок из
+   `deploy/order-email-confirm.nginx.conf.example` в HTTPS server, исправив upstream.
+   Он отключает access/error logs этого location: nginx может писать query string
+   как в access, так и в error logs. Аналогично исключить query/body в CDN, WAF,
+   ingress и APM. Python-фильтр не может очистить логи перед Django.
+4. Если TLS завершается на доверенном proxy: proxy должен перезаписывать
+   `X-Forwarded-Proto` для ВСЕХ маршрутов, доступ напрямую к Django закрыт;
+   тогда установить `TRUST_PROXY_HTTPS=True`. По умолчанию header не доверяется.
+   HTTP-запросы не могут подтвердить заказ.
+5. Проверить HTTPS GET из тестового письма, затем POST кнопки и повторный переход.
+
+Реализация не меняет инфраструктуру production автоматически.
+
+## Проверки
+
+Использовать существующий `.venv/bin/python` (в этом checkout нет `venv/`).
+
+```sh
+DEBUG=True DB_ENGINE=sqlite3 SECURE_SSL_REDIRECT=false ALLOWED_HOSTS=testserver,localhost .venv/bin/python manage.py check
+DEBUG=True DB_ENGINE=sqlite3 SECURE_SSL_REDIRECT=false ALLOWED_HOSTS=testserver,localhost .venv/bin/python manage.py test api.test_order_email_confirmation --noinput
+```
+
+Блокировки рассчитаны на PostgreSQL `SELECT FOR UPDATE`; SQLite использует
+настроенный в проекте `transaction_mode=IMMEDIATE`. Локальные тесты на SQLite
+не заменяют проверку конкуренции на production PostgreSQL.
+
+CSRF и фильтрация отчётов проверены по документации Django 5.2:
+https://docs.djangoproject.com/en/5.2/ref/csrf/
+https://docs.djangoproject.com/en/5.2/howto/error-reporting/

@@ -1,0 +1,12 @@
+# Add inside the existing HTTPS server block. Keep the upstream address in sync
+# with the deployment. Never use $request or $request_uri to log this location.
+location = /order-action/confirm/ {
+    access_log off;
+    # nginx error logs may contain the full request URI. Suppress them here;
+    # Django emits a sanitized error event if confirmation fails.
+    error_log /dev/null crit;
+    proxy_pass http://127.0.0.1:8000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Real-IP $remote_addr;
+}

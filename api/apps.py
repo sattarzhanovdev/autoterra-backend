@@ -7,6 +7,8 @@ class ApiConfig(AppConfig):
     verbose_name = "Данные платформы"
 
     def ready(self) -> None:
+        from api.order_email_security import install_log_filters
+        install_log_filters()
         import api.services.knowledge_documents  # noqa: F401 — private file cleanup
         import api.services.ai_history  # noqa: F401 — feedback publication cleanup
         import api.signals  # noqa: F401 — registers all signal handlers

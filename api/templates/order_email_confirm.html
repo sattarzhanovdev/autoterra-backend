@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Подтверждение заказа — AutoTerra</title>
+  <style>
+    * { box-sizing: border-box; } body { margin:0; background:#f4f5f7; color:#222; font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:560px; margin:40px auto; background:white; border-radius:16px; overflow:hidden; box-shadow:0 8px 32px #0000000d; }
+    header { background:#f01d2c; color:white; padding:24px; font-size:25px; font-weight:800; border-bottom:4px solid #111; }
+    section { padding:24px; } h1 { font-size:25px; line-height:1.3; margin:0 0 20px; overflow-wrap:anywhere; }
+    dl { margin:20px 0; } dt { color:#777; font-size:14px; } dd { margin:0 0 12px; overflow-wrap:anywhere; }
+    ul { padding-left:20px; } li { margin:8px 0; overflow-wrap:anywhere; }
+    button { width:100%; border:0; border-radius:10px; background:#f01d2c; color:white; padding:18px 12px; font:700 18px/1.4 sans-serif; cursor:pointer; }
+    .note { color:#777; font-size:13px; } @media(max-width:600px) { main { margin:16px; } section, header { padding:20px; } }
+  </style>
+</head>
+<body><main><header>AutoTerra</header><section>
+{% if success %}
+  <h1>Заказ ORD-{{ order.id|stringformat:"05d" }} подтверждён</h1>
+  <p>Клиент уже увидит новый статус в приложении AutoTerra.</p>
+{% elif message %}
+  <h1>{{ message }}</h1>
+{% else %}
+  <h1>Заказ ORD-{{ order.id|stringformat:"05d" }}</h1>
+  <dl><dt>Клиент</dt><dd>{{ order.client.company_name }}</dd>
+    <dt>Сумма</dt><dd>{{ order.total_amount }} ₽</dd>
+    <dt>Количество позиций</dt><dd>{{ item_count }}</dd></dl>
+  <ul>{% for item in items %}<li>{{ item.name }} — {{ item.quantity }} шт.</li>{% endfor %}</ul>
+  <form method="post" action="{% url 'order-email-confirm' %}">
+    <input type="hidden" name="token" value="{{ token }}">
+    <button type="submit">Подтвердить заказ</button>
+  </form>
+  <p class="note">Ссылка действует 24 часа и может быть использована один раз. Подтверждайте заказ только после проверки наличия товаров.</p>
+{% endif %}
+</section></main></body></html>
