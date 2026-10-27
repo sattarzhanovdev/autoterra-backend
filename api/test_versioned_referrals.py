@@ -33,6 +33,53 @@ class VersionedReferralTests(_Base):
         self.assertEqual(BonusTransaction.objects.count(), 2)
         self.assertEqual(BonusTransaction.objects.latest('pk').referral_event.version_id, rule.pk)
 
+    def test_tier_upgrade_in_new_version_excludes_old_turnover_from_target(self):
+        referral = self._referral()
+        before = datetime(2026, 10, 31, 12, tzinfo=timezone.utc)
+        after = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
+        with patch('django.utils.timezone.now', return_value=before):
+            self._purchase(self.invitee, 100000)
+        first = BonusTransaction.objects.get(kind='referral')
+        new_rule = ReferralRuleVersion.objects.create(
+            effective_from=datetime(2026, 11, 1, tzinfo=timezone.utc),
+            tiers=[['0', '1'], ['300000', '3']], activity_min=10000,
+        )
+        with patch('django.utils.timezone.now', return_value=after):
+            self._purchase(self.invitee, 100000)
+            self.assertEqual(balance(self.inviter), Decimal('2000.00'))
+            second = BonusTransaction.objects.latest('pk')
+            self._purchase(self.invitee, 100000)
+            # Lifetime turnover 300k selects 3%, but only this version's
+            # 200k is eligible: 6000 target minus its previous 1000 = 5000.
+            self.assertEqual(balance(self.inviter), Decimal('7000.00'))
+            self.assertEqual(rb.accrue(referral), Decimal('0.00'))
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertEqual(first.amount, Decimal('1000.00'))
+        self.assertEqual(second.amount, Decimal('1000.00'))
+        self.assertEqual(BonusTransaction.objects.latest('pk').amount, Decimal('5000.00'))
+        events = ReferralAccrual.objects.filter(version=new_rule).order_by('pk')
+        self.assertEqual(list(events.values_list('amount', flat=True)),
+                         [Decimal('1000.00'), Decimal('5000.00')])
+
+    def test_backfill_keeps_each_versions_cumulative_target_separate(self):
+        before = datetime(2026, 10, 31, 12, tzinfo=timezone.utc)
+        after = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
+        with patch('django.utils.timezone.now', return_value=before):
+            self._purchase(self.invitee, 100000)
+            self._purchase(self.invitee, 100000)
+        ReferralRuleVersion.objects.create(
+            effective_from=datetime(2026, 11, 1, tzinfo=timezone.utc),
+            tiers=[['0', '2']], activity_min=10000,
+        )
+        with patch('django.utils.timezone.now', return_value=after):
+            self._purchase(self.invitee, 50000)
+            referral = self._referral()
+            self.assertEqual(rb.accrue(referral), Decimal('4000.00'))
+            self.assertEqual(rb.accrue(referral), Decimal('0.00'))
+        self.assertEqual(list(ReferralAccrual.objects.order_by('pk').values_list('amount', flat=True)),
+                         [Decimal('1000.00'), Decimal('2000.00'), Decimal('1000.00')])
+
     @override_settings(REFERRAL_BONUS_TIERS=[(0, '99')])
     def test_settings_change_cannot_reprice_confirmed_operations(self):
         referral = self._referral()

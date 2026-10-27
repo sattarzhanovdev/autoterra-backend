@@ -46,6 +46,8 @@ class RateTests(TestCase):
         self.assertEqual(rb.earned_for(0), Decimal("0.00"))
         self.assertEqual(rb.earned_for(50_000), Decimal("250.00"))
         self.assertEqual(rb.earned_for(100_000), Decimal("1000.00"))
+        self.assertEqual(rb.earned_for(150_000), Decimal("1500.00"))
+        self.assertEqual(rb.earned_for(300_000), Decimal("4500.00"))
         self.assertEqual(rb.earned_for(200_000), Decimal("3000.00"))
         self.assertEqual(rb.earned_for(400_000), Decimal("8000.00"))
         self.assertEqual(rb.earned_for(800_000), Decimal("20000.00"))
@@ -117,8 +119,8 @@ class AccrualTests(_Base):
         self.assertEqual(rb.accrue(referral), Decimal("0.00"))
         self.assertEqual(balance(self.inviter), Decimal("4500.00"))
 
-    def test_tier_upgrade_only_applies_to_new_confirmed_operation(self):
-        """Подтверждённые операции сохраняют ранее зафиксированные ставки."""
+    def test_tier_upgrade_tops_up_cumulative_target_within_same_version(self):
+        """Переход ступени создаёт дельту, не изменяя прежнюю операцию."""
         self._referral()
         self._purchase(self.invitee, 100_000)
         self.assertEqual(balance(self.inviter), Decimal("1000.00"))  # 1% от 100k
@@ -127,7 +129,48 @@ class AccrualTests(_Base):
         # Доначислить должно ровно 2 000, а не начислить 3 000 поверх старого.
         self._purchase(self.invitee, 100_000)
 
-        self.assertEqual(balance(self.inviter), Decimal("2500.00"))
+        self.assertEqual(balance(self.inviter), Decimal("3000.00"))
+        self.assertEqual(list(BonusTransaction.objects.filter(kind="referral").order_by("pk").values_list("amount", flat=True)), [Decimal("1000.00"), Decimal("2000.00")])
+
+    def test_cumulative_balances_across_all_agreed_turnovers(self):
+        referral = self._referral()
+        previous_turnover = 0
+        for turnover, expected in [(50000, "250"), (100000, "1000"),
+                                   (150000, "1500"), (200000, "3000"),
+                                   (300000, "4500"), (400000, "8000"),
+                                   (800000, "20000")]:
+            with self.subTest(turnover=turnover):
+                previous_rows = list(BonusTransaction.objects.values_list("pk", "amount"))
+                self._purchase(self.invitee, turnover - previous_turnover)
+                self.assertEqual(balance(self.inviter), Decimal(expected))
+                for pk, amount in previous_rows:
+                    self.assertEqual(BonusTransaction.objects.get(pk=pk).amount, amount)
+                self.assertEqual(rb.accrue(referral), Decimal("0.00"))
+                previous_turnover = turnover
+
+    def test_backfill_plan_uses_cumulative_deltas_before_events_are_saved(self):
+        self._purchase(self.invitee, 100000)
+        self._purchase(self.invitee, 100000)
+        referral = self._referral()
+        self.assertEqual([row["amount"] for row in rb.accrual_plan(referral)],
+                         [Decimal("1000.00"), Decimal("2000.00")])
+        self.assertEqual(rb.accrue(referral), Decimal("3000.00"))
+        self.assertEqual(rb.accrue(referral), Decimal("0.00"))
+
+    def test_legacy_snapshot_credits_are_not_paid_twice(self):
+        from .models import ReferralAccrual
+        referral = self._referral()
+        self._purchase(self.invitee, 100000)
+        credit = BonusTransaction.objects.get(kind="referral")
+        event = credit.referral_event
+        BonusTransaction.objects.filter(pk=credit.pk).update(referral_event=None)
+        ReferralAccrual.objects.filter(pk=event.pk).update(amount=0, legacy_snapshot=True)
+        self._purchase(self.invitee, 100000)
+        self.assertEqual(balance(self.inviter), Decimal("3000.00"))
+        credit.refresh_from_db()
+        self.assertEqual(credit.amount, Decimal("1000.00"))
+        self.assertIsNone(credit.referral_event_id)
+        self.assertEqual(rb.accrue(referral), Decimal("0.00"))
 
     def test_accrue_computes_delta_when_called_directly(self):
         """Связку могли завести уже после закупок — тогда считаем всё разом."""
@@ -219,7 +262,7 @@ class ExpiryTests(_Base):
         # Приглашённый закупает ещё — начисляем только прирост, не всё заново.
         self._purchase(self.invitee, 100_000)
 
-        self.assertEqual(balance(self.inviter), Decimal("1500.00"))
+        self.assertEqual(balance(self.inviter), Decimal("2000.00"))
 
     def test_expiry_leaves_a_trace_in_the_ledger(self):
         self._earn()

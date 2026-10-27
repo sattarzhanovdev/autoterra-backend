@@ -2086,6 +2086,12 @@ class ReferralRuleVersion(models.Model):
 
 
 class ReferralAccrual(models.Model):
+    """Immutable source marker; amount is the delta to its version target.
+
+    turnover records lifetime invitee turnover used to select the tier.
+    Historical versions are never included in a new version's eligible base.
+    """
+
     referral = models.ForeignKey(Referral, on_delete=models.PROTECT, related_name="accrual_events")
     version = models.ForeignKey(ReferralRuleVersion, on_delete=models.PROTECT, related_name="accruals")
     purchase = models.ForeignKey(Purchase, on_delete=models.PROTECT, null=True, blank=True)

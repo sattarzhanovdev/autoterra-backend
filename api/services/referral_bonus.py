@@ -1,5 +1,7 @@
-"""Immutable referral accruals: each confirmed operation uses its effective rules.
-Historical transactions and processed source events are never repriced.
+"""Cumulative tier deltas, isolated by the effective referral rule version.
+
+Tier upgrades top up the turnover earned within that version. A new version
+never reprices earlier versions, and existing ledger rows stay immutable.
 """
 
 import logging
@@ -108,18 +110,51 @@ def source_operations(referral):
 
 
 def accrual_plan(referral):
-    from api.models import ReferralAccrual
-    turnover = ZERO
-    planned = []
+    from api.models import BonusTransaction, ReferralAccrual, ReferralRuleVersion
+
     if not referral.counts_toward_bonus:
-        return planned
+        return []
+
+    events = list(ReferralAccrual.objects.filter(referral=referral))
+    processed = {(e.purchase_id and "purchase" or "order", e.purchase_id or e.order_id)
+                 for e in events}
+    credited_by_version = {}
+    for event in events:
+        credited_by_version[event.version_id] = (
+            credited_by_version.get(event.version_id, ZERO) + event.amount
+        )
+
+    # Migration 0068 deliberately kept the old ledger untouched and stored
+    # zero-amount legacy markers. Count those historical credits as already
+    # paid under the original version, including credits since spent/expired.
+    original_version = ReferralRuleVersion.objects.order_by("effective_from").first()
+    if original_version is not None:
+        legacy_credit = BonusTransaction.objects.filter(
+            referral=referral, kind="referral", referral_event__isnull=True,
+        ).aggregate(total=Sum("amount"))["total"] or ZERO
+        credited_by_version[original_version.pk] = (
+            credited_by_version.get(original_version.pk, ZERO) + legacy_credit
+        )
+
+    turnover = ZERO
+    volume_by_version = {}
+    planned = []
     for confirmed, kind, source_id, volume in source_operations(referral):
         turnover += volume
-        lookup = {f"{kind}_id": source_id, "referral": referral}
-        if ReferralAccrual.objects.filter(**lookup).exists():
-            continue
         rule = current_rule(confirmed)
-        amount = (volume * rate_for(turnover, rule) / Decimal(100)).quantize(CENTS, rounding=ROUND_HALF_UP)
+        # Lifetime invitee turnover still selects the tier. Only turnover
+        # confirmed under this version is eligible for that version's target.
+        version_volume = volume_by_version.get(rule.pk, ZERO) + volume
+        volume_by_version[rule.pk] = version_volume
+        if (kind, source_id) in processed:
+            continue
+        target = (version_volume * rate_for(turnover, rule) / Decimal(100)).quantize(
+            CENTS, rounding=ROUND_HALF_UP,
+        )
+        already = credited_by_version.get(rule.pk, ZERO)
+        amount = max(ZERO, target - already)
+        credited_by_version[rule.pk] = already + amount
+        lookup = {f"{kind}_id": source_id, "referral": referral}
         planned.append(dict(lookup=lookup, rule=rule, confirmed=confirmed, turnover=turnover, amount=amount, volume=volume, kind=kind, source_id=source_id))
     return planned
 
@@ -137,7 +172,7 @@ def accrue(referral) -> Decimal:
             if row['amount'] > ZERO:
                 BonusTransaction.objects.create(client=referral.inviter, referral=referral, referral_event=event,
                     order_id=row['source_id'] if row['kind'] == "order" else None, kind="referral", amount=row['amount'],
-                    comment=f"{rate_for(row['turnover'], row['rule'])}% за подтверждённую покупку «{referral.invitee_name}» ({row['volume']:.2f} ₽)")
+                    comment=f"Доначисление до {rate_for(row['turnover'], row['rule'])}% по накопленному обороту «{referral.invitee_name}»; новая покупка {row['volume']:.2f} ₽")
                 credited += row['amount']
         return credited
 
