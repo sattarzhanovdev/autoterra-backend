@@ -4,34 +4,58 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>Подтверждение заказа — AutoTerra</title>
+  <title>Проверка заказа — AutoTerra</title>
   <style>
-    * { box-sizing: border-box; } body { margin:0; background:#f4f5f7; color:#222; font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
-    main { max-width:560px; margin:40px auto; background:white; border-radius:16px; overflow:hidden; box-shadow:0 8px 32px #0000000d; }
+    * { box-sizing:border-box; } body { margin:0; background:#f4f5f7; color:#222; font:17px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { max-width:720px; margin:40px auto; background:white; border-radius:16px; overflow:hidden; box-shadow:0 8px 32px #0000000d; }
     header { background:#f01d2c; color:white; padding:24px; font-size:25px; font-weight:800; border-bottom:4px solid #111; }
     section { padding:24px; } h1 { font-size:25px; line-height:1.3; margin:0 0 20px; overflow-wrap:anywhere; }
-    dl { margin:20px 0; } dt { color:#777; font-size:14px; } dd { margin:0 0 12px; overflow-wrap:anywhere; }
-    ul { padding-left:20px; } li { margin:8px 0; overflow-wrap:anywhere; }
-    button { width:100%; border:0; border-radius:10px; background:#f01d2c; color:white; padding:18px 12px; font:700 18px/1.4 sans-serif; cursor:pointer; }
-    .note { color:#777; font-size:13px; } @media(max-width:600px) { main { margin:16px; } section, header { padding:20px; } }
+    dl { margin:20px 0; } dt { color:#666; font-size:15px; } dd { margin:0 0 12px; overflow-wrap:anywhere; }
+    .item { padding:20px 0; border-top:1px solid #ddd; } h2 { margin:0 0 8px; font-size:18px; overflow-wrap:anywhere; }
+    label { display:block; font-weight:600; margin:12px 0 6px; } input[type=number], textarea { width:100%; max-width:100%; border:1px solid #888; border-radius:8px; padding:12px; font:inherit; }
+    input[type=number] { max-width:180px; } textarea { min-height:100px; resize:vertical; }
+    button { width:100%; border:0; border-radius:10px; background:#f01d2c; color:white; padding:18px 12px; font:700 18px/1.4 sans-serif; cursor:pointer; margin-top:20px; }
+    .note { color:#555; font-size:15px; } .error { padding:12px; border:2px solid #b00020; color:#870018; border-radius:8px; }
+    @media(max-width:600px) { main { margin:16px; } section, header { padding:20px; } }
   </style>
 </head>
 <body><main><header>AutoTerra</header><section>
 {% if success %}
-  <h1>Заказ ORD-{{ order.id|stringformat:"05d" }} подтверждён</h1>
-  <p>Клиент уже увидит новый статус в приложении AutoTerra.</p>
+  {% if adjusted %}
+    <h1>Корректировка заказа ORD-{{ order.id|stringformat:"05d" }} отправлена клиенту</h1>
+    <p>Клиент получит уведомление с изменениями количества и новой суммой {{ order.total_amount }} ₽. Заказ ожидает его согласия в AutoTerra.</p>
+    <p>До принятия корректировки клиентом заказ нельзя оплатить.</p>
+  {% else %}
+    <h1>Заказ ORD-{{ order.id|stringformat:"05d" }} подтверждён</h1>
+    <p>Клиент получит уведомление и увидит новый статус в приложении AutoTerra.</p>
+  {% endif %}
 {% elif message %}
   <h1>{{ message }}</h1>
 {% else %}
   <h1>Заказ ORD-{{ order.id|stringformat:"05d" }}</h1>
   <dl><dt>Клиент</dt><dd>{{ order.client.company_name }}</dd>
-    <dt>Сумма</dt><dd>{{ order.total_amount }} ₽</dd>
+    <dt>Текущая сумма</dt><dd>{{ order.total_amount }} ₽</dd>
     <dt>Количество позиций</dt><dd>{{ item_count }}</dd></dl>
-  <ul>{% for item in items %}<li>{{ item.name }} — {{ item.quantity }} шт.</li>{% endfor %}</ul>
+  <p>Проверьте наличие. Если клиент заказал 5 шт., а доступны 3, укажите 3. Чтобы убрать отсутствующий товар, укажите 0.</p>
+  <p class="note">При изменении количества сумма будет пересчитана, а клиент получит корректировку для согласования. Если ничего не менять, заказ будет подтверждён.</p>
+  {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
   <form method="post" action="{% url 'order-email-confirm' %}">
     <input type="hidden" name="token" value="{{ token }}">
-    <button type="submit">Подтвердить заказ</button>
+    <input type="hidden" name="revision" value="{{ revision }}">
+    {% for item in items %}
+    <div class="item">
+      <h2>{{ item.name }}</h2>
+      <div>Артикул: {{ item.sku }}</div>
+      <div>Заказано: {{ item.quantity }} шт.</div>
+      <div>{% if item.available is None %}Товар под заказ{% else %}Доступно с учётом резерва: {{ item.available }} шт.{% endif %}</div>
+      <label for="quantity_{{ item.pk }}">Количество к поставке</label>
+      <input id="quantity_{{ item.pk }}" name="quantity_{{ item.pk }}" type="number" min="0" max="{{ item.quantity }}" step="1" inputmode="numeric" required value="{{ item.entered_quantity }}">
+    </div>
+    {% endfor %}
+    <label for="reason">Комментарий клиенту (необязательно)</label>
+    <textarea id="reason" name="reason" maxlength="1000" placeholder="Например: в наличии только 3 шт.">{{ reason }}</textarea>
+    <button type="submit">Подтвердить заказ / отправить корректировку</button>
   </form>
-  <p class="note">Ссылка действует 24 часа и может быть использована один раз. Подтверждайте заказ только после проверки наличия товаров.</p>
+  <p class="note">Ссылка действует 24 часа и может быть использована один раз. Изменения сохранятся только после нажатия кнопки.</p>
 {% endif %}
 </section></main></body></html>

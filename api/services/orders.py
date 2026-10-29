@@ -68,13 +68,48 @@ def _audit(order, actor, action, changes):
                             object_id=str(order.pk), changes=changes)
 
 
+def adjustment_quantity_changes(order):
+    """Readable, structured quantity changes for client notifications and email."""
+    adjustment = order.adjustments.order_by('-created_at', '-pk').first()
+    if adjustment is None:
+        return []
+    def group(rows):
+        result = {}
+        for row in rows:
+            key = (row.get('productId'), row.get('sku'))
+            if key not in result:
+                result[key] = dict(row, quantity=0)
+            result[key]['quantity'] += row['quantity']
+        return result
+    before, after = group(adjustment.original_items), group(adjustment.adjusted_items)
+    changes = []
+    for key in dict.fromkeys([*before, *after]):
+        old, new = before.get(key, {}), after.get(key, {})
+        if old.get('quantity', 0) != new.get('quantity', 0):
+            item = new or old
+            changes.append({'name': item.get('name', ''), 'sku': item.get('sku', ''),
+                            'before': old.get('quantity', 0), 'after': new.get('quantity', 0)})
+    return changes
+
+
+def adjustment_quantity_summary(order):
+    changes = adjustment_quantity_changes(order)
+    # Full history stays on the order screen/email; keep push payload bounded.
+    lines = [f"{item['name'][:100]} ({item['sku'][:64]}): было {item['before']} шт., доступно {item['after']} шт."
+             for item in changes[:3]]
+    if len(changes) > 3:
+        lines.append(f'Ещё изменённых позиций: {len(changes) - 3}. Подробности в заказе.')
+    return ' '.join(lines)
+
+
 def _notify_event(order, old_status, event, reason=''):
     # Retain existing notification/email implementation and its delivery/error
     # handling. Lazy import avoids a views/service import cycle.
     from api import views
     if event == 'adjust':
         views._notify_client_order(order, 'Заказ скорректирован',
-            f'Заказ ORD-{order.id:05d} изменён оператором. Новая сумма: {order.total_amount} ₽. Подтвердите или отмените.')
+            f'Заказ ORD-{order.id:05d} изменён оператором. {adjustment_quantity_summary(order)} '
+            f'Новая сумма: {order.total_amount} ₽. Подтвердите изменения или отмените заказ в AutoTerra.')
         recipients = views._client_email_list(order)
     elif event == 'confirm':
         views._notify_client_order(order, 'Заказ подтверждён',

@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 @sensitive_variables()
 def confirm_order_from_email(request):
     context = {}
+    raw = ''
     status = 200
     try:
         # No HTTP downgrade redirects carrying the secret. Behind TLS termination,
@@ -27,14 +28,25 @@ def confirm_order_from_email(request):
             raise actions.EmailActionError('Ссылка недействительна. Откройте её через HTTPS.', 400)
         raw = request.GET.get('token', '') if request.method == 'GET' else request.POST.get('token', '')
         if request.method == 'POST':
-            order = actions.confirm(raw)
-            context = {'order': order, 'success': True}
+            fields = [key for key in request.POST if key.startswith('quantity_')]
+            if any(len(request.POST.getlist(key)) != 1 for key in fields):
+                raise actions.EmailActionError('Передано несколько количеств для одной позиции.')
+            quantities = {key.removeprefix('quantity_'): request.POST[key] for key in fields}
+            order = actions.confirm(raw, quantities=quantities if fields or 'revision' in request.POST else None,
+                                    revision=request.POST.get('revision'), reason=request.POST.get('reason', ''))
+            context = {'order': order, 'success': True, 'adjusted': order.status == 'adjusted'}
         else:
             order = actions.preview(raw)
-            context = {'order': order, 'token': raw,
-                       'items': order.items.all()[:5], 'item_count': order.items.count()}
+            context = dict(actions.editor_context(order), token=raw)
     except actions.EmailActionError as exc:
         context, status = {'message': exc.message}, exc.status
+        if request.method == 'POST' and exc.status == 400:
+            try:
+                order = actions.preview(raw)
+                context = dict(actions.editor_context(order, submitted=request.POST),
+                               token=raw, error=exc.message, reason=request.POST.get('reason', '')[:1000])
+            except actions.EmailActionError:
+                pass
     except Exception:
         # Never log request, exception text or traceback containing bearer secrets.
         logger.error('Email order confirmation failed')

@@ -152,7 +152,7 @@ def _send_order_email(order):
             )
         lines.append("")
         lines.append(f"Итого: {order.total_amount} ₽")
-        lines.extend(["", f"Подтвердить заказ: {action_url}",
+        lines.extend(["", f"Проверить количество и подтвердить заказ: {action_url}",
                       "Ссылка действует 24 часа и может быть использована один раз."])
         text_body = "\n".join(lines)
 
@@ -231,8 +231,8 @@ def _send_order_email(order):
         </tr>
         <tr>
           <td style="padding:0 32px 28px;text-align:center;">
-            <a href="{escape(action_url)}" style="display:block;background:#f01d2c;color:#fff;padding:18px 16px;border-radius:10px;font-size:18px;font-weight:700;text-decoration:none;">Подтвердить заказ</a>
-            <p style="font-size:13px;color:#777;line-height:1.5;">Ссылка действует 24 часа и может быть использована один раз.</p>
+            <a href="{escape(action_url)}" style="display:block;background:#f01d2c;color:#fff;padding:18px 16px;border-radius:10px;font-size:18px;font-weight:700;text-decoration:none;">Проверить и подтвердить заказ</a>
+            <p style="font-size:13px;color:#777;line-height:1.5;">По ссылке можно уменьшить количество или убрать отсутствующие позиции. Клиент получит уведомление об изменениях. Ссылка действует 24 часа и может быть использована один раз.</p>
           </td>
         </tr>
         <tr>
@@ -445,6 +445,8 @@ def _send_order_status_email(order, old_status, new_status, recipients=None):
         return
     try:
         from django.core.mail import EmailMultiAlternatives
+        from django.utils.html import escape
+        from .services.orders import adjustment_quantity_changes
 
         status_labels = dict(Order.STATUS_CHOICES)
         # Header colour per status: accepted/fulfilled → red brand, rejected → black
@@ -464,6 +466,22 @@ def _send_order_status_email(order, old_status, new_status, recipients=None):
         if new_status == "rejected" and order.rejection_reason:
             text_lines.append(f"Причина: {order.rejection_reason}")
         text_lines.append(f"Сумма заказа: {order.total_amount} ₽")
+        adjustment_block = ""
+        if new_status == "adjusted":
+            changes = adjustment_quantity_changes(order)
+            text_lines.extend(["", "Изменения количества:"])
+            text_lines.extend(f"{item['name']} ({item['sku']}): было {item['before']} шт., доступно {item['after']} шт." for item in changes)
+            adjustment = order.adjustments.order_by('-created_at', '-pk').first()
+            if adjustment and adjustment.reason:
+                text_lines.append(f"Комментарий оператора: {adjustment.reason}")
+            text_lines.append("Откройте заказ в AutoTerra и подтвердите изменения или отмените заказ. До вашего согласия оплата недоступна.")
+            rows = ''.join(
+                f"<li>{escape(item['name'])} ({escape(item['sku'])}): было {item['before']} шт., доступно <strong>{item['after']} шт.</strong></li>"
+                for item in changes)
+            comment = (f"<p>Комментарий оператора: {escape(adjustment.reason)}</p>" if adjustment and adjustment.reason else "")
+            adjustment_block = (f'<tr><td style="padding:12px 32px 24px;font-size:16px;line-height:1.6;overflow-wrap:anywhere;">'
+                f'<strong>Изменения количества</strong><ul>{rows}</ul>{comment}'
+                '<p>Откройте заказ в AutoTerra и подтвердите изменения или отмените заказ. До вашего согласия оплата недоступна.</p></td></tr>')
         text_body = "\n".join(text_lines)
 
         reason_block = ""
@@ -471,7 +489,7 @@ def _send_order_status_email(order, old_status, new_status, recipients=None):
             reason_block = f"""
               <tr>
                 <td style="padding:6px 0;font-size:16px;color:#888;width:190px;">Причина</td>
-                <td style="padding:6px 0;font-size:16px;color:#222;"><strong>{order.rejection_reason}</strong></td>
+                <td style="padding:6px 0;font-size:16px;color:#222;"><strong>{escape(order.rejection_reason)}</strong></td>
               </tr>"""
 
         html_body = f"""\
@@ -495,7 +513,7 @@ def _send_order_status_email(order, old_status, new_status, recipients=None):
             <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
               <tr>
                 <td style="padding:6px 0;font-size:16px;color:#888;width:190px;">Клиент</td>
-                <td style="padding:6px 0;font-size:16px;color:#222;"><strong>{client.company_name}</strong></td>
+                <td style="padding:6px 0;font-size:16px;color:#222;"><strong>{escape(client.company_name)}</strong></td>
               </tr>
               <tr>
                 <td style="padding:6px 0;font-size:16px;color:#888;width:190px;">ИНН</td>
@@ -508,6 +526,7 @@ def _send_order_status_email(order, old_status, new_status, recipients=None):
             </table>
           </td>
         </tr>
+        {adjustment_block}
         <tr>
           <td style="background:#111111;padding:18px 32px;text-align:center;font-size:13px;color:#bbbbbb;">
             Это письмо сформировано автоматически платформой <span style="color:#f01d2c;font-weight:700;">AutoTerra</span>.

@@ -137,7 +137,7 @@ class OrderEmailConfirmationTests(_Base):
         _send_order_email(self.order)
         message = mail.outbox[-1]
         html = message.alternatives[0].content
-        self.assertIn('Подтвердить заказ', html)
+        self.assertIn('Проверить и подтвердить заказ', html)
         self.assertIn('Ссылка действует 24 часа', html)
         link = re.search(r'https://autoterra.shop/order-action/confirm/\?token=([\w-]+)', message.body)
         self.assertIsNotNone(link)
