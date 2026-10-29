@@ -1864,7 +1864,8 @@ def products(request):
     if category:
         qs = qs.filter(category=category)
     if brand:
-        qs = qs.filter(brand=brand)
+        from .services.catalog_brands import filter_catalog_brand
+        qs = filter_catalog_brand(qs, brand)
     if request.GET.get("inStock") == "true":
         # «Под заказ» тоже доступен к заказу, хотя остаток нулевой.
         qs = qs.filter(Q(quantity__gt=0) | Q(status="onOrder"))
@@ -1956,10 +1957,9 @@ def order_config(request):
     categories = list(
         products_qs.order_by("category").values_list("category", flat=True).distinct()
     )
-    brands = list(
-        products_qs.order_by("brand").values_list("brand", flat=True).distinct()
-    )
-    return JsonResponse({
+    from .services.catalog_brands import catalog_brands
+    brands = catalog_brands(products_qs)
+    response = JsonResponse({
         "catalogRevision": catalog_revision(client.distributor),
         "client": _format_client(client),
         "distributor": _format_distributor(client.distributor),
@@ -1971,6 +1971,8 @@ def order_config(request):
         "bonusBalance": float(bonus_balance(client)),
         "orderDiscount": order_discount_config(),
     })
+    response["Cache-Control"] = "private, no-store"
+    return response
 
 
 @require_GET
