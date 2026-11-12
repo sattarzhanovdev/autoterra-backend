@@ -32,6 +32,25 @@ class Profile(models.Model):
         return f"{self.user.username} ({self.get_role_display()})"
 
 
+class PasswordResetRequest(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    email = models.EmailField()
+    credential_hash = models.CharField(max_length=64)
+    token_hash = models.CharField(max_length=64, blank=True, db_index=True)
+    expires_at = models.DateTimeField(null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    status = models.CharField(max_length=16, default="pending", db_index=True)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    claimed_at = models.DateTimeField(null=True)
+    consumed_at = models.DateTimeField(null=True)
+
+
+class PasswordResetRateLimit(models.Model):
+    key = models.CharField(max_length=64, unique=True)
+    count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
 class AuthToken(models.Model):
     key = models.CharField(max_length=64, unique=True)
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="auth_tokens")

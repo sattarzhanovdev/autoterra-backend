@@ -104,6 +104,13 @@ Query: `page` от 1; `page_size` (alias `pageSize`) default 20, максиму�
 
 ## Регистрация, вход, профиль и восстановление
 
+Для будущего веб-сценария добавлен запрос восстановления только по email:
+`POST /api/auth/password-reset/` с `{"email":"client@example.com"}` возвращает
+202 и ставит письмо со ссылкой в очередь. Установка пароля:
+`POST /api/auth/password-reset/confirm/` с `{"token":"...","new_password":"..."}`.
+Ссылка действует 15 минут. Старый формат phone/ИНН/code для приложения сохранён.
+Настройка SMTP, очереди и полный контракт: [EMAIL_PASSWORD_RECOVERY.md](EMAIL_PASSWORD_RECOVERY.md).
+
 ### Регистрация клиента
 
 `POST /api/auth/register/` (alias `/api/register/`), без Bearer. Регистрация создаёт клиента и его первую торговую точку, не произвольную роль.

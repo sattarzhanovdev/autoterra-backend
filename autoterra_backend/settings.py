@@ -267,3 +267,12 @@ ORDER_EMAIL_ACTION_BASE_URL = os.environ.get("ORDER_EMAIL_ACTION_BASE_URL", "htt
 # Enable only behind a trusted proxy that overwrites X-Forwarded-Proto.
 if os.environ.get("TRUST_PROXY_HTTPS", "False").lower() == "true":
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+# Email recovery reuses the SMTP configuration above. Enable after frontend is ready.
+PASSWORD_RESET_URL = os.environ.get("PASSWORD_RESET_URL", "")
+PASSWORD_RECOVERY_VALIDATORS = [
+    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator", "OPTIONS": {"min_length": 8}},
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+]

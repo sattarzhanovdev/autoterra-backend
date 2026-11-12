@@ -250,6 +250,39 @@ SCHEMAS["ShopMarkup"] = {
 }
 
 PATHS = {
+    "/auth/password-reset/": {
+        "post": {
+            "tags": ["Auth"],
+            "summary": "Запросить восстановление пароля по почте",
+            "description": "Формат email ставит письмо со ссылкой в очередь и возвращает одинаковый ответ для существующих и неизвестных адресов. До 3 писем на адрес и 20 запросов с IP в час. Старый формат phone/username + inn + new_password/password (+ code на втором шаге) сохранён для приложения; он возвращает 200 code_sent/success и использует прежнюю отправку кода.",
+            "requestBody": _body({"type": "object", "required": ["email"], "properties": {
+                "email": {"type": "string", "format": "email"}
+            }}, "Email, уже привязанный к аккаунту."),
+            "responses": {"202": _ok(_ref("Error"), "Запрос email-ссылки принят."),
+                          "200": _ok({"type": "object", "properties": {
+                              "status": {"type": "string", "enum": ["code_sent", "success"]},
+                              "detail": {"type": "string"},
+                          }}, "Ответ старого сценария приложения."),
+                          "400": _error("Некорректный email или JSON."),
+                          "429": _error("Лимит запросов с IP."),
+                          "503": _error("Не задан PASSWORD_RESET_URL.")},
+        }
+    },
+    "/auth/password-reset/confirm/": {
+        "post": {
+            "tags": ["Auth"],
+            "summary": "Установить новый пароль по одноразовой ссылке",
+            "description": "Ссылка действует 15 минут. Отзывает все AuthToken и ссылки восстановления пользователя. Не выполняет автоматический вход. До 60 попыток с IP в час.",
+            "requestBody": _body({"type": "object", "required": ["token", "new_password"], "properties": {
+                "token": {"type": "string", "minLength": 64, "maxLength": 64},
+                "new_password": {"type": "string", "format": "password", "minLength": 8, "maxLength": 128}
+            }}, "Token из ссылки и новый пароль."),
+            "responses": {"200": _ok(_ref("Error"), "Пароль изменён."),
+                          "400": _error("Неверная/истёкшая ссылка, JSON или слабый пароль (список errors)."),
+                          "429": _error("Лимит попыток с IP.")},
+        }
+    },
+
     "/me/markup/": {
         "get": _secured({"tags": ["Client"], "summary": "Своя информационная наценка (только магазин)",
             "responses": {"200": _ok(_ref("ShopMarkup"))}}),

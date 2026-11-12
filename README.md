@@ -45,3 +45,7 @@ flutter run --dart-define=API_BASE_URL=http://127.0.0.1:8000/api
 ## Оплата и сборка Android
 
 Настройка ключей ЮKassa, webhook, фоновой сверки и APK: [PAYMENTS_YOOKASSA.md](PAYMENTS_YOOKASSA.md).
+
+## Email password recovery
+
+See [docs/EMAIL_PASSWORD_RECOVERY.md](docs/EMAIL_PASSWORD_RECOVERY.md) for API and server setup.

@@ -1,7 +1,7 @@
 from . import knowledge_views
 from django.urls import path
 
-from . import finance_views, schema, views
+from . import finance_views, password_reset, schema, views
 
 urlpatterns = [
     path("catalog-state/", views.catalog_state),
@@ -22,7 +22,8 @@ urlpatterns = [
     path("health/", views.health),
     path("register/", views.register),
     path("auth/register/", views.register),
-    path("auth/password-reset/", views.password_reset),
+    path("auth/password-reset/", password_reset.request_reset, name="password-reset-request"),
+    path("auth/password-reset/confirm/", password_reset.confirm_reset, name="password-reset-confirm"),
     path("login/", views.login),
     path("me/", views.me),
     path("auth/me/", views.me),
